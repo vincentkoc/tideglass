@@ -246,6 +246,29 @@ func TestProbeCodexMissingPathIsError(t *testing.T) {
 	}
 }
 
+func TestProbeSuccessClearsStaleError(t *testing.T) {
+	sessionDir := filepath.Join(t.TempDir(), "sessions")
+	if err := os.MkdirAll(sessionDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sessionDir, "rollout.jsonl"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	status := probeSource(context.Background(), SourceStatus{
+		ID:        "codex",
+		Kind:      "import",
+		Locator:   sessionDir,
+		Health:    "error",
+		LastError: "old missing path",
+	})
+	if status.Health != "ok" {
+		t.Fatalf("health = %q, want ok", status.Health)
+	}
+	if status.LastError != "" {
+		t.Fatalf("last error = %q, want empty", status.LastError)
+	}
+}
+
 func TestCrawlbarBinaryUsesEnvOverride(t *testing.T) {
 	t.Setenv("TIDEGLASS_CRAWLBAR", "/tmp/tideglass-crawlbar")
 	bin, err := crawlbarBinary()

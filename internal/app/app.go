@@ -1245,6 +1245,7 @@ func crawlbarDatabasePath(ctx context.Context, bin, appID string) string {
 func probeSource(ctx context.Context, source SourceStatus) SourceStatus {
 	source.LastProbeAt = now()
 	source.Counts = map[string]int64{}
+	source.LastError = ""
 	switch source.ID {
 	case "gitcrawl":
 		return probeSQLite(ctx, source, source.Locator, map[string]string{"threads": "threads", "clusters": "cluster_groups"}, []string{"metadata", "text"})
