@@ -420,6 +420,39 @@ func TestProbeSQLiteMarksMissingExpectedTablesPartial(t *testing.T) {
 	}
 }
 
+func TestProbeSourceRequiresRetrievalFTSTable(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "slacrawl.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, statement := range []string{
+		`create table messages(id integer primary key)`,
+		`create table channels(id integer primary key)`,
+		`create table users(id integer primary key)`,
+		`insert into messages(id) values(1)`,
+		`insert into channels(id) values(1)`,
+		`insert into users(id) values(1)`,
+	} {
+		if _, err := db.ExecContext(ctx, statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	status := probeSource(ctx, SourceStatus{ID: "slacrawl", Kind: "crawl", Locator: dbPath})
+	if status.Health != "partial" || !strings.Contains(status.LastError, "message_fts") {
+		t.Fatalf("status without fts = %#v", status)
+	}
+	if _, err := db.ExecContext(ctx, `create table message_fts(content text, message_key text)`); err != nil {
+		t.Fatal(err)
+	}
+	status = probeSource(ctx, SourceStatus{ID: "slacrawl", Kind: "crawl", Locator: dbPath})
+	if status.Health != "ok" || status.LastError != "" {
+		t.Fatalf("status with fts = %#v", status)
+	}
+}
+
 func TestProbeDiscrawlHealthReflectsEmbeddingAvailability(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "discrawl.db")
@@ -432,6 +465,7 @@ func TestProbeDiscrawlHealthReflectsEmbeddingAvailability(t *testing.T) {
 		`create table messages(id integer primary key)`,
 		`create table members(id integer primary key)`,
 		`create table message_embeddings(id integer primary key)`,
+		`create table message_fts(content text, message_id text)`,
 		`insert into messages(id) values(1)`,
 		`insert into members(id) values(1)`,
 	} {
@@ -507,6 +541,28 @@ func TestTerminalSafeInlineStripsControlSequences(t *testing.T) {
 	}
 	if got != "hello]52;c;clipboard world[31m" {
 		t.Fatalf("sanitized text = %q", got)
+	}
+}
+
+func TestPrintSanitizesHumanPathOutput(t *testing.T) {
+	output := captureStdout(t, func() {
+		if err := Print(SourceList{Sources: []SourceStatus{{
+			ID:      "slacrawl",
+			Kind:    "crawl",
+			Health:  "ok",
+			Locator: "/tmp/bad\x1b]52;c;clipboard\a.db",
+		}}}, false); err != nil {
+			t.Fatal(err)
+		}
+		if err := Print(ExportResult{Path: "/tmp/export\x1b[31m.tgz", Records: 1}, false); err != nil {
+			t.Fatal(err)
+		}
+		if err := Print(DoctorResult{OverallState: "ok", DBPath: "/tmp/tide\x1b[31m.db", Schema: 1}, false); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if strings.ContainsAny(output, "\x1b\a") {
+		t.Fatalf("unsafe terminal path output preserved: %q", output)
 	}
 }
 
@@ -1079,4 +1135,29 @@ func writeAssistantMemoryZip(t *testing.T, path, memory string) {
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	originalStdout := os.Stdout
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = writer
+	defer func() {
+		os.Stdout = originalStdout
+	}()
+	fn()
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	output, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return string(output)
 }

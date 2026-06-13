@@ -1377,18 +1377,18 @@ func probeSource(ctx context.Context, source SourceStatus) SourceStatus {
 	case "gitcrawl":
 		return probeSQLite(ctx, source, source.Locator, map[string]string{"threads": "threads", "clusters": "cluster_groups"}, []string{"metadata", "text"})
 	case "slacrawl":
-		return probeSQLite(ctx, source, source.Locator, map[string]string{"messages": "messages", "channels": "channels", "users": "users"}, []string{"fts", "metadata", "text"})
+		return probeSQLite(ctx, source, source.Locator, map[string]string{"messages": "messages", "channels": "channels", "users": "users", "search": "message_fts"}, []string{"fts", "metadata", "text"})
 	case "discrawl":
-		out := probeSQLite(ctx, source, source.Locator, map[string]string{"messages": "messages", "members": "members", "embeddings": "message_embeddings"}, []string{"fts", "semantic", "metadata", "text"})
+		out := probeSQLite(ctx, source, source.Locator, map[string]string{"messages": "messages", "members": "members", "embeddings": "message_embeddings", "search": "message_fts"}, []string{"fts", "semantic", "metadata", "text"})
 		if out.Health == "ok" && out.Counts["embeddings"] == 0 {
 			out.Health = "partial"
 			out.LastError = "discrawl has no message embeddings; direct text probe is usable"
 		}
 		return out
 	case "notcrawl":
-		return probeSQLite(ctx, source, source.Locator, map[string]string{"pages": "pages", "blocks": "blocks", "comments": "comments"}, []string{"fts", "metadata", "text"})
+		return probeSQLite(ctx, source, source.Locator, map[string]string{"pages": "pages", "blocks": "blocks", "comments": "comments", "search": "page_fts"}, []string{"fts", "metadata", "text"})
 	case "graincrawl":
-		return probeSQLite(ctx, source, source.Locator, map[string]string{"notes": "notes", "transcripts": "transcript_chunks"}, []string{"fts", "metadata", "text"})
+		return probeSQLite(ctx, source, source.Locator, map[string]string{"notes": "notes", "transcripts": "transcript_chunks", "search": "notes_fts"}, []string{"fts", "metadata", "text"})
 	case "codex":
 		count := int64(0)
 		err := filepath.WalkDir(expandHome(source.Locator), func(path string, d fs.DirEntry, err error) error {
@@ -1923,7 +1923,7 @@ func Print(value any, jsonOut bool) error {
 	switch v := value.(type) {
 	case SourceList:
 		for _, source := range v.Sources {
-			fmt.Printf("%-10s %-8s %-7s %s\n", source.ID, source.Kind, source.Health, source.Locator)
+			fmt.Printf("%-10s %-8s %-7s %s\n", terminalSafeInline(source.ID), terminalSafeInline(source.Kind), terminalSafeInline(source.Health), terminalSafeInline(source.Locator))
 			if source.LastError != "" {
 				fmt.Printf("  warning: %s\n", terminalSafeInline(source.LastError))
 			}
@@ -1962,9 +1962,9 @@ func Print(value any, jsonOut bool) error {
 	case EditResult:
 		fmt.Printf("edited %s -> %s\n", v.ClaimID, terminalSafeInline(v.Value))
 	case ExportResult:
-		fmt.Printf("exported %s records=%d\n", v.Path, v.Records)
+		fmt.Printf("exported %s records=%d\n", terminalSafeInline(v.Path), v.Records)
 	case DoctorResult:
-		fmt.Printf("doctor: %s db=%s schema=%d\n", v.OverallState, v.DBPath, v.Schema)
+		fmt.Printf("doctor: %s db=%s schema=%d\n", terminalSafeInline(v.OverallState), terminalSafeInline(v.DBPath), v.Schema)
 		for _, check := range v.Checks {
 			fmt.Printf("- %s: %s %s\n", check.ID, check.Status, terminalSafeInline(check.Message))
 		}
