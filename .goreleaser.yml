@@ -20,7 +20,7 @@ builds:
       - -s -w -X main.version={{ .Version }}
 
 archives:
-  - id: bundles
+  - id: tideglass
     ids:
       - tideglass
     formats:
