@@ -103,6 +103,23 @@ func TestFTSQueryStripsReservedPunctuation(t *testing.T) {
 	}
 }
 
+func TestFTSQueryKeepsWorkAcronyms(t *testing.T) {
+	query := ftsQuery("CI PR db")
+	for _, want := range []string{"ci*", "pr*", "db*"} {
+		if !strings.Contains(query, want) {
+			t.Fatalf("fts query = %q, want %s", query, want)
+		}
+	}
+	claims := extractClaims("work.project.start", "CI PR validation", nil)
+	kinds := map[string]bool{}
+	for _, claim := range claims {
+		kinds[claim.Kind] = true
+	}
+	if !kinds["preference.project.validation"] || !kinds["boundary.agent.external_action"] {
+		t.Fatalf("claims = %#v", claims)
+	}
+}
+
 func TestRetrieveUsesSourceLocator(t *testing.T) {
 	ctx := context.Background()
 	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))

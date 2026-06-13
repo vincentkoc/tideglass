@@ -213,7 +213,7 @@ type retrievedEvidence struct {
 
 const assistantJSONLimit = 512 * 1024 * 1024
 
-var wordRE = regexp.MustCompile(`[A-Za-z][A-Za-z0-9_]{2,}`)
+var wordRE = regexp.MustCompile(`[A-Za-z][A-Za-z0-9_]*`)
 
 func Open(ctx context.Context, dbPath string) (*Tideglass, error) {
 	path, err := defaultDBPath(dbPath)
@@ -1606,7 +1606,7 @@ func extractClaims(kind, query string, evidence []retrievedEvidence) []candidate
 		if hasToken("kill", "kills", "killing", "process", "processes", "tmux") {
 			add("boundary.agent.process_kill", "Do not kill broad Codex, agent, tmux, SSH, mosh, or terminal processes without explicit current-turn scope.", 0.9, "inferred", findEvidence(evidence, "kill", "process", "tmux", "mosh"))
 		}
-		if hasToken("push", "pushes", "merge", "merges", "external", "land", "lands", "landing") {
+		if hasToken("push", "pushes", "merge", "merges", "external", "land", "lands", "landing", "pr", "prs") {
 			add("boundary.agent.external_action", "Treat pushes, merges, PR updates, and other external actions as high-integrity operations requiring current state and clear permission.", 0.78, "inferred", findEvidence(evidence, "push", "merge", "external", "land", "permission"))
 		}
 	case "social.dinner":
@@ -2012,12 +2012,21 @@ func wordTokens(text string) []string {
 	out := make([]string, 0, len(raw))
 	for _, word := range raw {
 		word = strings.Trim(word, "_")
-		if len(word) < 3 || stopword(word) {
+		if (len(word) < 3 && !shortDomainToken(word)) || stopword(word) {
 			continue
 		}
 		out = append(out, word)
 	}
 	return out
+}
+
+func shortDomainToken(word string) bool {
+	switch word {
+	case "ci", "pr", "db", "ui", "ai":
+		return true
+	default:
+		return false
+	}
 }
 
 func stopword(word string) bool {
