@@ -767,7 +767,9 @@ from sources where id = ?`, source.ID).Scan(
 	if strings.TrimSpace(source.Label) == "" {
 		source.Label = persisted.Label
 	}
-	if strings.TrimSpace(source.Locator) == "" {
+	if persisted.Kind == "import" && strings.TrimSpace(persisted.Locator) != "" {
+		source.Locator = persisted.Locator
+	} else if strings.TrimSpace(source.Locator) == "" {
 		source.Locator = persisted.Locator
 	}
 	if source.Health == "" || source.Health == "unknown" {
@@ -1519,7 +1521,7 @@ func importAssistantDir(kind, root string, limit int) ([]artifact, error) {
 func appendAssistantArtifacts(kind string, artifacts []artifact, blob namedBlob, limit int) ([]artifact, error) {
 	var value any
 	if err := json.Unmarshal(blob.Data, &value); err != nil {
-		return artifacts, nil
+		return artifacts, fmt.Errorf("parse %s: %w", blob.Name, err)
 	}
 	texts := collectAssistantTexts(value)
 	for index, text := range texts {
@@ -1578,24 +1580,33 @@ func extractClaims(kind, query string, evidence []retrievedEvidence) []candidate
 		claims = append(claims, candidateClaim{Kind: kind, Value: value, Confidence: confidence, SourceMode: sourceMode, EvidenceID: evidenceID})
 	}
 	all := strings.ToLower(query + "\n" + strings.Join(snippets(evidence), "\n"))
+	tokens := rawTokenSet(all)
+	hasToken := func(targets ...string) bool {
+		for _, target := range targets {
+			if tokens[strings.ToLower(target)] {
+				return true
+			}
+		}
+		return false
+	}
 	switch kind {
 	case "work.project.start", "work.release", "agent.delegation":
-		if strings.Contains(all, "live") || strings.Contains(all, "evidence") || strings.Contains(all, "proof") || strings.Contains(all, "exact sha") {
+		if hasToken("live", "evidence", "proof") || (hasToken("exact") && hasToken("sha")) {
 			add("preference.agent.evidence", "Prefer live, concrete evidence over stale assumptions; include exact proof such as command output, CI state, or landed SHA when relevant.", 0.88, "inferred", findEvidence(evidence, "live", "evidence", "proof", "exact", "sha"))
 		}
-		if strings.Contains(all, "test") || strings.Contains(all, "validate") || strings.Contains(all, "check") || strings.Contains(all, "ci") {
+		if hasToken("test", "tests", "validate", "validation", "check", "checks", "ci") {
 			add("preference.project.validation", "Prefer scoped verification first, then broader gates when risk or user request requires it.", 0.82, "inferred", findEvidence(evidence, "test", "validate", "check", "ci", "proof"))
 		}
-		if strings.Contains(all, "worktree") || strings.Contains(all, "gwt") || strings.Contains(all, "branch") {
+		if hasToken("worktree", "worktrees", "gwt", "branch", "branches") {
 			add("preference.project.branching", "Prefer fresh, scoped worktrees and explicit branch/worktree state for implementation lanes.", 0.8, "inferred", findEvidence(evidence, "worktree", "gwt", "branch"))
 		}
-		if strings.Contains(all, "concise") || strings.Contains(all, "terse") || strings.Contains(all, "no fluff") {
+		if hasToken("concise", "terse", "fluff") {
 			add("preference.agent.communication", "Use terse, operational updates with concrete state and next action; avoid filler.", 0.86, "inferred", findEvidence(evidence, "concise", "terse", "fluff", "status"))
 		}
-		if strings.Contains(all, "kill") || strings.Contains(all, "process") || strings.Contains(all, "tmux") {
+		if hasToken("kill", "kills", "killing", "process", "processes", "tmux") {
 			add("boundary.agent.process_kill", "Do not kill broad Codex, agent, tmux, SSH, mosh, or terminal processes without explicit current-turn scope.", 0.9, "inferred", findEvidence(evidence, "kill", "process", "tmux", "mosh"))
 		}
-		if strings.Contains(all, "push") || strings.Contains(all, "merge") || strings.Contains(all, "external") || strings.Contains(all, "land") {
+		if hasToken("push", "pushes", "merge", "merges", "external", "land", "lands", "landing") {
 			add("boundary.agent.external_action", "Treat pushes, merges, PR updates, and other external actions as high-integrity operations requiring current state and clear permission.", 0.78, "inferred", findEvidence(evidence, "push", "merge", "external", "land", "permission"))
 		}
 	case "social.dinner":
@@ -1902,6 +1913,17 @@ func hasAnyWord(text string, targets ...string) bool {
 		}
 	}
 	return false
+}
+
+func rawTokenSet(text string) map[string]bool {
+	out := map[string]bool{}
+	for _, token := range wordRE.FindAllString(strings.ToLower(text), -1) {
+		token = strings.Trim(token, "_")
+		if token != "" {
+			out[token] = true
+		}
+	}
+	return out
 }
 
 func hasDatingPhrase(text string) bool {

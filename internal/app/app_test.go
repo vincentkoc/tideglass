@@ -84,6 +84,15 @@ func TestNormalizeKindDoesNotTreatValidateOrUpdateAsDating(t *testing.T) {
 	}
 }
 
+func TestExtractClaimsDoesNotUseSubstringTriggers(t *testing.T) {
+	claims := extractClaims("work.project.start", "specific design skill matrix", nil)
+	for _, claim := range claims {
+		if claim.Kind == "preference.project.validation" || claim.Kind == "boundary.agent.process_kill" {
+			t.Fatalf("substring trigger created false claim: %#v", claims)
+		}
+	}
+}
+
 func TestFTSQueryStripsReservedPunctuation(t *testing.T) {
 	query := ftsQuery("openclaw-m1 exact-SHA go-humanize c++")
 	if strings.ContainsAny(query, "+-") {
@@ -445,6 +454,17 @@ func TestAssistantImportSkipsAssistantAuthoredMemoryText(t *testing.T) {
 	}
 }
 
+func TestAssistantImportMalformedJSONFails(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "conversations.json")
+	if err := os.WriteFile(path, []byte(`{"messages":[`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := importAssistantExport("chatgpt", path, 0)
+	if err == nil {
+		t.Fatal("expected malformed assistant JSON to fail")
+	}
+}
+
 func TestRetrieveImportedSearchesEvidenceFTS(t *testing.T) {
 	ctx := context.Background()
 	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
@@ -571,6 +591,42 @@ func TestCodexImportMissingPathFails(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected missing codex path to fail")
 	}
+}
+
+func TestSourcesPreserveCustomCodexImportLocator(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	sessionDir := filepath.Join(t.TempDir(), "sessions")
+	if err := os.MkdirAll(sessionDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	data := `{"type":"event_msg","payload":{"type":"user_message","message":"please keep this custom Codex session import path for source provenance"}}` + "\n"
+	if err := os.WriteFile(filepath.Join(sessionDir, "rollout.jsonl"), []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.Ingest(ctx, IngestOptions{Kind: "codex", Path: sessionDir}); err != nil {
+		t.Fatal(err)
+	}
+	sources, err := tg.Sources(ctx, SourceOptions{Probe: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, source := range sources.Sources {
+		if source.ID == "codex" {
+			if source.Locator != sessionDir {
+				t.Fatalf("codex locator = %q, want %q", source.Locator, sessionDir)
+			}
+			if source.Health != "ok" {
+				t.Fatalf("codex health = %q, want ok", source.Health)
+			}
+			return
+		}
+	}
+	t.Fatal("codex source not found")
 }
 
 func TestAssistantIngestLinksImportedMemoryEvidence(t *testing.T) {
