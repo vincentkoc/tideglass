@@ -913,7 +913,9 @@ func (t *Tideglass) loadClaims(ctx context.Context, intentID string) ([]ClaimOut
 	rows, err := t.db.QueryContext(ctx, `
 select c.id, c.kind,
        coalesce(json_extract(e.patch_json, '$.value'), c.value) as value,
-       c.confidence, c.status, c.source_mode
+       c.confidence, c.status, c.source_mode,
+       c.created_at, c.updated_at,
+       case when e.id is null then 0 else 1 end as has_value_edit
 from claims c
 left join edits e on e.id = (
   select id from edits
@@ -921,20 +923,87 @@ left join edits e on e.id = (
   order by created_at desc, rowid desc limit 1
 )
 where c.intent_id = ?
-  and c.status != 'rejected'
-order by case when e.id is null then 0 else 1 end desc, c.confidence desc, c.created_at desc`, intentID)
+order by c.created_at desc`, intentID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var claims []ClaimOut
-	seen := map[string]bool{}
+	type materializedClaim struct {
+		ClaimOut
+		CreatedAt    string
+		UpdatedAt    string
+		HasValueEdit bool
+		Normalized   string
+	}
+	var rowsOut []materializedClaim
 	for rows.Next() {
-		var claim ClaimOut
-		if err := rows.Scan(&claim.ID, &claim.Kind, &claim.Value, &claim.Confidence, &claim.Status, &claim.SourceMode); err != nil {
+		var claim materializedClaim
+		var hasValueEdit int
+		if err := rows.Scan(&claim.ID, &claim.Kind, &claim.Value, &claim.Confidence, &claim.Status, &claim.SourceMode, &claim.CreatedAt, &claim.UpdatedAt, &hasValueEdit); err != nil {
 			return nil, err
 		}
-		key := claim.Kind + "\x00" + normalizeText(claim.Value)
+		claim.HasValueEdit = hasValueEdit == 1
+		claim.Normalized = normalizeText(claim.Value)
+		rowsOut = append(rowsOut, claim)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	decisionRank := func(status string) int {
+		switch status {
+		case "accepted":
+			return 3
+		case "rejected":
+			return 2
+		default:
+			return 1
+		}
+	}
+	prefer := func(left, right materializedClaim, rank func(string) int) bool {
+		if rank(left.Status) != rank(right.Status) {
+			return rank(left.Status) > rank(right.Status)
+		}
+		if left.UpdatedAt != right.UpdatedAt {
+			return left.UpdatedAt > right.UpdatedAt
+		}
+		if left.HasValueEdit != right.HasValueEdit {
+			return left.HasValueEdit
+		}
+		if left.Confidence != right.Confidence {
+			return left.Confidence > right.Confidence
+		}
+		return left.CreatedAt > right.CreatedAt
+	}
+	sort.SliceStable(rowsOut, func(leftIndex, rightIndex int) bool {
+		return prefer(rowsOut[leftIndex], rowsOut[rightIndex], decisionRank)
+	})
+	duplicateSeen := map[string]bool{}
+	var deduped []materializedClaim
+	for _, claim := range rowsOut {
+		key := claim.Kind + "\x00" + claim.Normalized
+		if duplicateSeen[key] {
+			continue
+		}
+		duplicateSeen[key] = true
+		deduped = append(deduped, claim)
+	}
+	slotRank := func(status string) int {
+		switch status {
+		case "accepted":
+			return 3
+		case "active":
+			return 2
+		default:
+			return 1
+		}
+	}
+	sort.SliceStable(deduped, func(leftIndex, rightIndex int) bool {
+		return prefer(deduped[leftIndex], deduped[rightIndex], slotRank)
+	})
+	seen := map[string]bool{}
+	var claims []ClaimOut
+	for _, claim := range deduped {
+		key := claim.Kind + "\x00" + claim.Normalized
 		if singletonClaimKind(claim.Kind) {
 			key = claim.Kind
 		}
@@ -942,9 +1011,12 @@ order by case when e.id is null then 0 else 1 end desc, c.confidence desc, c.cre
 			continue
 		}
 		seen[key] = true
-		claims = append(claims, claim)
+		if claim.Status == "rejected" {
+			continue
+		}
+		claims = append(claims, claim.ClaimOut)
 	}
-	return claims, rows.Err()
+	return claims, nil
 }
 
 func (t *Tideglass) attachClaimEvidence(ctx context.Context, claims []ClaimOut) ([]ClaimOut, []EvidenceOut, error) {

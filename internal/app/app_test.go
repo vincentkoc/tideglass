@@ -318,6 +318,86 @@ func TestReviewAcceptKeepsEditedOverlay(t *testing.T) {
 	}
 }
 
+func TestRejectedDuplicateSingletonDoesNotRevealOlderActive(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	intent, err := tg.ensureIntent(ctx, "work.project.start", "Project start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "preference.agent.communication",
+		Value:      "Use terse updates.",
+		Confidence: 0.7,
+		SourceMode: "inferred",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	duplicateID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "preference.agent.communication",
+		Value:      "Use terse updates.",
+		Confidence: 0.9,
+		SourceMode: "inferred",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: duplicateID, Action: "reject", Reason: "duplicate regression"}); err != nil {
+		t.Fatal(err)
+	}
+	claims, err := tg.loadClaims(ctx, intent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claims) != 0 {
+		t.Fatalf("rejected duplicate leaked older active claim: %#v", claims)
+	}
+}
+
+func TestAcceptedDuplicateSingletonBeatsNewerActive(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	intent, err := tg.ensureIntent(ctx, "work.project.start", "Project start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	acceptedID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "preference.project.validation",
+		Value:      "Run focused tests.",
+		Confidence: 0.7,
+		SourceMode: "inferred",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: acceptedID, Action: "accept", Reason: "duplicate regression"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "preference.project.validation",
+		Value:      "Run focused tests.",
+		Confidence: 0.99,
+		SourceMode: "inferred",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	claims, err := tg.loadClaims(ctx, intent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claims) != 1 || claims[0].ID != acceptedID || claims[0].Status != "accepted" {
+		t.Fatalf("accepted duplicate was not authoritative: %#v", claims)
+	}
+}
+
 func TestProbeSQLiteMarksMissingExpectedTablesPartial(t *testing.T) {
 	ctx := context.Background()
 	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
