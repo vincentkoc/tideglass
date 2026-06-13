@@ -264,6 +264,10 @@ func (t *Tideglass) Sources(ctx context.Context, opts SourceOptions) (SourceList
 	}
 	out := make([]SourceStatus, 0, len(sourceByID))
 	for _, source := range sourceByID {
+		source, err := t.mergePersistedSource(ctx, source)
+		if err != nil {
+			return SourceList{}, err
+		}
 		if opts.Probe {
 			source = probeSource(ctx, source)
 		}
@@ -324,6 +328,13 @@ func (t *Tideglass) Ingest(ctx context.Context, opts IngestOptions) (IngestResul
 			return IngestResult{}, err
 		}
 		if (kind == "chatgpt" || kind == "claude") && looksLikeMemory(art.Title, art.Snippet) {
+			existing, err := t.claimExistsForEvidence(ctx, evidenceID, "preference.agent.imported_memory")
+			if err != nil {
+				return IngestResult{}, err
+			}
+			if existing {
+				continue
+			}
 			intent, err := t.ensureIntent(ctx, "agent.delegation", "Agent delegation")
 			if err != nil {
 				return IngestResult{}, err
@@ -726,6 +737,68 @@ capabilities_json=excluded.capabilities_json,counts_json=excluded.counts_json,la
 last_error=excluded.last_error,metadata_json=excluded.metadata_json`,
 		source.ID, source.Kind, source.Label, source.Locator, source.Health, string(caps), string(counts), source.LastProbeAt, source.LastError, string(meta))
 	return err
+}
+
+func (t *Tideglass) mergePersistedSource(ctx context.Context, source SourceStatus) (SourceStatus, error) {
+	var persisted SourceStatus
+	var capsJSON, countsJSON, metadataJSON string
+	err := t.db.QueryRowContext(ctx, `
+select id,kind,label,locator,health,capabilities_json,counts_json,coalesce(last_probe_at,''),last_error,metadata_json
+from sources where id = ?`, source.ID).Scan(
+		&persisted.ID, &persisted.Kind, &persisted.Label, &persisted.Locator, &persisted.Health,
+		&capsJSON, &countsJSON, &persisted.LastProbeAt, &persisted.LastError, &metadataJSON)
+	if errors.Is(err, sql.ErrNoRows) {
+		return source, nil
+	}
+	if err != nil {
+		return SourceStatus{}, err
+	}
+	_ = json.Unmarshal([]byte(capsJSON), &persisted.Capabilities)
+	_ = json.Unmarshal([]byte(countsJSON), &persisted.Counts)
+	_ = json.Unmarshal([]byte(metadataJSON), &persisted.Metadata)
+	if strings.TrimSpace(source.Kind) == "" {
+		source.Kind = persisted.Kind
+	}
+	if strings.TrimSpace(source.Label) == "" {
+		source.Label = persisted.Label
+	}
+	if strings.TrimSpace(source.Locator) == "" {
+		source.Locator = persisted.Locator
+	}
+	if source.Health == "" || source.Health == "unknown" {
+		source.Health = persisted.Health
+	}
+	if len(source.Capabilities) == 0 {
+		source.Capabilities = persisted.Capabilities
+	}
+	if len(source.Counts) == 0 {
+		source.Counts = persisted.Counts
+	}
+	if strings.TrimSpace(source.LastProbeAt) == "" {
+		source.LastProbeAt = persisted.LastProbeAt
+	}
+	if strings.TrimSpace(source.LastError) == "" {
+		source.LastError = persisted.LastError
+	}
+	source.Metadata = mergeStringMaps(persisted.Metadata, source.Metadata)
+	return source, nil
+}
+
+func (t *Tideglass) claimExistsForEvidence(ctx context.Context, evidenceID, kind string) (bool, error) {
+	var existing string
+	err := t.db.QueryRowContext(ctx, `
+select c.id
+from claims c
+join claim_evidence ce on ce.claim_id = c.id
+where ce.evidence_id = ? and c.kind = ?
+limit 1`, evidenceID, kind).Scan(&existing)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (t *Tideglass) upsertArtifactEvidence(ctx context.Context, art artifact) (string, error) {
@@ -1161,7 +1234,9 @@ func probeSource(ctx context.Context, source SourceStatus) SourceStatus {
 		return source
 	default:
 		if source.Kind == "import" {
-			source.Health = "unknown"
+			if source.Health == "" {
+				source.Health = "unknown"
+			}
 			source.Capabilities = []string{"metadata", "text"}
 		}
 		return source

@@ -524,6 +524,73 @@ func TestAssistantIngestLinksImportedMemoryEvidence(t *testing.T) {
 	}
 }
 
+func TestSourcesPreserveImportedSourceMetadata(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	zipPath := filepath.Join(t.TempDir(), "chatgpt-export.zip")
+	writeAssistantMemoryZip(t, zipPath, "Remember that source discovery must not erase imported export provenance.")
+	if _, err := tg.Ingest(ctx, IngestOptions{Kind: "chatgpt", Path: zipPath}); err != nil {
+		t.Fatal(err)
+	}
+	for _, probe := range []bool{false, true} {
+		sources, err := tg.Sources(ctx, SourceOptions{Probe: probe})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var chatgpt SourceStatus
+		for _, source := range sources.Sources {
+			if source.ID == "chatgpt" {
+				chatgpt = source
+			}
+		}
+		if chatgpt.Locator != zipPath {
+			t.Fatalf("probe=%v locator = %q, want %q", probe, chatgpt.Locator, zipPath)
+		}
+		if chatgpt.Health != "ok" {
+			t.Fatalf("probe=%v health = %q, want ok", probe, chatgpt.Health)
+		}
+	}
+}
+
+func TestAssistantIngestDoesNotDuplicateImportedMemoryClaims(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	zipPath := filepath.Join(t.TempDir(), "chatgpt-export.zip")
+	writeAssistantMemoryZip(t, zipPath, "Remember that imported memories should remain idempotent across repeated ingests.")
+	first, err := tg.Ingest(ctx, IngestOptions{Kind: "chatgpt", Path: zipPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := tg.Ingest(ctx, IngestOptions{Kind: "chatgpt", Path: zipPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Claims != 1 || second.Claims != 0 {
+		t.Fatalf("claims first=%d second=%d", first.Claims, second.Claims)
+	}
+	profile, err := tg.Profile(ctx, ProfileOptions{Kind: "agent.delegation"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, claim := range profile.Claims {
+		if claim.Kind == "preference.agent.imported_memory" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("imported memory claims = %d, profile=%#v", count, profile.Claims)
+	}
+}
+
 func TestImportedMemoriesDoNotCollapseInProfile(t *testing.T) {
 	ctx := context.Background()
 	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
@@ -583,4 +650,28 @@ func readTGZEntries(t *testing.T, path string) map[string]string {
 		entries[header.Name] = string(data)
 	}
 	return entries
+}
+
+func writeAssistantMemoryZip(t *testing.T, path, memory string) {
+	t.Helper()
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(file)
+	w, err := zw.Create("memory.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(map[string]string{"memory": memory})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = w.Write(encoded)
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
