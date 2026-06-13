@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -35,6 +36,8 @@ func run(ctx context.Context, args []string) error {
 		return runIngest(ctx, args)
 	case "ask":
 		return runAsk(ctx, args)
+	case "review":
+		return runReview(ctx, args)
 	case "profile":
 		return runProfile(ctx, args)
 	case "evidence":
@@ -136,6 +139,88 @@ func runAsk(ctx context.Context, args []string) error {
 		return err
 	}
 	return app.Print(result, *jsonOut)
+}
+
+func runReview(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("review", flag.ContinueOnError)
+	intentID := fs.String("intent", "", "intent ID")
+	kind := fs.String("kind", "", "intent kind")
+	all := fs.Bool("all", false, "include already accepted claims")
+	jsonOut := fs.Bool("json", false, "write review candidates as JSON")
+	dbPath := fs.String("db", "", "database path")
+	if err := fs.Parse(normalizeFlagArgs(args)); err != nil {
+		return err
+	}
+	tg, err := app.Open(ctx, *dbPath)
+	if err != nil {
+		return err
+	}
+	defer tg.Close()
+	profile, err := tg.Profile(ctx, app.ProfileOptions{IntentID: *intentID, Kind: *kind})
+	if err != nil {
+		return err
+	}
+	if *jsonOut {
+		return app.Print(profile, true)
+	}
+	reader := bufio.NewReader(os.Stdin)
+	reviewed := 0
+	for _, claim := range profile.Claims {
+		if claim.Status == "accepted" && !*all {
+			continue
+		}
+		fmt.Printf("\n%s\n", strings.Repeat("─", 72))
+		fmt.Printf("claim: %s\nkind: %s\nstatus: %s confidence: %.2f\n", claim.ID, claim.Kind, claim.Status, claim.Confidence)
+		fmt.Printf("value: %s\n", safeLine(claim.Value))
+		if len(claim.Evidence) > 0 {
+			fmt.Printf("evidence: %s\n", strings.Join(claim.Evidence, ", "))
+		}
+		fmt.Print("[a]ccept [e]dit+accept [r]eject [s]kip [q]uit > ")
+		answer, err := reader.ReadString('\n')
+		if err != nil {
+			return err
+		}
+		switch strings.TrimSpace(strings.ToLower(answer)) {
+		case "a", "accept":
+			if _, err := tg.ReviewClaim(ctx, app.ReviewOptions{ClaimID: claim.ID, Action: "accept", Reason: "interactive review"}); err != nil {
+				return err
+			}
+			reviewed++
+			fmt.Println("accepted")
+		case "e", "edit":
+			fmt.Print("new value > ")
+			value, err := reader.ReadString('\n')
+			if err != nil {
+				return err
+			}
+			value = strings.TrimSpace(value)
+			if value == "" {
+				fmt.Println("skipped empty edit")
+				continue
+			}
+			if _, err := tg.EditClaim(ctx, app.EditOptions{ClaimID: claim.ID, Value: value, Reason: "interactive review edit"}); err != nil {
+				return err
+			}
+			if _, err := tg.ReviewClaim(ctx, app.ReviewOptions{ClaimID: claim.ID, Action: "accept", Reason: "interactive review edit"}); err != nil {
+				return err
+			}
+			reviewed++
+			fmt.Println("edited and accepted")
+		case "r", "reject":
+			if _, err := tg.ReviewClaim(ctx, app.ReviewOptions{ClaimID: claim.ID, Action: "reject", Reason: "interactive review"}); err != nil {
+				return err
+			}
+			reviewed++
+			fmt.Println("rejected")
+		case "q", "quit":
+			fmt.Printf("reviewed %d claims\n", reviewed)
+			return nil
+		default:
+			fmt.Println("skipped")
+		}
+	}
+	fmt.Printf("reviewed %d claims\n", reviewed)
+	return nil
 }
 
 func runProfile(ctx context.Context, args []string) error {
@@ -297,9 +382,10 @@ func usage() {
 commands:
   init
   sources [--probe] [--json]
-  ingest chatgpt|claude|codex --path <path> [--limit n]
-  ask [--kind kind] [--json] <query>
-  profile show --kind <kind>|--intent <id>
+	  ingest chatgpt|claude|codex --path <path> [--limit n]
+	  ask [--kind kind] [--json] <query>
+	  review --kind <kind>|--intent <id>
+	  profile show --kind <kind>|--intent <id>
   profile edit <claim-id> --set <value>
   profile export --kind <kind>|--intent <id>
   evidence show <claim-id>
@@ -355,4 +441,20 @@ func expandPath(path string) string {
 		}
 	}
 	return path
+}
+
+func safeLine(text string) string {
+	text = strings.Map(func(r rune) rune {
+		switch r {
+		case '\n', '\r', '\t':
+			return ' '
+		case '\x1b', '\x7f':
+			return -1
+		}
+		if r < 0x20 || (r >= 0x80 && r <= 0x9f) {
+			return -1
+		}
+		return r
+	}, text)
+	return strings.Join(strings.Fields(text), " ")
 }

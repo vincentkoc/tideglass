@@ -232,6 +232,57 @@ func TestEditOverlayUsesLatestSameSecondEdit(t *testing.T) {
 	}
 }
 
+func TestReviewClaimAcceptsAndRejects(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	intent, err := tg.ensureIntent(ctx, "work.project.start", "Project start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	acceptedID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "preference.project.validation",
+		Value:      "run tests",
+		Confidence: 0.8,
+		SourceMode: "inferred",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rejectedID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "preference.agent.communication",
+		Value:      "use too much fluff",
+		Confidence: 0.6,
+		SourceMode: "inferred",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: acceptedID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: rejectedID, Action: "reject", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	claims, err := tg.loadClaims(ctx, intent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claims) != 1 || claims[0].ID != acceptedID || claims[0].Status != "accepted" {
+		t.Fatalf("claims = %#v", claims)
+	}
+	var editCount int
+	if err := tg.db.QueryRowContext(ctx, `select count(*) from edits where claim_id in (?,?)`, acceptedID, rejectedID).Scan(&editCount); err != nil {
+		t.Fatal(err)
+	}
+	if editCount != 2 {
+		t.Fatalf("review edits = %d, want 2", editCount)
+	}
+}
+
 func TestProbeSQLiteMarksMissingExpectedTablesPartial(t *testing.T) {
 	ctx := context.Background()
 	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))

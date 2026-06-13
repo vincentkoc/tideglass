@@ -67,6 +67,12 @@ type EditOptions struct {
 	Reason  string
 }
 
+type ReviewOptions struct {
+	ClaimID string
+	Action  string
+	Reason  string
+}
+
 type ExportOptions struct {
 	IntentID string
 	Kind     string
@@ -159,6 +165,12 @@ type EditResult struct {
 	EditID  string `json:"edit_id"`
 	ClaimID string `json:"claim_id"`
 	Value   string `json:"value"`
+}
+
+type ReviewResult struct {
+	ClaimID string `json:"claim_id"`
+	Action  string `json:"action"`
+	Status  string `json:"status"`
 }
 
 type ExportResult struct {
@@ -496,6 +508,42 @@ func (t *Tideglass) EditClaim(ctx context.Context, opts EditOptions) (EditResult
 		return EditResult{}, err
 	}
 	return EditResult{EditID: editID, ClaimID: opts.ClaimID, Value: value}, nil
+}
+
+func (t *Tideglass) ReviewClaim(ctx context.Context, opts ReviewOptions) (ReviewResult, error) {
+	claimID := strings.TrimSpace(opts.ClaimID)
+	if claimID == "" {
+		return ReviewResult{}, errors.New("claim id is required")
+	}
+	action := strings.TrimSpace(strings.ToLower(opts.Action))
+	status := ""
+	switch action {
+	case "accept", "accepted":
+		action = "accept"
+		status = "accepted"
+	case "reject", "rejected":
+		action = "reject"
+		status = "rejected"
+	default:
+		return ReviewResult{}, fmt.Errorf("unsupported review action %q", opts.Action)
+	}
+	res, err := t.db.ExecContext(ctx, `update claims set status = ?, updated_at = ? where id = ?`, status, now(), claimID)
+	if err != nil {
+		return ReviewResult{}, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return ReviewResult{}, err
+	}
+	if affected == 0 {
+		return ReviewResult{}, sql.ErrNoRows
+	}
+	patch, _ := json.Marshal(map[string]string{"status": status})
+	if _, err := t.db.ExecContext(ctx, `insert into edits(id,claim_id,operation,patch_json,reason,created_at) values(?,?,?,?,?,?)`,
+		id("edt"), claimID, action, string(patch), opts.Reason, now()); err != nil {
+		return ReviewResult{}, err
+	}
+	return ReviewResult{ClaimID: claimID, Action: action, Status: status}, nil
 }
 
 func (t *Tideglass) Evidence(ctx context.Context, claimID string) ([]EvidenceOut, error) {
@@ -871,6 +919,7 @@ left join edits e on e.id = (
   select id from edits where claim_id = c.id order by created_at desc, rowid desc limit 1
 )
 where c.intent_id = ?
+  and c.status != 'rejected'
 order by case when e.id is null then 0 else 1 end desc, c.confidence desc, c.created_at desc`, intentID)
 	if err != nil {
 		return nil, err
