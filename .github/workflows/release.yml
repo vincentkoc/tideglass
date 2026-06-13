@@ -115,16 +115,24 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          gh release view "${RELEASE_TAG}" --json tagName,assets --jq '
-            . as $release
-            | if ($release.tagName != env.RELEASE_TAG) then error("release tag mismatch") else . end
-            | [.assets[].name] as $assets
-            | ["tideglass_" + env.RELEASE_VERSION + "_darwin_amd64.tar.gz",
-               "tideglass_" + env.RELEASE_VERSION + "_darwin_arm64.tar.gz",
-               "tideglass_" + env.RELEASE_VERSION + "_linux_amd64.tar.gz",
-               "tideglass_" + env.RELEASE_VERSION + "_linux_arm64.tar.gz",
-               "sha256sums.txt"] as $required
-            | if (($required - $assets) | length) > 0 then error("missing release assets") else "release assets ok" end'
+          release_json="$(gh release view "${RELEASE_TAG}" --json tagName,assets)"
+          actual_tag="$(jq -r '.tagName' <<<"${release_json}")"
+          if [ "${actual_tag}" != "${RELEASE_TAG}" ]; then
+            echo "::error::release tag mismatch: ${actual_tag}"
+            exit 1
+          fi
+          for asset in \
+            "tideglass_${RELEASE_VERSION}_darwin_amd64.tar.gz" \
+            "tideglass_${RELEASE_VERSION}_darwin_arm64.tar.gz" \
+            "tideglass_${RELEASE_VERSION}_linux_amd64.tar.gz" \
+            "tideglass_${RELEASE_VERSION}_linux_arm64.tar.gz" \
+            "sha256sums.txt"; do
+            if ! jq -e --arg asset "${asset}" '.assets[].name == $asset' <<<"${release_json}" >/dev/null; then
+              echo "::error::missing release asset ${asset}"
+              exit 1
+            fi
+          done
+          echo "release assets ok"
 
       - name: Verify Homebrew formula
         if: ${{ env.RELEASE_SKIP_PUBLISH != '1' }}
