@@ -1439,53 +1439,22 @@ func importAssistantExport(kind, path string, limit int) ([]artifact, []candidat
 	if err != nil {
 		return nil, nil, err
 	}
-	var blobs []namedBlob
+	var artifacts []artifact
 	if info.IsDir() {
-		blobs, err = readJSONFiles(path)
+		artifacts, err = importAssistantDir(kind, path, limit)
 	} else if strings.HasSuffix(strings.ToLower(path), ".zip") {
-		blobs, err = readZipJSON(path)
+		artifacts, err = importAssistantZip(kind, path, limit)
 	} else {
 		data, readErr := readFileLimited(path)
 		err = readErr
 		if err == nil {
-			blobs = []namedBlob{{Name: filepath.Base(path), Data: data}}
+			artifacts, err = appendAssistantArtifacts(kind, nil, namedBlob{Name: filepath.Base(path), Data: data}, limit)
 		}
 	}
 	if err != nil {
 		return nil, nil, err
 	}
-	var artifacts []artifact
 	var claims []candidateClaim
-	for _, blob := range blobs {
-		var value any
-		if err := json.Unmarshal(blob.Data, &value); err != nil {
-			continue
-		}
-		texts := collectAssistantTexts(value)
-		for index, text := range texts {
-			if limit > 0 && len(artifacts) >= limit {
-				break
-			}
-			text = trimForSnippet(text, 1000)
-			if len(text) < 40 {
-				continue
-			}
-			locator, _ := json.Marshal(map[string]any{"file": blob.Name, "index": index})
-			artifacts = append(artifacts, artifact{
-				SourceID:     kind,
-				ExternalID:   fmt.Sprintf("%s:%d", blob.Name, index),
-				Kind:         "assistant_export_text",
-				Title:        blob.Name,
-				ContentHash:  hashText(text),
-				MetadataJSON: "{}",
-				Snippet:      text,
-				LocatorJSON:  string(locator),
-			})
-		}
-		if limit > 0 && len(artifacts) >= limit {
-			break
-		}
-	}
 	return artifacts, claims, nil
 }
 
@@ -1494,14 +1463,17 @@ type namedBlob struct {
 	Data []byte
 }
 
-func readZipJSON(path string) ([]namedBlob, error) {
+func importAssistantZip(kind, path string, limit int) ([]artifact, error) {
 	zr, err := zip.OpenReader(path)
 	if err != nil {
 		return nil, err
 	}
 	defer zr.Close()
-	var out []namedBlob
+	var artifacts []artifact
 	for _, file := range zr.File {
+		if limit > 0 && len(artifacts) >= limit {
+			break
+		}
 		if file.FileInfo().IsDir() || !strings.HasSuffix(strings.ToLower(file.Name), ".json") {
 			continue
 		}
@@ -1511,13 +1483,66 @@ func readZipJSON(path string) ([]namedBlob, error) {
 		}
 		data, err := readAllLimited(rc, assistantJSONLimit, file.Name)
 		_ = rc.Close()
-		if err == nil {
-			out = append(out, namedBlob{Name: file.Name, Data: data})
-		} else {
+		if err != nil {
+			return nil, err
+		}
+		artifacts, err = appendAssistantArtifacts(kind, artifacts, namedBlob{Name: file.Name, Data: data}, limit)
+		if err != nil {
 			return nil, err
 		}
 	}
-	return out, nil
+	return artifacts, nil
+}
+
+func importAssistantDir(kind, root string, limit int) ([]artifact, error) {
+	var artifacts []artifact
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if limit > 0 && len(artifacts) >= limit {
+			return filepath.SkipAll
+		}
+		if d.IsDir() || !strings.HasSuffix(strings.ToLower(path), ".json") {
+			return nil
+		}
+		data, err := readFileLimited(path)
+		if err != nil {
+			return err
+		}
+		artifacts, err = appendAssistantArtifacts(kind, artifacts, namedBlob{Name: path, Data: data}, limit)
+		return err
+	})
+	return artifacts, err
+}
+
+func appendAssistantArtifacts(kind string, artifacts []artifact, blob namedBlob, limit int) ([]artifact, error) {
+	var value any
+	if err := json.Unmarshal(blob.Data, &value); err != nil {
+		return artifacts, nil
+	}
+	texts := collectAssistantTexts(value)
+	for index, text := range texts {
+		if limit > 0 && len(artifacts) >= limit {
+			break
+		}
+		text = trimForSnippet(text, 1000)
+		if len(text) < 40 {
+			continue
+		}
+		locator, _ := json.Marshal(map[string]any{"file": blob.Name, "index": index})
+		artifacts = append(artifacts, artifact{
+			SourceID:     kind,
+			ExternalID:   fmt.Sprintf("%s:%d", blob.Name, index),
+			Kind:         "assistant_export_text",
+			Title:        blob.Name,
+			ContentHash:  hashText(text),
+			MetadataJSON: "{}",
+			Snippet:      text,
+			LocatorJSON:  string(locator),
+		})
+	}
+	return artifacts, nil
 }
 
 func readFileLimited(path string) ([]byte, error) {
@@ -1539,26 +1564,6 @@ func readAllLimited(reader io.Reader, limit int64, name string) ([]byte, error) 
 		return nil, fmt.Errorf("%s is too large to import safely: %d bytes exceeds %d byte limit", name, written, limit)
 	}
 	return buf.Bytes(), nil
-}
-
-func readJSONFiles(root string) ([]namedBlob, error) {
-	var out []namedBlob
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() || !strings.HasSuffix(strings.ToLower(path), ".json") {
-			return nil
-		}
-		data, err := readFileLimited(path)
-		if err == nil {
-			out = append(out, namedBlob{Name: path, Data: data})
-		} else {
-			return err
-		}
-		return nil
-	})
-	return out, err
 }
 
 func extractClaims(kind, query string, evidence []retrievedEvidence) []candidateClaim {
@@ -1752,7 +1757,7 @@ func renderAgentContext(intent IntentOut, claims []ClaimOut, unresolved []string
 	if len(claims) > 0 {
 		b.WriteString("\npreferences and constraints:\n")
 		for _, claim := range claims {
-			fmt.Fprintf(&b, "- %s: %s (confidence %.2f)\n", claim.Kind, claim.Value, claim.Confidence)
+			fmt.Fprintf(&b, "- %s: %s (confidence %.2f)\n", claim.Kind, terminalSafeInline(claim.Value), claim.Confidence)
 		}
 	}
 	if len(unresolved) > 0 {
@@ -1779,7 +1784,7 @@ func Print(value any, jsonOut bool) error {
 		for _, source := range v.Sources {
 			fmt.Printf("%-10s %-8s %-7s %s\n", source.ID, source.Kind, source.Health, source.Locator)
 			if source.LastError != "" {
-				fmt.Printf("  warning: %s\n", source.LastError)
+				fmt.Printf("  warning: %s\n", terminalSafeInline(source.LastError))
 			}
 		}
 	case IngestResult:
@@ -1788,7 +1793,7 @@ func Print(value any, jsonOut bool) error {
 		fmt.Printf("intent: %s (%s)\n", v.Intent.Title, v.Intent.Kind)
 		fmt.Println("claims:")
 		for _, claim := range v.Claims {
-			fmt.Printf("- [%s] %s (%.2f)\n", claim.Kind, claim.Value, claim.Confidence)
+			fmt.Printf("- [%s] %s (%.2f)\n", claim.Kind, terminalSafeInline(claim.Value), claim.Confidence)
 		}
 		if len(v.UnresolvedQuestions) > 0 {
 			fmt.Println("unresolved:")
@@ -1800,7 +1805,7 @@ func Print(value any, jsonOut bool) error {
 		for _, coverage := range v.SourceCoverage {
 			fmt.Printf("- %s: %s hits=%d", coverage.SourceID, coverage.Health, coverage.Hits)
 			if coverage.Error != "" {
-				fmt.Printf(" warning=%s", coverage.Error)
+				fmt.Printf(" warning=%s", terminalSafeInline(coverage.Error))
 			}
 			fmt.Println()
 		}
@@ -1811,20 +1816,20 @@ func Print(value any, jsonOut bool) error {
 		}
 		fmt.Printf("intent: %s (%s)\n", v.Intent.Title, v.Intent.Kind)
 		for _, claim := range v.Claims {
-			fmt.Printf("- [%s] %s (%.2f)\n", claim.Kind, claim.Value, claim.Confidence)
+			fmt.Printf("- [%s] %s (%.2f)\n", claim.Kind, terminalSafeInline(claim.Value), claim.Confidence)
 		}
 	case EditResult:
-		fmt.Printf("edited %s -> %s\n", v.ClaimID, v.Value)
+		fmt.Printf("edited %s -> %s\n", v.ClaimID, terminalSafeInline(v.Value))
 	case ExportResult:
 		fmt.Printf("exported %s records=%d\n", v.Path, v.Records)
 	case DoctorResult:
 		fmt.Printf("doctor: %s db=%s schema=%d\n", v.OverallState, v.DBPath, v.Schema)
 		for _, check := range v.Checks {
-			fmt.Printf("- %s: %s %s\n", check.ID, check.Status, check.Message)
+			fmt.Printf("- %s: %s %s\n", check.ID, check.Status, terminalSafeInline(check.Message))
 		}
 	case []EvidenceOut:
 		for _, ev := range v {
-			fmt.Printf("- %s %s %s\n", ev.SourceID, ev.ID, ev.Snippet)
+			fmt.Printf("- %s %s %s\n", ev.SourceID, ev.ID, terminalSafeInline(ev.Snippet))
 		}
 	default:
 		enc := json.NewEncoder(os.Stdout)
@@ -1832,6 +1837,22 @@ func Print(value any, jsonOut bool) error {
 		return enc.Encode(value)
 	}
 	return nil
+}
+
+func terminalSafeInline(text string) string {
+	text = strings.Map(func(r rune) rune {
+		switch r {
+		case '\n', '\r', '\t':
+			return ' '
+		case '\x1b', '\x7f':
+			return -1
+		}
+		if r < 0x20 || (r >= 0x80 && r <= 0x9f) {
+			return -1
+		}
+		return r
+	}, text)
+	return strings.Join(strings.Fields(text), " ")
 }
 
 func PrintText(format string, args ...any) error {

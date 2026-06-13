@@ -231,6 +231,16 @@ func TestCrawlbarBinaryUsesEnvOverride(t *testing.T) {
 	}
 }
 
+func TestTerminalSafeInlineStripsControlSequences(t *testing.T) {
+	got := terminalSafeInline("hello\x1b]52;c;clipboard\a\nworld\x1b[31m")
+	if strings.ContainsAny(got, "\x1b\a\n\r") {
+		t.Fatalf("unsafe terminal text preserved: %q", got)
+	}
+	if got != "hello]52;c;clipboard world[31m" {
+		t.Fatalf("sanitized text = %q", got)
+	}
+}
+
 func TestExportProfileIncludesEvidenceRecords(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "tideglass.db")
