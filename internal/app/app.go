@@ -518,6 +518,9 @@ func (t *Tideglass) ExportProfile(ctx context.Context, opts ExportOptions) (Expo
 	if err != nil {
 		return ExportResult{}, err
 	}
+	exportEvidence := sanitizeEvidenceForExport(profile.Evidence)
+	exportProfile := profile
+	exportProfile.Evidence = exportEvidence
 	out := opts.Out
 	if out == "" {
 		out = filepath.Join(filepath.Dir(t.path), "tideglass-"+profile.Intent.Kind+"-"+time.Now().UTC().Format("20060102T150405Z")+".tgz")
@@ -552,7 +555,7 @@ func (t *Tideglass) ExportProfile(ctx context.Context, opts ExportOptions) (Expo
 		return ExportResult{}, err
 	}
 	records++
-	if err := writeTarJSON(tw, "profile.json", profile); err != nil {
+	if err := writeTarJSON(tw, "profile.json", exportProfile); err != nil {
 		_ = tw.Close()
 		_ = gz.Close()
 		_ = file.Close()
@@ -566,7 +569,7 @@ func (t *Tideglass) ExportProfile(ctx context.Context, opts ExportOptions) (Expo
 		return ExportResult{}, err
 	}
 	records += len(profile.Claims)
-	if err := writeTarJSONL(tw, "evidence.jsonl", profile.Evidence); err != nil {
+	if err := writeTarJSONL(tw, "evidence.jsonl", exportEvidence); err != nil {
 		_ = tw.Close()
 		_ = gz.Close()
 		_ = file.Close()
@@ -586,6 +589,51 @@ func (t *Tideglass) ExportProfile(ctx context.Context, opts ExportOptions) (Expo
 		return ExportResult{}, err
 	}
 	return ExportResult{Path: out, Format: "tgz", Records: records}, nil
+}
+
+func sanitizeEvidenceForExport(evidence []EvidenceOut) []EvidenceOut {
+	out := make([]EvidenceOut, len(evidence))
+	for i, ev := range evidence {
+		ev.Locator = sanitizeLocatorJSON(ev.Locator)
+		out[i] = ev
+	}
+	return out
+}
+
+func sanitizeLocatorJSON(raw string) string {
+	var value any
+	if err := json.Unmarshal([]byte(raw), &value); err != nil {
+		return raw
+	}
+	value = sanitizeLocatorValue("", value)
+	data, err := json.Marshal(value)
+	if err != nil {
+		return raw
+	}
+	return string(data)
+}
+
+func sanitizeLocatorValue(key string, value any) any {
+	switch v := value.(type) {
+	case map[string]any:
+		for childKey, childValue := range v {
+			v[childKey] = sanitizeLocatorValue(childKey, childValue)
+		}
+		return v
+	case []any:
+		for i, childValue := range v {
+			v[i] = sanitizeLocatorValue(key, childValue)
+		}
+		return v
+	case string:
+		lowerKey := strings.ToLower(key)
+		if filepath.IsAbs(v) && (strings.Contains(lowerKey, "path") || strings.Contains(lowerKey, "file") || strings.Contains(lowerKey, "database")) {
+			return filepath.Base(v)
+		}
+		return v
+	default:
+		return value
+	}
 }
 
 func resolvedWritePath(path string) (string, error) {
@@ -950,7 +998,7 @@ func (t *Tideglass) retrieveImported(ctx context.Context, source SourceStatus, q
 select e.id, e.locator_json, f.snippet
 from evidence_fts f
 join evidence e on e.id = f.evidence_id
-where evidence_fts match ? and f.source_id = ?
+where f.snippet match ? and f.source_id = ?
 limit ?`, queryText, source.ID, limit)
 	if err != nil {
 		return nil, err

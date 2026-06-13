@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -220,7 +221,8 @@ func TestProbeCodexMissingPathIsError(t *testing.T) {
 
 func TestExportProfileIncludesEvidenceRecords(t *testing.T) {
 	ctx := context.Background()
-	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	dbPath := filepath.Join(t.TempDir(), "tideglass.db")
+	tg, err := Open(ctx, dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,12 +234,14 @@ func TestExportProfileIncludesEvidenceRecords(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	rawLocator, _ := json.Marshal(map[string]any{"path": dbPath, "line": 42})
 	evidenceID, err := tg.upsertArtifactEvidence(ctx, artifact{
-		SourceID:   "codex",
-		ExternalID: "session-1",
-		Kind:       "codex_event",
-		Title:      "session",
-		Snippet:    "Always preserve exact evidence for portable Tideglass profile exports.",
+		SourceID:    "codex",
+		ExternalID:  "session-1",
+		Kind:        "codex_event",
+		Title:       "session",
+		Snippet:     "Always preserve exact evidence for portable Tideglass profile exports.",
+		LocatorJSON: string(rawLocator),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -267,6 +271,12 @@ func TestExportProfileIncludesEvidenceRecords(t *testing.T) {
 	}
 	if !strings.Contains(entries["profile.json"], evidenceID) {
 		t.Fatalf("profile export missing evidence id %q: %s", evidenceID, entries["profile.json"])
+	}
+	if strings.Contains(entries["evidence.jsonl"], filepath.Dir(dbPath)) || strings.Contains(entries["profile.json"], filepath.Dir(dbPath)) {
+		t.Fatalf("export leaked absolute locator path: evidence=%s profile=%s", entries["evidence.jsonl"], entries["profile.json"])
+	}
+	if !strings.Contains(entries["evidence.jsonl"], filepath.Base(dbPath)) {
+		t.Fatalf("export should retain source-local file basename: %s", entries["evidence.jsonl"])
 	}
 }
 
@@ -374,6 +384,34 @@ func TestAssistantImportLimitCountsArtifactsNotJSONFiles(t *testing.T) {
 	}
 	if len(artifacts) != 1 || !strings.Contains(artifacts[0].Snippet, "keep scanning files") {
 		t.Fatalf("artifacts = %#v", artifacts)
+	}
+}
+
+func TestRetrieveImportedSearchesEvidenceFTS(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	if err := tg.upsertSource(ctx, SourceStatus{ID: "chatgpt", Kind: "import", Label: "ChatGPT", Health: "ok"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.upsertArtifactEvidence(ctx, artifact{
+		SourceID:   "chatgpt",
+		ExternalID: "memory-1",
+		Kind:       "assistant_export_text",
+		Title:      "memory",
+		Snippet:    "Remember that Tideglass should retrieve imported memories through the evidence FTS table.",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	found, err := tg.retrieveImported(ctx, SourceStatus{ID: "chatgpt"}, "imported memories evidence", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(found) != 1 || !strings.Contains(found[0].Snippet, "imported memories") {
+		t.Fatalf("found = %#v", found)
 	}
 }
 
