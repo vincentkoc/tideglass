@@ -127,7 +127,7 @@ jobs:
             "tideglass_${RELEASE_VERSION}_linux_amd64.tar.gz" \
             "tideglass_${RELEASE_VERSION}_linux_arm64.tar.gz" \
             "sha256sums.txt"; do
-            if ! jq -e --arg asset "${asset}" '.assets[].name == $asset' <<<"${release_json}" >/dev/null; then
+            if ! jq -e --arg asset "${asset}" 'any(.assets[].name; . == $asset)' <<<"${release_json}" >/dev/null; then
               echo "::error::missing release asset ${asset}"
               exit 1
             fi
