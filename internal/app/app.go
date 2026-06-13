@@ -1621,11 +1621,30 @@ func hasAnyWord(text string, targets ...string) bool {
 }
 
 func hasDatingPhrase(text string) bool {
-	q := strings.ToLower(text)
-	return strings.Contains(q, "first dates") ||
-		strings.Contains(q, "better dates") ||
-		strings.Contains(q, "date ideas") ||
-		strings.Contains(q, "dating ideas")
+	tokens := words(text)
+	return hasTokenSequence(tokens, "first", "dates") ||
+		hasTokenSequence(tokens, "better", "dates") ||
+		hasTokenSequence(tokens, "date", "ideas") ||
+		hasTokenSequence(tokens, "dating", "ideas")
+}
+
+func hasTokenSequence(tokens []string, sequence ...string) bool {
+	if len(sequence) == 0 || len(sequence) > len(tokens) {
+		return false
+	}
+	for i := 0; i <= len(tokens)-len(sequence); i++ {
+		matched := true
+		for j, token := range sequence {
+			if tokens[i+j] != token {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return true
+		}
+	}
+	return false
 }
 
 func titleForKind(kind string) string {
