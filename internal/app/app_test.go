@@ -65,6 +65,9 @@ func TestNormalizeKindDoesNotTreatValidateOrUpdateAsDating(t *testing.T) {
 	if got := normalizeKind("", "ideas for first dates"); got != "social.dating" {
 		t.Fatalf("kind = %q, want social.dating", got)
 	}
+	if got := normalizeKind("", "plan release dates for OpenClaw"); got != "work.project.start" {
+		t.Fatalf("kind = %q, want work.project.start", got)
+	}
 }
 
 func TestFTSQueryStripsReservedPunctuation(t *testing.T) {

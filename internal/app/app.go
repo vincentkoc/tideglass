@@ -1596,7 +1596,7 @@ func normalizeKind(kind, query string) string {
 	switch {
 	case strings.Contains(q, "dinner"):
 		return "social.dinner"
-	case strings.Contains(q, "dating") || hasAnyWord(q, "date", "dates"):
+	case strings.Contains(q, "dating") || hasAnyWord(q, "date") || hasDatingPhrase(q):
 		return "social.dating"
 	case strings.Contains(q, "new job"):
 		return "work.new_job"
@@ -1618,6 +1618,14 @@ func hasAnyWord(text string, targets ...string) bool {
 		}
 	}
 	return false
+}
+
+func hasDatingPhrase(text string) bool {
+	q := strings.ToLower(text)
+	return strings.Contains(q, "first dates") ||
+		strings.Contains(q, "better dates") ||
+		strings.Contains(q, "date ideas") ||
+		strings.Contains(q, "dating ideas")
 }
 
 func titleForKind(kind string) string {
