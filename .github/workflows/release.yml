@@ -1,0 +1,143 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Existing release tag to publish or validate (for example: v0.1.0)"
+        required: true
+        type: string
+      skip_publish:
+        description: "Build and validate without publishing release assets or Homebrew updates"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  RELEASE_SKIP_PUBLISH: ${{ github.event_name == 'workflow_dispatch' && inputs.skip_publish && '1' || '0' }}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag_name || github.ref }}
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Resolve release metadata
+        env:
+          TAG: ${{ inputs.tag_name || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z]+)*$ ]]; then
+            echo "::error::Invalid release tag: ${TAG}"
+            exit 1
+          fi
+          echo "RELEASE_TAG=${TAG}" >> "$GITHUB_ENV"
+          echo "RELEASE_VERSION=${TAG#v}" >> "$GITHUB_ENV"
+
+      - name: Guard manual release rerun
+        if: ${{ github.event_name == 'workflow_dispatch' && !inputs.skip_publish }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" 2>/dev/null || true)"
+          asset_count="0"
+          if [ -n "${release_json}" ]; then
+            asset_count="$(printf '%s' "${release_json}" | jq -r '(.assets // []) | length')"
+          fi
+          if [ "${asset_count}" != "0" ]; then
+            echo "::error::Release ${RELEASE_TAG} already has ${asset_count} assets. Delete existing assets before republishing, or rerun with skip_publish=true to validate only."
+            exit 1
+          fi
+
+      - name: Verify Homebrew tap token
+        if: ${{ env.RELEASE_SKIP_PUBLISH != '1' }}
+        env:
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${HOMEBREW_TAP_GITHUB_TOKEN:-}" ]; then
+            echo "::error::HOMEBREW_TAP_GITHUB_TOKEN is missing; cannot publish vincentkoc/homebrew-tap formula."
+            exit 1
+          fi
+          code="$(curl -sS -o /tmp/tap.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${HOMEBREW_TAP_GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/vincentkoc/homebrew-tap || true)"
+          if [ "${code}" != "200" ]; then
+            echo "::error::HOMEBREW_TAP_GITHUB_TOKEN cannot access vincentkoc/homebrew-tap (HTTP ${code})."
+            exit 1
+          fi
+
+      - name: Configure GoReleaser
+        run: |
+          set -euo pipefail
+          args="release --clean"
+          if [ "${RELEASE_SKIP_PUBLISH}" = "1" ]; then
+            args="${args} --skip=publish"
+          fi
+          echo "GORELEASER_ARGS=${args}" >> "$GITHUB_ENV"
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: ${{ env.GORELEASER_ARGS }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+
+      - name: Verify GitHub release assets
+        if: ${{ env.RELEASE_SKIP_PUBLISH != '1' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release view "${RELEASE_TAG}" --json tagName,assets --jq '
+            . as $release
+            | if ($release.tagName != env.RELEASE_TAG) then error("release tag mismatch") else . end
+            | [.assets[].name] as $assets
+            | ["tideglass_" + env.RELEASE_VERSION + "_darwin_amd64.tar.gz",
+               "tideglass_" + env.RELEASE_VERSION + "_darwin_arm64.tar.gz",
+               "tideglass_" + env.RELEASE_VERSION + "_linux_amd64.tar.gz",
+               "tideglass_" + env.RELEASE_VERSION + "_linux_arm64.tar.gz",
+               "sha256sums.txt"] as $required
+            | if (($required - $assets) | length) > 0 then error("missing release assets") else "release assets ok" end'
+
+      - name: Verify Homebrew formula
+        if: ${{ env.RELEASE_SKIP_PUBLISH != '1' }}
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          formula="$(gh api repos/vincentkoc/homebrew-tap/contents/Formula/tideglass.rb --jq '.content' | base64 --decode)"
+          if ! grep -q "version \"${RELEASE_VERSION}\"" <<<"$formula"; then
+            echo "::error::vincentkoc/homebrew-tap Formula/tideglass.rb was not updated to ${RELEASE_VERSION}"
+            exit 1
+          fi
+          if ! grep -q "releases/download/v${RELEASE_VERSION}/" <<<"$formula"; then
+            echo "::error::Formula/tideglass.rb does not point at v${RELEASE_VERSION} assets"
+            exit 1
+          fi

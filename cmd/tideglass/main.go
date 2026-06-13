@@ -13,6 +13,8 @@ import (
 	"github.com/vincentkoc/tideglass/internal/app"
 )
 
+var version = "dev"
+
 func main() {
 	if err := run(context.Background(), os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "tideglass:", err)
@@ -26,8 +28,15 @@ func run(ctx context.Context, args []string) error {
 		return nil
 	}
 	command := args[0]
+	if command == "--version" || command == "-v" {
+		fmt.Println(version)
+		return nil
+	}
 	args = args[1:]
 	switch command {
+	case "version":
+		fmt.Println(version)
+		return nil
 	case "init":
 		return runInit(ctx, args)
 	case "sources":
@@ -389,9 +398,10 @@ commands:
   profile edit <claim-id> --set <value>
   profile export --kind <kind>|--intent <id>
   evidence show <claim-id>
-  context --kind <kind> --for-agent codex
-  doctor
-`)
+	  context --kind <kind> --for-agent codex
+	  doctor
+	  version
+	`)
 }
 
 func normalizeFlagArgs(args []string) []string {

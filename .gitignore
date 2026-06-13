@@ -1,6 +1,7 @@
 /tideglass
+/bin/
+/dist/
 *.db
 *.db-shm
 *.db-wal
 *.tgz
-

@@ -1,0 +1,83 @@
+version: 2
+
+project_name: tideglass
+
+builds:
+  - id: tideglass
+    main: ./cmd/tideglass
+    binary: tideglass
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+archives:
+  - id: bundles
+    ids:
+      - tideglass
+    formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+
+checksum:
+  name_template: "sha256sums.txt"
+  algorithm: sha256
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - "^Merge pull request"
+      - "^Merge branch"
+
+nfpms:
+  - id: linux-packages
+    ids:
+      - tideglass
+    package_name: tideglass
+    file_name_template: "{{ .ConventionalFileName }}"
+    homepage: https://github.com/vincentkoc/tideglass
+    maintainer: Vincent Koc <vincent@vincentkoc.com>
+    description: Portable intent and preference profiles for local-first agents.
+    formats:
+      - deb
+      - rpm
+    bindir: /usr/bin
+    section: utils
+    priority: optional
+    contents:
+      - src: ./README.md
+        dst: /usr/share/doc/tideglass/README.md
+
+brews:
+  - name: tideglass
+    ids:
+      - tideglass
+    repository:
+      owner: vincentkoc
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    directory: Formula
+    commit_author:
+      name: github-actions[bot]
+      email: 41898282+github-actions[bot]@users.noreply.github.com
+    commit_msg_template: "tideglass: update formula for {{ .Tag }}"
+    homepage: https://github.com/vincentkoc/tideglass
+    description: Portable intent and preference profiles for local-first agents
+    install: |
+      bin.install "tideglass"
+    test: |
+      system bin/"tideglass", "version"
