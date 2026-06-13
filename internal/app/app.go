@@ -916,7 +916,9 @@ select c.id, c.kind,
        c.confidence, c.status, c.source_mode
 from claims c
 left join edits e on e.id = (
-  select id from edits where claim_id = c.id order by created_at desc, rowid desc limit 1
+  select id from edits
+  where claim_id = c.id and json_extract(patch_json, '$.value') is not null
+  order by created_at desc, rowid desc limit 1
 )
 where c.intent_id = ?
   and c.status != 'rejected'
