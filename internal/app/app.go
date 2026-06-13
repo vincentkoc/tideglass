@@ -1486,7 +1486,7 @@ func importAssistantZip(kind, path string, limit int) ([]artifact, error) {
 		}
 		rc, err := file.Open()
 		if err != nil {
-			continue
+			return nil, err
 		}
 		data, err := readAllLimited(rc, assistantJSONLimit, file.Name)
 		_ = rc.Close()
