@@ -1596,7 +1596,7 @@ func normalizeKind(kind, query string) string {
 	switch {
 	case strings.Contains(q, "dinner"):
 		return "social.dinner"
-	case strings.Contains(q, "dating") || hasWord(q, "date"):
+	case strings.Contains(q, "dating") || hasAnyWord(q, "date", "dates"):
 		return "social.dating"
 	case strings.Contains(q, "new job"):
 		return "work.new_job"
@@ -1607,9 +1607,13 @@ func normalizeKind(kind, query string) string {
 	}
 }
 
-func hasWord(text, target string) bool {
+func hasAnyWord(text string, targets ...string) bool {
+	targetSet := map[string]bool{}
+	for _, target := range targets {
+		targetSet[target] = true
+	}
 	for _, word := range words(text) {
-		if word == target {
+		if targetSet[word] {
 			return true
 		}
 	}
