@@ -270,6 +270,51 @@ func TestExportProfileIncludesEvidenceRecords(t *testing.T) {
 	}
 }
 
+func TestExportProfileRejectsDatabaseOutputPath(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "tideglass.db")
+	tg, err := Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	if _, err := tg.ensureIntent(ctx, "work.project.start", "Project start"); err != nil {
+		t.Fatal(err)
+	}
+	_, err = tg.ExportProfile(ctx, ExportOptions{Kind: "work.project.start", Out: dbPath})
+	if err == nil {
+		t.Fatal("expected export over active db to fail")
+	}
+	if !strings.Contains(err.Error(), "active database") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestExportProfileExpandsHomeOutputPath(t *testing.T) {
+	ctx := context.Background()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	if _, err := tg.ensureIntent(ctx, "work.project.start", "Project start"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := tg.ExportProfile(ctx, ExportOptions{Kind: "work.project.start", Out: "~/profile.tgz"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(home, "profile.tgz")
+	if result.Path != want {
+		t.Fatalf("path = %q, want %q", result.Path, want)
+	}
+	if _, err := os.Stat(want); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestAssistantExportImporterReadsZipAndImportedMemories(t *testing.T) {
 	zipPath := filepath.Join(t.TempDir(), "chatgpt-export.zip")
 	file, err := os.Create(zipPath)

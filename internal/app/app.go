@@ -521,6 +521,19 @@ func (t *Tideglass) ExportProfile(ctx context.Context, opts ExportOptions) (Expo
 	out := opts.Out
 	if out == "" {
 		out = filepath.Join(filepath.Dir(t.path), "tideglass-"+profile.Intent.Kind+"-"+time.Now().UTC().Format("20060102T150405Z")+".tgz")
+	} else {
+		out = expandHome(out)
+	}
+	outPath, err := resolvedWritePath(out)
+	if err != nil {
+		return ExportResult{}, err
+	}
+	dbPath, err := resolvedWritePath(t.path)
+	if err != nil {
+		return ExportResult{}, err
+	}
+	if outPath == dbPath {
+		return ExportResult{}, fmt.Errorf("refusing to export over active database path %s", out)
 	}
 	if err := os.MkdirAll(filepath.Dir(out), 0o700); err != nil {
 		return ExportResult{}, err
@@ -573,6 +586,21 @@ func (t *Tideglass) ExportProfile(ctx context.Context, opts ExportOptions) (Expo
 		return ExportResult{}, err
 	}
 	return ExportResult{Path: out, Format: "tgz", Records: records}, nil
+}
+
+func resolvedWritePath(path string) (string, error) {
+	abs, err := filepath.Abs(expandHome(path))
+	if err != nil {
+		return "", err
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return filepath.Clean(resolved), nil
+	}
+	parent := filepath.Dir(abs)
+	if resolvedParent, err := filepath.EvalSymlinks(parent); err == nil {
+		return filepath.Clean(filepath.Join(resolvedParent, filepath.Base(abs))), nil
+	}
+	return filepath.Clean(abs), nil
 }
 
 func (t *Tideglass) Doctor(ctx context.Context) (DoctorResult, error) {
