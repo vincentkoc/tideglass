@@ -2,6 +2,11 @@ version: 2
 
 project_name: tideglass
 
+release:
+  github:
+    owner: vincentkoc
+    name: tideglass
+
 builds:
   - id: tideglass
     main: ./cmd/tideglass
