@@ -699,7 +699,7 @@ select c.id, c.kind,
        c.confidence, c.status, c.source_mode
 from claims c
 left join edits e on e.id = (
-  select id from edits where claim_id = c.id order by created_at desc limit 1
+  select id from edits where claim_id = c.id order by created_at desc, rowid desc limit 1
 )
 where c.intent_id = ?
 order by case when e.id is null then 0 else 1 end desc, c.confidence desc, c.created_at desc`, intentID)
@@ -1053,14 +1053,19 @@ func probeSQLite(ctx context.Context, source SourceStatus, path string, tables m
 	source.Health = "ok"
 	source.Capabilities = caps
 	source.Counts = map[string]int64{}
+	probeErrors := 0
 	for label, table := range tables {
 		var count int64
 		query := `select count(*) from ` + store.QuoteIdent(table)
 		if err := ro.DB().QueryRowContext(ctx, query).Scan(&count); err != nil {
 			source.LastError = strings.TrimSpace(source.LastError + "; " + err.Error())
+			probeErrors++
 			continue
 		}
 		source.Counts[label] = count
+	}
+	if probeErrors > 0 {
+		source.Health = "partial"
 	}
 	return source
 }

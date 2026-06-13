@@ -142,6 +142,65 @@ func TestEditOverlayMaterializesWithoutMutatingClaim(t *testing.T) {
 	}
 }
 
+func TestEditOverlayUsesLatestSameSecondEdit(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	intent, err := tg.ensureIntent(ctx, "work.project.start", "Project start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "preference.agent.communication",
+		Value:      "original value",
+		Confidence: 0.7,
+		SourceMode: "inferred",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stamp := "2026-06-13T00:00:00Z"
+	for _, value := range []string{"first value", "second value"} {
+		patch := `{"value":"` + value + `"}`
+		if _, err := tg.db.ExecContext(ctx, `insert into edits(id,claim_id,operation,patch_json,reason,created_at) values(?,?,?,?,?,?)`,
+			id("edt"), claimID, "supersede", patch, "same-second regression", stamp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	claims, err := tg.loadClaims(ctx, intent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claims) != 1 || claims[0].Value != "second value" {
+		t.Fatalf("materialized claims = %#v", claims)
+	}
+}
+
+func TestProbeSQLiteMarksMissingExpectedTablesPartial(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	status := probeSQLite(ctx, SourceStatus{ID: "fake", Kind: "fake"}, tg.path, map[string]string{
+		"existing": "schema_migrations",
+		"missing":  "missing_table",
+	}, []string{"metadata"})
+	if status.Health != "partial" {
+		t.Fatalf("health = %q, want partial", status.Health)
+	}
+	if status.Counts["existing"] == 0 {
+		t.Fatalf("expected existing table count, got %#v", status.Counts)
+	}
+	if !strings.Contains(status.LastError, "missing_table") {
+		t.Fatalf("missing table error not reported: %q", status.LastError)
+	}
+}
+
 func TestAssistantExportImporterReadsZipAndImportedMemories(t *testing.T) {
 	zipPath := filepath.Join(t.TempDir(), "chatgpt-export.zip")
 	file, err := os.Create(zipPath)
