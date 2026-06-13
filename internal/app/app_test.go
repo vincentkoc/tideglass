@@ -1,9 +1,12 @@
 package app
 
 import (
+	"archive/tar"
 	"archive/zip"
 	"bytes"
+	"compress/gzip"
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -201,6 +204,72 @@ func TestProbeSQLiteMarksMissingExpectedTablesPartial(t *testing.T) {
 	}
 }
 
+func TestProbeCodexMissingPathIsError(t *testing.T) {
+	status := probeSource(context.Background(), SourceStatus{
+		ID:      "codex",
+		Kind:    "codex",
+		Locator: filepath.Join(t.TempDir(), "missing"),
+	})
+	if status.Health != "error" {
+		t.Fatalf("health = %q, want error", status.Health)
+	}
+	if status.LastError == "" {
+		t.Fatal("expected missing path error")
+	}
+}
+
+func TestExportProfileIncludesEvidenceRecords(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	if err := tg.upsertSource(ctx, SourceStatus{ID: "codex", Kind: "import", Label: "Codex", Health: "ok"}); err != nil {
+		t.Fatal(err)
+	}
+	intent, err := tg.ensureIntent(ctx, "work.project.start", "Project start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidenceID, err := tg.upsertArtifactEvidence(ctx, artifact{
+		SourceID:   "codex",
+		ExternalID: "session-1",
+		Kind:       "codex_event",
+		Title:      "session",
+		Snippet:    "Always preserve exact evidence for portable Tideglass profile exports.",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "preference.agent.evidence",
+		Value:      "preserve exact evidence",
+		Confidence: 0.8,
+		SourceMode: "inferred",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.db.ExecContext(ctx, `insert into claim_evidence(claim_id,evidence_id,role) values(?,?,?)`, claimID, evidenceID, "supporting"); err != nil {
+		t.Fatal(err)
+	}
+	outPath := filepath.Join(t.TempDir(), "profile.tgz")
+	if _, err := tg.ExportProfile(ctx, ExportOptions{Kind: "work.project.start", Out: outPath}); err != nil {
+		t.Fatal(err)
+	}
+	entries := readTGZEntries(t, outPath)
+	if !strings.Contains(entries["claims.jsonl"], evidenceID) {
+		t.Fatalf("claims export missing evidence id %q: %s", evidenceID, entries["claims.jsonl"])
+	}
+	if !strings.Contains(entries["evidence.jsonl"], evidenceID) {
+		t.Fatalf("evidence export missing evidence id %q: %s", evidenceID, entries["evidence.jsonl"])
+	}
+	if !strings.Contains(entries["profile.json"], evidenceID) {
+		t.Fatalf("profile export missing evidence id %q: %s", evidenceID, entries["profile.json"])
+	}
+}
+
 func TestAssistantExportImporterReadsZipAndImportedMemories(t *testing.T) {
 	zipPath := filepath.Join(t.TempDir(), "chatgpt-export.zip")
 	file, err := os.Create(zipPath)
@@ -228,6 +297,38 @@ func TestAssistantExportImporterReadsZipAndImportedMemories(t *testing.T) {
 	}
 	if len(claims) != 0 {
 		t.Fatalf("raw importer should leave claim linking to ingest, got %d", len(claims))
+	}
+}
+
+func TestAssistantImportLimitCountsArtifactsNotJSONFiles(t *testing.T) {
+	zipPath := filepath.Join(t.TempDir(), "chatgpt-export.zip")
+	file, err := os.Create(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(file)
+	metadata, err := zw.Create("metadata.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = metadata.Write([]byte(`{"title":"short"}`))
+	conversation, err := zw.Create("conversations.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = conversation.Write([]byte(`[{"messages":[{"content":"Remember that Tideglass imports should keep scanning files until the requested artifact budget is filled."}]}]`))
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	artifacts, _, err := importAssistantExport("chatgpt", zipPath, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(artifacts) != 1 || !strings.Contains(artifacts[0].Snippet, "keep scanning files") {
+		t.Fatalf("artifacts = %#v", artifacts)
 	}
 }
 
@@ -368,4 +469,35 @@ func TestImportedMemoriesDoNotCollapseInProfile(t *testing.T) {
 	if len(claims) != 2 {
 		t.Fatalf("claims collapsed: %#v", claims)
 	}
+}
+
+func readTGZEntries(t *testing.T, path string) map[string]string {
+	t.Helper()
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	gz, err := gzip.NewReader(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gz.Close()
+	tr := tar.NewReader(gz)
+	entries := map[string]string{}
+	for {
+		header, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := io.ReadAll(tr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		entries[header.Name] = string(data)
+	}
+	return entries
 }

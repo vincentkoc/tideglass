@@ -149,6 +149,7 @@ type ProfileResult struct {
 	Intent              IntentOut        `json:"intent"`
 	ForAgent            string           `json:"for_agent,omitempty"`
 	Claims              []ClaimOut       `json:"claims"`
+	Evidence            []EvidenceOut    `json:"evidence,omitempty"`
 	UnresolvedQuestions []string         `json:"unresolved_questions,omitempty"`
 	SourceCoverage      []SourceCoverage `json:"source_coverage,omitempty"`
 	Text                string           `json:"text,omitempty"`
@@ -456,8 +457,13 @@ func (t *Tideglass) Profile(ctx context.Context, opts ProfileOptions) (ProfileRe
 	if err != nil {
 		return ProfileResult{}, err
 	}
+	evidence := []EvidenceOut(nil)
+	claims, evidence, err = t.attachClaimEvidence(ctx, claims)
+	if err != nil {
+		return ProfileResult{}, err
+	}
 	unresolved := unresolvedQuestions(intent.Kind, claims)
-	result := ProfileResult{Intent: intent, ForAgent: opts.ForAgent, Claims: claims, UnresolvedQuestions: unresolved}
+	result := ProfileResult{Intent: intent, ForAgent: opts.ForAgent, Claims: claims, Evidence: evidence, UnresolvedQuestions: unresolved}
 	if opts.ForAgent != "" || opts.Budget > 0 {
 		result.Text = renderAgentContext(intent, claims, unresolved, opts.Budget)
 	}
@@ -547,6 +553,13 @@ func (t *Tideglass) ExportProfile(ctx context.Context, opts ExportOptions) (Expo
 		return ExportResult{}, err
 	}
 	records += len(profile.Claims)
+	if err := writeTarJSONL(tw, "evidence.jsonl", profile.Evidence); err != nil {
+		_ = tw.Close()
+		_ = gz.Close()
+		_ = file.Close()
+		return ExportResult{}, err
+	}
+	records += len(profile.Evidence)
 	if err := tw.Close(); err != nil {
 		_ = gz.Close()
 		_ = file.Close()
@@ -725,6 +738,42 @@ order by case when e.id is null then 0 else 1 end desc, c.confidence desc, c.cre
 		claims = append(claims, claim)
 	}
 	return claims, rows.Err()
+}
+
+func (t *Tideglass) attachClaimEvidence(ctx context.Context, claims []ClaimOut) ([]ClaimOut, []EvidenceOut, error) {
+	if len(claims) == 0 {
+		return claims, nil, nil
+	}
+	evidenceByID := map[string]EvidenceOut{}
+	var evidence []EvidenceOut
+	for index := range claims {
+		rows, err := t.db.QueryContext(ctx, `
+select e.id, sa.source_id, e.locator_json, e.snippet
+from claim_evidence ce
+join evidence e on e.id = ce.evidence_id
+join source_artifacts sa on sa.id = e.source_artifact_id
+where ce.claim_id = ?
+order by e.observed_at desc, e.id`, claims[index].ID)
+		if err != nil {
+			return nil, nil, err
+		}
+		for rows.Next() {
+			var ev EvidenceOut
+			if err := rows.Scan(&ev.ID, &ev.SourceID, &ev.Locator, &ev.Snippet); err != nil {
+				_ = rows.Close()
+				return nil, nil, err
+			}
+			claims[index].Evidence = append(claims[index].Evidence, ev.ID)
+			if _, ok := evidenceByID[ev.ID]; !ok {
+				evidenceByID[ev.ID] = ev
+				evidence = append(evidence, ev)
+			}
+		}
+		if err := rows.Close(); err != nil {
+			return nil, nil, err
+		}
+	}
+	return claims, evidence, nil
 }
 
 func (t *Tideglass) embedText(ctx context.Context, ownerKind, ownerID, text string) error {
@@ -1016,15 +1065,23 @@ func probeSource(ctx context.Context, source SourceStatus) SourceStatus {
 		return probeSQLite(ctx, source, source.Locator, map[string]string{"notes": "notes", "transcripts": "transcript_chunks"}, []string{"fts", "metadata", "text"})
 	case "codex":
 		count := int64(0)
-		_ = filepath.WalkDir(expandHome(source.Locator), func(path string, d fs.DirEntry, err error) error {
-			if err == nil && !d.IsDir() && strings.HasSuffix(path, ".jsonl") {
+		err := filepath.WalkDir(expandHome(source.Locator), func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if !d.IsDir() && strings.HasSuffix(path, ".jsonl") {
 				count++
 			}
 			return nil
 		})
-		source.Health = "ok"
 		source.Capabilities = []string{"metadata", "text"}
 		source.Counts = map[string]int64{"session_files": count}
+		if err != nil {
+			source.Health = "error"
+			source.LastError = err.Error()
+			return source
+		}
+		source.Health = "ok"
 		return source
 	default:
 		if source.Kind == "import" {
@@ -1186,9 +1243,9 @@ func importAssistantExport(kind, path string, limit int) ([]artifact, []candidat
 	}
 	var blobs []namedBlob
 	if info.IsDir() {
-		blobs, err = readJSONFiles(path, limit)
+		blobs, err = readJSONFiles(path)
 	} else if strings.HasSuffix(strings.ToLower(path), ".zip") {
-		blobs, err = readZipJSON(path, limit)
+		blobs, err = readZipJSON(path)
 	} else {
 		data, readErr := readFileLimited(path)
 		err = readErr
@@ -1227,6 +1284,9 @@ func importAssistantExport(kind, path string, limit int) ([]artifact, []candidat
 				LocatorJSON:  string(locator),
 			})
 		}
+		if limit > 0 && len(artifacts) >= limit {
+			break
+		}
 	}
 	return artifacts, claims, nil
 }
@@ -1236,7 +1296,7 @@ type namedBlob struct {
 	Data []byte
 }
 
-func readZipJSON(path string, limit int) ([]namedBlob, error) {
+func readZipJSON(path string) ([]namedBlob, error) {
 	zr, err := zip.OpenReader(path)
 	if err != nil {
 		return nil, err
@@ -1244,9 +1304,6 @@ func readZipJSON(path string, limit int) ([]namedBlob, error) {
 	defer zr.Close()
 	var out []namedBlob
 	for _, file := range zr.File {
-		if limit > 0 && len(out) >= limit {
-			break
-		}
 		if file.FileInfo().IsDir() || !strings.HasSuffix(strings.ToLower(file.Name), ".json") {
 			continue
 		}
@@ -1286,14 +1343,14 @@ func readAllLimited(reader io.Reader, limit int64, name string) ([]byte, error) 
 	return buf.Bytes(), nil
 }
 
-func readJSONFiles(root string, limit int) ([]namedBlob, error) {
+func readJSONFiles(root string) ([]namedBlob, error) {
 	var out []namedBlob
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() || !strings.HasSuffix(strings.ToLower(path), ".json") {
-			return nil
+		if err != nil {
+			return err
 		}
-		if limit > 0 && len(out) >= limit {
-			return filepath.SkipAll
+		if d.IsDir() || !strings.HasSuffix(strings.ToLower(path), ".json") {
+			return nil
 		}
 		data, err := readFileLimited(path)
 		if err == nil {
