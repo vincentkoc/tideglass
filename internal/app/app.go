@@ -1078,12 +1078,15 @@ func importCodex(root string, limit int) ([]artifact, []candidateClaim, error) {
 	}
 	var files []codexFile
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".jsonl") {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || !strings.HasSuffix(path, ".jsonl") {
 			return nil
 		}
 		info, statErr := d.Info()
 		if statErr != nil {
-			return nil
+			return statErr
 		}
 		files = append(files, codexFile{Path: path, ModTime: info.ModTime()})
 		return nil
@@ -1102,7 +1105,7 @@ func importCodex(root string, limit int) ([]artifact, []candidateClaim, error) {
 		}
 		file, err := os.Open(path)
 		if err != nil {
-			continue
+			return nil, nil, err
 		}
 		reader := bufio.NewReaderSize(file, 1024*1024)
 		lineNo := 0

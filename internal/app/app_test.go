@@ -293,6 +293,13 @@ func TestCodexImportSurvivesOversizedSkippedLine(t *testing.T) {
 	}
 }
 
+func TestCodexImportMissingPathFails(t *testing.T) {
+	_, _, err := importCodex(filepath.Join(t.TempDir(), "missing"), 0)
+	if err == nil {
+		t.Fatal("expected missing codex path to fail")
+	}
+}
+
 func TestAssistantIngestLinksImportedMemoryEvidence(t *testing.T) {
 	ctx := context.Background()
 	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
