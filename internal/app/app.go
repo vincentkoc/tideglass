@@ -1215,7 +1215,9 @@ func crawlbarBinary() (string, error) {
 }
 
 func crawlbarDatabasePath(ctx context.Context, bin, appID string) string {
-	cmd := exec.CommandContext(ctx, bin, "status", "--app", appID, "--json")
+	statusCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(statusCtx, bin, "status", "--app", appID, "--json")
 	output, err := cmd.Output()
 	if err != nil {
 		return ""
@@ -1255,9 +1257,9 @@ func probeSource(ctx context.Context, source SourceStatus) SourceStatus {
 		return probeSQLite(ctx, source, source.Locator, map[string]string{"messages": "messages", "channels": "channels", "users": "users"}, []string{"fts", "metadata", "text"})
 	case "discrawl":
 		out := probeSQLite(ctx, source, source.Locator, map[string]string{"messages": "messages", "members": "members", "embeddings": "message_embeddings"}, []string{"fts", "semantic", "metadata", "text"})
-		if out.Health == "ok" {
+		if out.Health == "ok" && out.Counts["embeddings"] == 0 {
 			out.Health = "partial"
-			out.LastError = "CrawlBar status reports schema version mismatch; direct read-only probe is usable"
+			out.LastError = "discrawl has no message embeddings; direct text probe is usable"
 		}
 		return out
 	case "notcrawl":

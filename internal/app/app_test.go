@@ -254,6 +254,38 @@ func TestProbeSQLiteMarksMissingExpectedTablesPartial(t *testing.T) {
 	}
 }
 
+func TestProbeDiscrawlHealthReflectsEmbeddingAvailability(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "discrawl.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, statement := range []string{
+		`create table messages(id integer primary key)`,
+		`create table members(id integer primary key)`,
+		`create table message_embeddings(id integer primary key)`,
+		`insert into messages(id) values(1)`,
+		`insert into members(id) values(1)`,
+	} {
+		if _, err := db.ExecContext(ctx, statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	status := probeSource(ctx, SourceStatus{ID: "discrawl", Kind: "crawl", Locator: dbPath})
+	if status.Health != "partial" || !strings.Contains(status.LastError, "no message embeddings") {
+		t.Fatalf("status without embeddings = %#v", status)
+	}
+	if _, err := db.ExecContext(ctx, `insert into message_embeddings(id) values(1)`); err != nil {
+		t.Fatal(err)
+	}
+	status = probeSource(ctx, SourceStatus{ID: "discrawl", Kind: "crawl", Locator: dbPath, LastError: "old"})
+	if status.Health != "ok" || status.LastError != "" {
+		t.Fatalf("status with embeddings = %#v", status)
+	}
+}
+
 func TestProbeCodexMissingPathIsError(t *testing.T) {
 	status := probeSource(context.Background(), SourceStatus{
 		ID:      "codex",
