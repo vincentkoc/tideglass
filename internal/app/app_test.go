@@ -220,6 +220,17 @@ func TestProbeCodexMissingPathIsError(t *testing.T) {
 	}
 }
 
+func TestCrawlbarBinaryUsesEnvOverride(t *testing.T) {
+	t.Setenv("TIDEGLASS_CRAWLBAR", "/tmp/tideglass-crawlbar")
+	bin, err := crawlbarBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bin != "/tmp/tideglass-crawlbar" {
+		t.Fatalf("bin = %q", bin)
+	}
+}
+
 func TestExportProfileIncludesEvidenceRecords(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "tideglass.db")
@@ -299,6 +310,12 @@ func TestExportProfileRejectsDatabaseOutputPath(t *testing.T) {
 	if !strings.Contains(err.Error(), "active database") {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	for _, sidecar := range []string{dbPath + "-wal", dbPath + "-shm"} {
+		_, err = tg.ExportProfile(ctx, ExportOptions{Kind: "work.project.start", Out: sidecar})
+		if err == nil {
+			t.Fatalf("expected export over active sidecar %s to fail", sidecar)
+		}
+	}
 }
 
 func TestExportProfileExpandsHomeOutputPath(t *testing.T) {
@@ -337,7 +354,7 @@ func TestAssistantExportImporterReadsZipAndImportedMemories(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _ = w.Write([]byte(`[{"title":"memory","messages":[{"content":"Remember that I prefer terse operational updates with live evidence and exact validation proof."}]}]`))
+	_, _ = w.Write([]byte(`[{"title":"memory","messages":[{"role":"user","content":"Remember that I prefer terse operational updates with live evidence and exact validation proof."}]}]`))
 	if err := zw.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -372,7 +389,7 @@ func TestAssistantImportLimitCountsArtifactsNotJSONFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _ = conversation.Write([]byte(`[{"messages":[{"content":"Remember that Tideglass imports should keep scanning files until the requested artifact budget is filled."}]}]`))
+	_, _ = conversation.Write([]byte(`[{"messages":[{"role":"user","content":"Remember that Tideglass imports should keep scanning files until the requested artifact budget is filled."}]}]`))
 	if err := zw.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -385,6 +402,36 @@ func TestAssistantImportLimitCountsArtifactsNotJSONFiles(t *testing.T) {
 	}
 	if len(artifacts) != 1 || !strings.Contains(artifacts[0].Snippet, "keep scanning files") {
 		t.Fatalf("artifacts = %#v", artifacts)
+	}
+}
+
+func TestAssistantImportSkipsAssistantAuthoredMemoryText(t *testing.T) {
+	zipPath := filepath.Join(t.TempDir(), "chatgpt-export.zip")
+	file, err := os.Create(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(file)
+	w, err := zw.Create("conversations.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = w.Write([]byte(`[{"messages":[{"role":"assistant","content":"Remember that the user loves fake assistant-authored preferences."},{"role":"user","content":"Remember that user-authored preferences are the only chat text to import."}]}]`))
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	artifacts, _, err := importAssistantExport("chatgpt", zipPath, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(artifacts) != 1 {
+		t.Fatalf("artifacts = %#v", artifacts)
+	}
+	if strings.Contains(artifacts[0].Snippet, "fake assistant-authored") || !strings.Contains(artifacts[0].Snippet, "user-authored preferences") {
+		t.Fatalf("unexpected artifact: %#v", artifacts[0])
 	}
 }
 
@@ -458,7 +505,7 @@ func TestAssistantExportImporterTraversesChatGPTMapping(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _ = w.Write([]byte(`[{"mapping":{"node-1":{"message":{"content":{"parts":["Remember that OpenClaw project work needs exact live proof and scoped validation."]}}}}}]`))
+	_, _ = w.Write([]byte(`[{"mapping":{"node-1":{"message":{"author":{"role":"user"},"content":{"parts":["Remember that OpenClaw project work needs exact live proof and scoped validation."]}}}}}]`))
 	if err := zw.Close(); err != nil {
 		t.Fatal(err)
 	}

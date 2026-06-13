@@ -546,7 +546,12 @@ func (t *Tideglass) ExportProfile(ctx context.Context, opts ExportOptions) (Expo
 	if err != nil {
 		return ExportResult{}, err
 	}
-	if outPath == dbPath {
+	blockedPaths := map[string]bool{
+		dbPath:          true,
+		dbPath + "-wal": true,
+		dbPath + "-shm": true,
+	}
+	if blockedPaths[outPath] {
 		return ExportResult{}, fmt.Errorf("refusing to export over active database path %s", out)
 	}
 	if err := os.MkdirAll(filepath.Dir(out), 0o700); err != nil {
@@ -1151,13 +1156,9 @@ func discoverStaticSources() []SourceStatus {
 }
 
 func discoverCrawlBar(ctx context.Context) ([]SourceStatus, error) {
-	bin := "/Users/vincentkoc/.local/bin/crawlbar"
-	if _, err := os.Stat(bin); err != nil {
-		var lookErr error
-		bin, lookErr = exec.LookPath("crawlbar")
-		if lookErr != nil {
-			return nil, err
-		}
+	bin, err := crawlbarBinary()
+	if err != nil {
+		return nil, err
 	}
 	cmd := exec.CommandContext(ctx, bin, "apps", "--json")
 	output, err := cmd.Output()
@@ -1189,6 +1190,24 @@ func discoverCrawlBar(ctx context.Context) ([]SourceStatus, error) {
 		})
 	}
 	return out, nil
+}
+
+func crawlbarBinary() (string, error) {
+	for _, envKey := range []string{"TIDEGLASS_CRAWLBAR", "CRAWLBAR_BIN"} {
+		if value := strings.TrimSpace(os.Getenv(envKey)); value != "" {
+			return value, nil
+		}
+	}
+	if bin, err := exec.LookPath("crawlbar"); err == nil {
+		return bin, nil
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		bin := filepath.Join(home, ".local", "bin", "crawlbar")
+		if _, statErr := os.Stat(bin); statErr == nil {
+			return bin, nil
+		}
+	}
+	return "", errors.New("crawlbar binary not found")
 }
 
 func crawlbarDatabasePath(ctx context.Context, bin, appID string) string {
@@ -1442,7 +1461,7 @@ func importAssistantExport(kind, path string, limit int) ([]artifact, []candidat
 		if err := json.Unmarshal(blob.Data, &value); err != nil {
 			continue
 		}
-		texts := collectTexts(value, nil)
+		texts := collectAssistantTexts(value)
 		for index, text := range texts {
 			if limit > 0 && len(artifacts) >= limit {
 				break
@@ -2199,6 +2218,102 @@ func collectTexts(value any, out []string) []string {
 		}
 	}
 	return out
+}
+
+func collectAssistantTexts(value any) []string {
+	return collectAssistantTextsValue(value, nil)
+}
+
+func collectAssistantTextsValue(value any, out []string) []string {
+	switch v := value.(type) {
+	case []any:
+		for _, item := range v {
+			out = collectAssistantTextsValue(item, out)
+		}
+	case map[string]any:
+		if role, ok := assistantMessageRole(v); ok {
+			if !userAssistantExportRole(role) {
+				return out
+			}
+			out = collectAssistantMessageText(v, out)
+			if memory, ok := lookupMapValue(v, "memory"); ok {
+				out = collectTexts(memory, out)
+			}
+			return out
+		}
+		if memory, ok := lookupMapValue(v, "memory"); ok {
+			out = collectTexts(memory, out)
+		}
+		if message, ok := lookupMapValue(v, "message"); ok {
+			out = collectAssistantTextsValue(message, out)
+		}
+		for _, key := range []string{"messages", "chat_messages", "mapping", "conversations", "items", "children", "payload"} {
+			if item, ok := lookupMapValue(v, key); ok {
+				if key == "mapping" {
+					if mapping, ok := item.(map[string]any); ok {
+						keys := make([]string, 0, len(mapping))
+						for mappingKey := range mapping {
+							keys = append(keys, mappingKey)
+						}
+						sort.Strings(keys)
+						for _, mappingKey := range keys {
+							out = collectAssistantTextsValue(mapping[mappingKey], out)
+						}
+						continue
+					}
+				}
+				out = collectAssistantTextsValue(item, out)
+			}
+		}
+	}
+	return out
+}
+
+func assistantMessageRole(v map[string]any) (string, bool) {
+	for _, key := range []string{"role", "sender"} {
+		if item, ok := lookupMapValue(v, key); ok {
+			if role, ok := item.(string); ok && strings.TrimSpace(role) != "" {
+				return role, true
+			}
+		}
+	}
+	if author, ok := lookupMapValue(v, "author"); ok {
+		if authorMap, ok := author.(map[string]any); ok {
+			if item, ok := lookupMapValue(authorMap, "role"); ok {
+				if role, ok := item.(string); ok && strings.TrimSpace(role) != "" {
+					return role, true
+				}
+			}
+		}
+	}
+	return "", false
+}
+
+func userAssistantExportRole(role string) bool {
+	switch strings.ToLower(strings.TrimSpace(role)) {
+	case "user", "human":
+		return true
+	default:
+		return false
+	}
+}
+
+func collectAssistantMessageText(v map[string]any, out []string) []string {
+	for _, key := range []string{"content", "text", "parts"} {
+		if item, ok := lookupMapValue(v, key); ok {
+			out = collectTexts(item, out)
+		}
+	}
+	return out
+}
+
+func lookupMapValue(v map[string]any, key string) (any, bool) {
+	for candidate, value := range v {
+		if strings.EqualFold(candidate, key) {
+			return value, true
+		}
+	}
+	return nil, false
 }
 
 func noisyExportKey(key string) bool {
