@@ -55,6 +55,15 @@ func TestSourceRoutingKeepsSocialQueriesOutOfProjectStores(t *testing.T) {
 	}
 }
 
+func TestNormalizeKindDoesNotTreatValidateOrUpdateAsDating(t *testing.T) {
+	if got := normalizeKind("", "validate the OpenClaw update path"); got != "work.project.start" {
+		t.Fatalf("kind = %q, want work.project.start", got)
+	}
+	if got := normalizeKind("", "plan a date"); got != "social.dating" {
+		t.Fatalf("kind = %q, want social.dating", got)
+	}
+}
+
 func TestFTSQueryStripsReservedPunctuation(t *testing.T) {
 	query := ftsQuery("openclaw-m1 exact-SHA go-humanize c++")
 	if strings.ContainsAny(query, "+-") {
@@ -247,5 +256,35 @@ func TestAssistantIngestLinksImportedMemoryEvidence(t *testing.T) {
 	}
 	if linked == 0 {
 		t.Fatal("expected claim evidence link")
+	}
+}
+
+func TestImportedMemoriesDoNotCollapseInProfile(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	intent, err := tg.ensureIntent(ctx, "agent.delegation", "Agent delegation")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []string{"Remember terse updates.", "Remember live evidence."} {
+		if _, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+			Kind:       "preference.agent.imported_memory",
+			Value:      value,
+			Confidence: 0.9,
+			SourceMode: "imported_memory",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	claims, err := tg.loadClaims(ctx, intent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claims) != 2 {
+		t.Fatalf("claims collapsed: %#v", claims)
 	}
 }

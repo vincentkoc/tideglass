@@ -1451,6 +1451,9 @@ func unresolvedQuestions(kind string, claims []ClaimOut) []string {
 }
 
 func singletonClaimKind(kind string) bool {
+	if kind == "preference.agent.imported_memory" {
+		return false
+	}
 	return strings.HasPrefix(kind, "preference.agent.") ||
 		strings.HasPrefix(kind, "boundary.agent.") ||
 		strings.HasPrefix(kind, "preference.project.") ||
@@ -1593,7 +1596,7 @@ func normalizeKind(kind, query string) string {
 	switch {
 	case strings.Contains(q, "dinner"):
 		return "social.dinner"
-	case strings.Contains(q, "date") || strings.Contains(q, "dating"):
+	case strings.Contains(q, "dating") || hasWord(q, "date"):
 		return "social.dating"
 	case strings.Contains(q, "new job"):
 		return "work.new_job"
@@ -1602,6 +1605,15 @@ func normalizeKind(kind, query string) string {
 	default:
 		return "work.project.start"
 	}
+}
+
+func hasWord(text, target string) bool {
+	for _, word := range words(text) {
+		if word == target {
+			return true
+		}
+	}
+	return false
 }
 
 func titleForKind(kind string) string {
