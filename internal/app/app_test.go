@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"io"
 	"os"
@@ -411,6 +412,37 @@ func TestRetrieveImportedSearchesEvidenceFTS(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(found) != 1 || !strings.Contains(found[0].Snippet, "imported memories") {
+		t.Fatalf("found = %#v", found)
+	}
+}
+
+func TestRetrieveGitcrawlFallsBackToBodyColumn(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	if err := tg.upsertSource(ctx, SourceStatus{ID: "gitcrawl", Kind: "crawl", Label: "GitHub", Health: "ok"}); err != nil {
+		t.Fatal(err)
+	}
+	gitcrawlPath := filepath.Join(t.TempDir(), "gitcrawl.db")
+	db, err := sql.Open("sqlite", gitcrawlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.ExecContext(ctx, `create table threads (id integer primary key, title text not null, body text, html_url text not null, updated_at_gh text)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `insert into threads(id,title,body,html_url,updated_at_gh) values(1,'Fallback schema','adaptive schema body text','https://example.invalid/1','2026-06-13T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	found, err := tg.retrieveGitcrawl(ctx, SourceStatus{ID: "gitcrawl", Locator: gitcrawlPath}, "adaptive schema", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(found) != 1 || !strings.Contains(found[0].Snippet, "adaptive schema body text") {
 		t.Fatalf("found = %#v", found)
 	}
 }

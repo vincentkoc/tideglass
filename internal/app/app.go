@@ -1022,15 +1022,21 @@ func (t *Tideglass) retrieveGitcrawl(ctx context.Context, source SourceStatus, q
 	if len(terms) == 0 {
 		return nil, nil
 	}
+	bodyExpr := "''"
+	if sqliteColumnExists(ctx, ro.DB(), "threads", "body_excerpt") {
+		bodyExpr = "coalesce(body_excerpt,'')"
+	} else if sqliteColumnExists(ctx, ro.DB(), "threads", "body") {
+		bodyExpr = "coalesce(body,'')"
+	}
 	var where []string
 	var args []any
 	for _, term := range terms[:minInt(len(terms), 5)] {
-		where = append(where, `(lower(title) like ? or lower(coalesce(body_excerpt,'')) like ?)`)
+		where = append(where, `(lower(title) like ? or lower(`+bodyExpr+`) like ?)`)
 		pattern := "%" + strings.ToLower(term) + "%"
 		args = append(args, pattern, pattern)
 	}
 	args = append(args, limit)
-	rows, err := ro.DB().QueryContext(ctx, `select id, title, coalesce(body_excerpt,''), html_url from threads where `+strings.Join(where, " or ")+` order by updated_at_gh desc limit ?`, args...)
+	rows, err := ro.DB().QueryContext(ctx, `select id, title, `+bodyExpr+`, html_url from threads where `+strings.Join(where, " or ")+` order by updated_at_gh desc limit ?`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1060,6 +1066,28 @@ func (t *Tideglass) retrieveGitcrawl(ctx context.Context, source SourceStatus, q
 		out = append(out, retrievedEvidence{EvidenceID: evID, SourceID: source.ID, Locator: string(locator), Snippet: snippet})
 	}
 	return out, rows.Err()
+}
+
+func sqliteColumnExists(ctx context.Context, db *sql.DB, table, column string) bool {
+	rows, err := db.QueryContext(ctx, `pragma table_info(`+store.QuoteIdent(table)+`)`)
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var defaultValue any
+		var primaryKey int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &primaryKey); err != nil {
+			return false
+		}
+		if strings.EqualFold(name, column) {
+			return true
+		}
+	}
+	return false
 }
 
 func (t *Tideglass) retrieveImported(ctx context.Context, source SourceStatus, query string, limit int) ([]retrievedEvidence, error) {
