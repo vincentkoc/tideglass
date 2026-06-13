@@ -99,6 +99,22 @@ func TestExtractClaimsDoesNotUseSubstringTriggers(t *testing.T) {
 	}
 }
 
+func TestExtractClaimsRequiresKillSignalForProcessBoundary(t *testing.T) {
+	claims := extractClaims("work.project.start", "improve the release process", nil)
+	for _, claim := range claims {
+		if claim.Kind == "boundary.agent.process_kill" {
+			t.Fatalf("process-only trigger created false claim: %#v", claims)
+		}
+	}
+	claims = extractClaims("work.project.start", "do not kill broad tmux processes", nil)
+	for _, claim := range claims {
+		if claim.Kind == "boundary.agent.process_kill" {
+			return
+		}
+	}
+	t.Fatalf("kill/process trigger missing: %#v", claims)
+}
+
 func TestFTSQueryStripsReservedPunctuation(t *testing.T) {
 	query := ftsQuery("openclaw-m1 exact-SHA go-humanize c++")
 	if strings.ContainsAny(query, "+-") {

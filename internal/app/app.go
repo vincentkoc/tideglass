@@ -1162,7 +1162,9 @@ func discoverCrawlBar(ctx context.Context) ([]SourceStatus, error) {
 	if err != nil {
 		return nil, err
 	}
-	cmd := exec.CommandContext(ctx, bin, "apps", "--json")
+	discoveryCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(discoveryCtx, bin, "apps", "--json")
 	output, err := cmd.Output()
 	if err != nil {
 		return nil, err
@@ -1604,7 +1606,9 @@ func extractClaims(kind, query string, evidence []retrievedEvidence) []candidate
 		if hasToken("concise", "terse", "fluff") {
 			add("preference.agent.communication", "Use terse, operational updates with concrete state and next action; avoid filler.", 0.86, "inferred", findEvidence(evidence, "concise", "terse", "fluff", "status"))
 		}
-		if hasToken("kill", "kills", "killing", "process", "processes", "tmux") {
+		killSignal := hasToken("kill", "kills", "killing", "terminate", "terminates", "terminated", "interrupt", "interrupts", "stop", "stops")
+		processTarget := hasToken("process", "processes", "tmux", "mosh", "ssh", "terminal", "terminals", "codex", "agent")
+		if killSignal && processTarget {
 			add("boundary.agent.process_kill", "Do not kill broad Codex, agent, tmux, SSH, mosh, or terminal processes without explicit current-turn scope.", 0.9, "inferred", findEvidence(evidence, "kill", "process", "tmux", "mosh"))
 		}
 		if hasToken("push", "pushes", "merge", "merges", "external", "land", "lands", "landing", "pr", "prs") {
