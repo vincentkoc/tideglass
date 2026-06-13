@@ -1621,7 +1621,7 @@ func hasAnyWord(text string, targets ...string) bool {
 }
 
 func hasDatingPhrase(text string) bool {
-	tokens := words(text)
+	tokens := wordTokens(text)
 	return hasTokenSequence(tokens, "first", "dates") ||
 		hasTokenSequence(tokens, "better", "dates") ||
 		hasTokenSequence(tokens, "date", "ideas") ||
@@ -1688,15 +1688,27 @@ func normalizeText(text string) string {
 }
 
 func words(text string) []string {
-	raw := wordRE.FindAllString(strings.ToLower(text), -1)
+	raw := wordTokens(text)
 	out := make([]string, 0, len(raw))
 	seen := map[string]bool{}
 	for _, word := range raw {
-		word = strings.Trim(word, "_+-")
-		if len(word) < 3 || stopword(word) || seen[word] {
+		if seen[word] {
 			continue
 		}
 		seen[word] = true
+		out = append(out, word)
+	}
+	return out
+}
+
+func wordTokens(text string) []string {
+	raw := wordRE.FindAllString(strings.ToLower(text), -1)
+	out := make([]string, 0, len(raw))
+	for _, word := range raw {
+		word = strings.Trim(word, "_")
+		if len(word) < 3 || stopword(word) {
+			continue
+		}
 		out = append(out, word)
 	}
 	return out
