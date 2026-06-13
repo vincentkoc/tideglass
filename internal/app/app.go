@@ -1892,10 +1892,10 @@ func normalizeKind(kind, query string) string {
 	switch {
 	case strings.Contains(q, "dinner"):
 		return "social.dinner"
-	case strings.Contains(q, "dating") || hasAnyWord(q, "date") || hasDatingPhrase(q):
-		return "social.dating"
 	case strings.Contains(q, "new job"):
 		return "work.new_job"
+	case strings.Contains(q, "dating") || hasDatingPhrase(q):
+		return "social.dating"
 	case strings.Contains(q, "agent"):
 		return "agent.delegation"
 	default:
@@ -1930,8 +1930,12 @@ func rawTokenSet(text string) map[string]bool {
 func hasDatingPhrase(text string) bool {
 	tokens := wordTokens(text)
 	return hasTokenSequence(tokens, "first", "dates") ||
+		hasTokenSequence(tokens, "first", "date") ||
 		hasTokenSequence(tokens, "better", "dates") ||
+		hasTokenSequence(tokens, "better", "date") ||
+		hasTokenSequence(tokens, "plan", "date") ||
 		hasTokenSequence(tokens, "date", "ideas") ||
+		hasTokenSequence(tokens, "date", "someone") ||
 		hasTokenSequence(tokens, "dating", "ideas")
 }
 

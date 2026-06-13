@@ -73,6 +73,12 @@ func TestNormalizeKindDoesNotTreatValidateOrUpdateAsDating(t *testing.T) {
 	if got := normalizeKind("", "plan release dates for OpenClaw"); got != "work.project.start" {
 		t.Fatalf("kind = %q, want work.project.start", got)
 	}
+	if got := normalizeKind("", "new job start date"); got != "work.new_job" {
+		t.Fatalf("kind = %q, want work.new_job", got)
+	}
+	if got := normalizeKind("", "OpenClaw due date"); got != "work.project.start" {
+		t.Fatalf("kind = %q, want work.project.start", got)
+	}
 	if got := normalizeKind("", "OpenClaw update ideas"); got != "work.project.start" {
 		t.Fatalf("kind = %q, want work.project.start", got)
 	}
