@@ -878,7 +878,8 @@ func TestServiceHandlerResolvesIntentResource(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tg.Close()
-	server := httptest.NewServer(NewServiceHandler(tg))
+	token := "test-token"
+	server := httptest.NewServer(NewServiceHandlerWithToken(tg, token))
 	defer server.Close()
 	health, err := http.Get(server.URL + "/healthz")
 	if err != nil {
@@ -892,7 +893,16 @@ func TestServiceHandlerResolvesIntentResource(t *testing.T) {
 	if err := tg.db.QueryRowContext(ctx, `select count(*) from intent_requests`).Scan(&requestsBeforeResource); err != nil {
 		t.Fatal(err)
 	}
-	resource, err := http.Get(server.URL + "/resource?uri=tideglass://intent/work.project.start")
+	unauthResource, err := http.Get(server.URL + "/resource?uri=tideglass://intent/work.project.start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unauthResource.Body.Close()
+	if unauthResource.StatusCode != http.StatusUnauthorized {
+		data, _ := io.ReadAll(unauthResource.Body)
+		t.Fatalf("unauth resource status = %d body=%s", unauthResource.StatusCode, data)
+	}
+	resource, err := authedHTTP(t, http.MethodGet, server.URL+"/resource?uri=tideglass://intent/work.project.start", "", nil, token)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -916,20 +926,14 @@ func TestServiceHandlerResolvesIntentResource(t *testing.T) {
 		t.Fatalf("resource read persisted request: before=%d after=%d", requestsBeforeResource, requestsAfterResource)
 	}
 	csrf := strings.NewReader(`{"uri":"tideglass://disclosure/social.dinner/venue"}`)
-	csrfResponse, err := http.Post(server.URL+"/resolve", "text/plain", csrf)
-	if err != nil {
-		t.Fatal(err)
-	}
+	csrfResponse, err := authedHTTP(t, http.MethodPost, server.URL+"/resolve", "text/plain", csrf, token)
 	defer csrfResponse.Body.Close()
 	if csrfResponse.StatusCode != http.StatusForbidden {
 		data, _ := io.ReadAll(csrfResponse.Body)
 		t.Fatalf("text/plain resolve status = %d body=%s", csrfResponse.StatusCode, data)
 	}
 	body := strings.NewReader(`{"uri":"tideglass://disclosure/social.dinner/venue"}`)
-	resolve, err := http.Post(server.URL+"/resolve", "application/json", body)
-	if err != nil {
-		t.Fatal(err)
-	}
+	resolve, err := authedHTTP(t, http.MethodPost, server.URL+"/resolve", "application/json", body, token)
 	defer resolve.Body.Close()
 	if resolve.StatusCode != http.StatusOK {
 		data, _ := io.ReadAll(resolve.Body)
@@ -942,30 +946,21 @@ func TestServiceHandlerResolvesIntentResource(t *testing.T) {
 	if response.Policy.Audience != "venue" || response.ResolvedURI != "tideglass://v1/profile/me/social.dinner/current" {
 		t.Fatalf("resolve response = %#v", response)
 	}
-	bad, err := http.Get(server.URL + "/resource?uri=tideglass://intent/")
-	if err != nil {
-		t.Fatal(err)
-	}
+	bad, err := authedHTTP(t, http.MethodGet, server.URL+"/resource?uri=tideglass://intent/", "", nil, token)
 	defer bad.Body.Close()
 	if bad.StatusCode != http.StatusBadRequest {
 		data, _ := io.ReadAll(bad.Body)
 		t.Fatalf("bad resource status = %d body=%s", bad.StatusCode, data)
 	}
 	sensitive := strings.NewReader(`{"uri":"tideglass://intent/work.project.start","disclosure":{"allow_sensitive":true}}`)
-	forbidden, err := http.Post(server.URL+"/resolve", "application/json", sensitive)
-	if err != nil {
-		t.Fatal(err)
-	}
+	forbidden, err := authedHTTP(t, http.MethodPost, server.URL+"/resolve", "application/json", sensitive, token)
 	defer forbidden.Body.Close()
 	if forbidden.StatusCode != http.StatusForbidden {
 		data, _ := io.ReadAll(forbidden.Body)
 		t.Fatalf("sensitive resolve status = %d body=%s", forbidden.StatusCode, data)
 	}
 	invalidTask := strings.NewReader(`{"uri":"tideglass://intent/work.project.start","task":{"mode":"ship_it"}}`)
-	invalidResponse, err := http.Post(server.URL+"/resolve", "application/json", invalidTask)
-	if err != nil {
-		t.Fatal(err)
-	}
+	invalidResponse, err := authedHTTP(t, http.MethodPost, server.URL+"/resolve", "application/json", invalidTask, token)
 	defer invalidResponse.Body.Close()
 	if invalidResponse.StatusCode != http.StatusBadRequest {
 		data, _ := io.ReadAll(invalidResponse.Body)
@@ -1793,6 +1788,19 @@ func containsString(rows []string, value string) bool {
 		}
 	}
 	return false
+}
+
+func authedHTTP(t *testing.T, method, url, contentType string, body io.Reader, token string) (*http.Response, error) {
+	t.Helper()
+	req, err := http.NewRequest(method, url, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	return http.DefaultClient.Do(req)
 }
 
 func hasQuestionSlot(rows []IntentQuestion, value string) bool {

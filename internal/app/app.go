@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -1069,6 +1070,11 @@ func (t *Tideglass) Doctor(ctx context.Context) (DoctorResult, error) {
 }
 
 func NewServiceHandler(t *Tideglass) http.Handler {
+	return NewServiceHandlerWithToken(t, os.Getenv("TIDEGLASS_SERVICE_TOKEN"))
+}
+
+func NewServiceHandlerWithToken(t *Tideglass, token string) http.Handler {
+	token = strings.TrimSpace(token)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -1088,6 +1094,10 @@ func NewServiceHandler(t *Tideglass) http.Handler {
 		}
 		if !authorizedHTTPHost(r) {
 			writeHTTPError(w, http.StatusForbidden, "forbidden host")
+			return
+		}
+		if !authorizedServiceRequest(r, token) {
+			writeHTTPError(w, http.StatusUnauthorized, "missing or invalid service token")
 			return
 		}
 		if !authorizedHTTPWrite(r) {
@@ -1118,6 +1128,10 @@ func NewServiceHandler(t *Tideglass) http.Handler {
 		}
 		if !authorizedHTTPHost(r) {
 			writeHTTPError(w, http.StatusForbidden, "forbidden host")
+			return
+		}
+		if !authorizedServiceRequest(r, token) {
+			writeHTTPError(w, http.StatusUnauthorized, "missing or invalid service token")
 			return
 		}
 		uri := r.URL.Query().Get("uri")
@@ -1222,6 +1236,18 @@ func authorizedHTTPWrite(r *http.Request) bool {
 		return false
 	}
 	return true
+}
+
+func authorizedServiceRequest(r *http.Request, token string) bool {
+	if token == "" {
+		return false
+	}
+	if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Tideglass-Token")), []byte(token)) == 1 {
+		return true
+	}
+	const prefix = "Bearer "
+	auth := r.Header.Get("Authorization")
+	return strings.HasPrefix(auth, prefix) && subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(auth, prefix)), []byte(token)) == 1
 }
 
 func authorizeHTTPResolveRequest(request IntentRequestEnvelope) error {
