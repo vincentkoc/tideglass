@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -127,13 +128,13 @@ type IntentResponseEnvelope struct {
 }
 
 type IntentClaimEnvelope struct {
-	ID          string   `json:"id"`
+	ID          string   `json:"id,omitempty"`
 	Kind        string   `json:"kind"`
 	Value       string   `json:"value,omitempty"`
-	Confidence  float64  `json:"confidence"`
+	Confidence  float64  `json:"confidence,omitempty"`
 	Status      string   `json:"status"`
-	SourceMode  string   `json:"source_mode"`
-	Sensitivity string   `json:"sensitivity"`
+	SourceMode  string   `json:"source_mode,omitempty"`
+	Sensitivity string   `json:"sensitivity,omitempty"`
 	Evidence    []string `json:"evidence,omitempty"`
 }
 
@@ -206,6 +207,7 @@ type ClaimOut struct {
 	Confidence float64  `json:"confidence"`
 	Status     string   `json:"status"`
 	SourceMode string   `json:"source_mode"`
+	UpdatedAt  string   `json:"updated_at,omitempty"`
 	Evidence   []string `json:"evidence,omitempty"`
 }
 
@@ -586,6 +588,14 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 	}
 	var claims []ClaimOut
 	var unresolved []IntentQuestion
+	requireReviewed := true
+	if request.Freshness.RequireReviewed != nil {
+		requireReviewed = *request.Freshness.RequireReviewed
+	}
+	maxAge, err := parseMaxAge(request.Freshness.MaxAge)
+	if err != nil {
+		return IntentResponseEnvelope{}, err
+	}
 	if foundIntent {
 		loaded, err := t.loadClaims(ctx, intent.ID)
 		if err != nil {
@@ -595,17 +605,13 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 		if err != nil {
 			return IntentResponseEnvelope{}, err
 		}
-		claims = loaded
-		unresolved = unresolvedIntentQuestions(intent.Kind, loaded)
+		claims = eligibleClaimsForRequest(loaded, requireReviewed, maxAge)
+		unresolved = unresolvedIntentQuestions(intent.Kind, claims)
 	} else {
 		intent = IntentOut{Kind: kind, Title: titleForKind(kind)}
 		unresolved = unresolvedIntentQuestions(kind, nil)
 	}
-	requireReviewed := true
-	if request.Freshness.RequireReviewed != nil {
-		requireReviewed = *request.Freshness.RequireReviewed
-	}
-	filteredClaims, policy := applyIntentPolicy(claims, unresolved, request, requireReviewed)
+	filteredClaims, policy := applyIntentPolicy(claims, unresolved, request)
 	if !foundIntent {
 		policy.NeedsUserAnswer = true
 		policy.MayAct = false
@@ -1254,6 +1260,7 @@ order by c.created_at desc`, intentID)
 			return nil, err
 		}
 		claim.HasValueEdit = hasValueEdit == 1
+		claim.ClaimOut.UpdatedAt = claim.UpdatedAt
 		claim.Normalized = normalizeText(claim.Value)
 		rowsOut = append(rowsOut, claim)
 	}
@@ -2250,8 +2257,10 @@ func parseIntentURI(rawURI string) (string, string, error) {
 	switch {
 	case len(parts) == 2 && parts[0] == "intent":
 		return normalizeKind(parts[1], ""), "", nil
-	case len(parts) == 5 && parts[0] == "profile" && parts[1] == "me" && parts[4] == "current":
+	case len(parts) == 4 && parts[0] == "profile" && parts[1] == "me" && parts[3] == "current":
 		return normalizeKind(parts[2], ""), "", nil
+	case len(parts) == 2 && parts[0] == "unresolved":
+		return normalizeKind(parts[1], ""), "", nil
 	case len(parts) == 3 && parts[0] == "disclosure":
 		return normalizeKind(parts[1], ""), parts[2], nil
 	default:
@@ -2259,7 +2268,43 @@ func parseIntentURI(rawURI string) (string, string, error) {
 	}
 }
 
-func applyIntentPolicy(claims []ClaimOut, unresolved []IntentQuestion, request IntentRequestEnvelope, requireReviewed bool) ([]IntentClaimEnvelope, IntentPolicyEnvelope) {
+func eligibleClaimsForRequest(claims []ClaimOut, requireReviewed bool, maxAge time.Duration) []ClaimOut {
+	out := make([]ClaimOut, 0, len(claims))
+	for _, claim := range claims {
+		if requireReviewed && claim.Status != "accepted" {
+			continue
+		}
+		if maxAge > 0 && claim.UpdatedAt != "" {
+			updatedAt, err := time.Parse(time.RFC3339, claim.UpdatedAt)
+			if err != nil || time.Since(updatedAt) > maxAge {
+				continue
+			}
+		}
+		out = append(out, claim)
+	}
+	return out
+}
+
+func parseMaxAge(value string) (time.Duration, error) {
+	value = strings.TrimSpace(strings.ToLower(value))
+	if value == "" {
+		return 0, nil
+	}
+	if strings.HasSuffix(value, "d") {
+		days, err := strconv.Atoi(strings.TrimSuffix(value, "d"))
+		if err != nil {
+			return 0, fmt.Errorf("invalid freshness.max_age %q", value)
+		}
+		return time.Duration(days) * 24 * time.Hour, nil
+	}
+	duration, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("invalid freshness.max_age %q", value)
+	}
+	return duration, nil
+}
+
+func applyIntentPolicy(claims []ClaimOut, unresolved []IntentQuestion, request IntentRequestEnvelope) ([]IntentClaimEnvelope, IntentPolicyEnvelope) {
 	policy := IntentPolicyEnvelope{
 		Audience:        request.Audience,
 		DisclosureMode:  request.Disclosure.Mode,
@@ -2271,9 +2316,6 @@ func applyIntentPolicy(claims []ClaimOut, unresolved []IntentQuestion, request I
 	redacted := map[string]bool{}
 	shareable := map[string]bool{}
 	for _, claim := range claims {
-		if requireReviewed && claim.Status != "accepted" {
-			continue
-		}
 		sensitivity := claimSensitivity(claim.Kind)
 		envelope := IntentClaimEnvelope{
 			ID:          claim.ID,
@@ -2290,15 +2332,14 @@ func applyIntentPolicy(claims []ClaimOut, unresolved []IntentQuestion, request I
 		if shouldRedactClaim(request.Disclosure, sensitivity) {
 			redacted[claim.Kind] = true
 			if request.Disclosure.Mode == "existence" {
-				envelope.Value = ""
-				envelope.Evidence = nil
-				out = append(out, envelope)
+				out = append(out, existenceClaimEnvelope(claim))
 			}
 			continue
 		}
 		if request.Disclosure.Mode == "existence" {
-			envelope.Value = ""
-			envelope.Evidence = nil
+			out = append(out, existenceClaimEnvelope(claim))
+			shareable[claim.Kind] = true
+			continue
 		}
 		shareable[claim.Kind] = true
 		out = append(out, envelope)
@@ -2324,6 +2365,13 @@ func shouldRedactClaim(disclosure IntentDisclosure, sensitivity string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func existenceClaimEnvelope(claim ClaimOut) IntentClaimEnvelope {
+	return IntentClaimEnvelope{
+		Kind:   claim.Kind,
+		Status: claim.Status,
 	}
 }
 

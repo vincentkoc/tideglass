@@ -506,6 +506,111 @@ func TestResolveIntentSupportsDisclosureAndMissingIntent(t *testing.T) {
 	}
 }
 
+func TestResolveIntentUnreviewedAndStaleClaimsDoNotSatisfyCriticalSlots(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	intent, err := tg.ensureIntent(ctx, "social.dinner", "Dinner with strangers")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unreviewedID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "preference.food.allergy",
+		Value:      "No shellfish.",
+		Confidence: 0.8,
+		SourceMode: "inferred",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{URI: "tideglass://intent/social.dinner"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !response.Policy.NeedsUserAnswer || response.Policy.MayAct {
+		t.Fatalf("unreviewed critical claim satisfied policy: %#v", response.Policy)
+	}
+	if len(response.Claims) != 0 {
+		t.Fatalf("unreviewed claim leaked into default response: %#v", response.Claims)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: unreviewedID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	old := "2020-01-01T00:00:00Z"
+	if _, err := tg.db.ExecContext(ctx, `update claims set updated_at = ? where id = ?`, old, unreviewedID); err != nil {
+		t.Fatal(err)
+	}
+	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
+		URI:       "tideglass://intent/social.dinner",
+		Freshness: IntentFreshness{MaxAge: "1h"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !response.Policy.NeedsUserAnswer || response.Policy.MayAct {
+		t.Fatalf("stale critical claim satisfied policy: %#v", response.Policy)
+	}
+}
+
+func TestResolveIntentCanonicalLinksAndExistenceDisclosure(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	intent, err := tg.ensureIntent(ctx, "work.project.start", "Project start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "preference.agent.communication",
+		Value:      "Use terse updates.",
+		Confidence: 0.9,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: claimID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	response, err := tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{URI: "tideglass://profile/me/work.project.start/current"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Intent.Kind != "work.project.start" {
+		t.Fatalf("profile uri response = %#v", response)
+	}
+	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{URI: response.Links["unresolved"]}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Intent.Kind != "work.project.start" {
+		t.Fatalf("unresolved uri response = %#v", response)
+	}
+	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
+		URI:        "tideglass://intent/work.project.start",
+		Disclosure: IntentDisclosure{Mode: "existence"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Claims) != 1 {
+		t.Fatalf("existence claims = %#v", response.Claims)
+	}
+	claim := response.Claims[0]
+	if claim.Kind != "preference.agent.communication" || claim.Status != "accepted" {
+		t.Fatalf("existence claim identity = %#v", claim)
+	}
+	if claim.ID != "" || claim.Value != "" || claim.Confidence != 0 || claim.SourceMode != "" || claim.Sensitivity != "" || len(claim.Evidence) != 0 {
+		t.Fatalf("existence claim leaked metadata: %#v", claim)
+	}
+}
+
 func TestServiceHandlerResolvesIntentResource(t *testing.T) {
 	ctx := context.Background()
 	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
