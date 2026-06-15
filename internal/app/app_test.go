@@ -755,9 +755,6 @@ func TestResolveIntentActionGateIgnoresSupersededSingletonBoundaries(t *testing.
 	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: newBoundaryID, Action: "accept", Reason: "test"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tg.db.ExecContext(ctx, `update claims set updated_at = ? where id in (?, ?)`, "2026-01-01T00:00:00Z", oldBoundaryID, newBoundaryID); err != nil {
-		t.Fatal(err)
-	}
 	response, err := tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, Request: IntentRequestEnvelope{
 		URI:        "tideglass://v1/intent/work.project.start/current",
 		Task:       IntentTask{Mode: "act_gate", Autonomy: "bounded_act"},

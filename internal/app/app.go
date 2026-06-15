@@ -1708,7 +1708,7 @@ func (t *Tideglass) loadActionGateClaims(ctx context.Context, intentID, intentKi
 select c.id, c.kind,
        coalesce(json_extract(e.patch_json, '$.value'), c.value) as value,
        c.confidence, c.status, c.source_mode,
-       c.updated_at, coalesce(e.created_at, ''), c.rowid
+       c.updated_at, coalesce(e.created_at, '')
 from claims c
 left join edits e on e.id = (
   select id from edits
@@ -1721,20 +1721,12 @@ order by c.created_at desc`, intentID)
 		return nil, err
 	}
 	defer rows.Close()
-	type actionGateClaim struct {
-		ClaimOut
-		RowID int64
-	}
-	var claims []actionGateClaim
-	type singletonVersion struct {
-		UpdatedAt string
-		RowID     int64
-	}
-	bestAcceptedSingleton := map[string]singletonVersion{}
+	var claims []ClaimOut
+	bestAcceptedSingleton := map[string]string{}
 	for rows.Next() {
-		var claim actionGateClaim
+		var claim ClaimOut
 		var valueEditCreatedAt string
-		if err := rows.Scan(&claim.ID, &claim.Kind, &claim.Value, &claim.Confidence, &claim.Status, &claim.SourceMode, &claim.UpdatedAt, &valueEditCreatedAt, &claim.RowID); err != nil {
+		if err := rows.Scan(&claim.ID, &claim.Kind, &claim.Value, &claim.Confidence, &claim.Status, &claim.SourceMode, &claim.UpdatedAt, &valueEditCreatedAt); err != nil {
 			return nil, err
 		}
 		if !blocking[claim.Kind] && !strings.HasPrefix(claim.Kind, "boundary.") {
@@ -1743,8 +1735,8 @@ order by c.created_at desc`, intentID)
 		if valueEditCreatedAt > claim.UpdatedAt {
 			claim.UpdatedAt = valueEditCreatedAt
 		}
-		if singletonClaimKind(claim.Kind) && claim.Status == "accepted" && newerSingletonVersion(claim.UpdatedAt, claim.RowID, bestAcceptedSingleton[claim.Kind]) {
-			bestAcceptedSingleton[claim.Kind] = singletonVersion{UpdatedAt: claim.UpdatedAt, RowID: claim.RowID}
+		if singletonClaimKind(claim.Kind) && claim.Status == "accepted" && claim.UpdatedAt > bestAcceptedSingleton[claim.Kind] {
+			bestAcceptedSingleton[claim.Kind] = claim.UpdatedAt
 		}
 		claims = append(claims, claim)
 	}
@@ -1753,29 +1745,12 @@ order by c.created_at desc`, intentID)
 	}
 	out := make([]ClaimOut, 0, len(claims))
 	for _, claim := range claims {
-		if singletonClaimKind(claim.Kind) && claim.Status != "accepted" && singletonSuperseded(claim.UpdatedAt, claim.RowID, bestAcceptedSingleton[claim.Kind]) {
+		if singletonClaimKind(claim.Kind) && claim.Status != "accepted" && bestAcceptedSingleton[claim.Kind] != "" && claim.UpdatedAt < bestAcceptedSingleton[claim.Kind] {
 			continue
 		}
-		out = append(out, claim.ClaimOut)
+		out = append(out, claim)
 	}
 	return out, nil
-}
-
-func newerSingletonVersion(updatedAt string, rowID int64, previous struct {
-	UpdatedAt string
-	RowID     int64
-}) bool {
-	return updatedAt > previous.UpdatedAt || (updatedAt == previous.UpdatedAt && rowID > previous.RowID)
-}
-
-func singletonSuperseded(updatedAt string, rowID int64, accepted struct {
-	UpdatedAt string
-	RowID     int64
-}) bool {
-	if accepted.UpdatedAt == "" {
-		return false
-	}
-	return updatedAt < accepted.UpdatedAt || (updatedAt == accepted.UpdatedAt && rowID < accepted.RowID)
 }
 
 func (t *Tideglass) attachClaimEvidence(ctx context.Context, claims []ClaimOut) ([]ClaimOut, []EvidenceOut, error) {
@@ -3576,7 +3551,7 @@ func titleForKind(kind string) string {
 }
 
 func now() string {
-	return time.Now().UTC().Format(time.RFC3339)
+	return time.Now().UTC().Format(time.RFC3339Nano)
 }
 
 func id(prefix string) string {
