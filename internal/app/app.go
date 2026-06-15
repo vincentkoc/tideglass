@@ -1220,7 +1220,11 @@ func authorizedHTTPHost(r *http.Request) bool {
 		}
 	}
 	host = strings.Trim(strings.ToLower(host), "[]")
-	return host == "localhost" || host == "127.0.0.1" || host == "::1"
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func authorizedHTTPWrite(r *http.Request) bool {

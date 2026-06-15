@@ -80,6 +80,9 @@ func runInit(ctx context.Context, args []string) error {
 	if err := fs.Parse(normalizeFlagArgs(args)); err != nil {
 		return err
 	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("serve received unexpected positional arguments: %s", strings.Join(fs.Args(), " "))
+	}
 	tg, err := app.Open(ctx, *dbPath)
 	if err != nil {
 		return err
@@ -547,6 +550,7 @@ func normalizeFlagArgs(args []string) []string {
 		"request":   true,
 		"set":       true,
 		"addr":      true,
+		"token":     true,
 	}
 	var flags []string
 	var positionals []string

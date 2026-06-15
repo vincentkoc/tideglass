@@ -48,9 +48,11 @@ stored in the same SQLite database for audit and replay.
 Run the local service:
 
 ```sh
-tideglass serve --addr 127.0.0.1:8765
+export TIDEGLASS_SERVICE_TOKEN="$(openssl rand -hex 32)"
+tideglass serve --addr 127.0.0.1:8765 --token "$TIDEGLASS_SERVICE_TOKEN"
 curl -s http://127.0.0.1:8765/healthz
-curl -s 'http://127.0.0.1:8765/resource?uri=tideglass://intent/work.project.start'
+curl -s -H "Authorization: Bearer $TIDEGLASS_SERVICE_TOKEN" \
+  'http://127.0.0.1:8765/resource?uri=tideglass://intent/work.project.start'
 ```
 
 Minimal MCP-style one-shot resource reads are available for agent wrappers while
