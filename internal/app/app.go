@@ -1796,7 +1796,7 @@ from claims c
 left join edits e on e.id = (
   select id from edits
   where claim_id = c.id and json_extract(patch_json, '$.value') is not null
-  order by julianday(created_at) desc, rowid desc limit 1
+  order by rowid desc limit 1
 )
 where c.intent_id = ?
 order by c.created_at desc`, intentID)
@@ -1916,7 +1916,7 @@ from claims c
 left join edits e on e.id = (
   select id from edits
   where claim_id = c.id and json_extract(patch_json, '$.value') is not null
-  order by julianday(created_at) desc, rowid desc limit 1
+  order by rowid desc limit 1
 )
 where c.intent_id = ? and c.status != 'rejected'
 order by c.created_at desc`, intentID)
@@ -1984,7 +1984,7 @@ from claims c
 left join edits e on e.id = (
   select id from edits
   where claim_id = c.id and json_extract(patch_json, '$.value') is not null
-  order by julianday(created_at) desc, rowid desc limit 1
+  order by rowid desc limit 1
 )
 where c.intent_id = ? and c.status != 'rejected'
 order by c.created_at desc`, intentID)
@@ -2355,7 +2355,7 @@ where status in ('accepted', 'rejected')
         select latest_value.rowid from edits latest_value
         where latest_value.claim_id = claims.id
           and json_extract(latest_value.patch_json, '$.value') is not null
-        order by julianday(latest_value.created_at) desc, latest_value.rowid desc limit 1
+        order by latest_value.rowid desc limit 1
       )
       and (
         julianday(value_edits.created_at) > coalesce((
@@ -2370,7 +2370,7 @@ where status in ('accepted', 'rejected')
           and value_edits.rowid > coalesce((
             select latest_review.rowid from edits latest_review
             where latest_review.claim_id = claims.id and latest_review.operation in ('accept', 'reject')
-            order by julianday(latest_review.created_at) desc, latest_review.rowid desc limit 1
+            order by latest_review.rowid desc limit 1
           ), 0)
         )
       )
@@ -3205,6 +3205,7 @@ func normalizeIntentRequest(request IntentRequestEnvelope) IntentRequestEnvelope
 	if request.Proof.Commitments == "" {
 		request.Proof.Commitments = "per_claim"
 	}
+	sort.Strings(request.Proof.ZKPredicates)
 	if request.Context == nil {
 		request.Context = map[string]any{}
 	}
@@ -3231,6 +3232,9 @@ func validateIntentRequest(request IntentRequestEnvelope) error {
 	case "context_only", "suggest_only", "suggest_then_confirm", "bounded_act", "deny":
 	default:
 		return fmt.Errorf("unsupported autonomy %q", request.Task.Autonomy)
+	}
+	if len(request.Proof.ZKPredicates) > 0 {
+		return errors.New("proof.zk_predicates are not supported")
 	}
 	return nil
 }
@@ -3532,6 +3536,11 @@ func actionScopeHash(request IntentRequestEnvelope) string {
 			"allow_evidence":    request.Disclosure.AllowEvidence,
 			"allow_sensitive":   request.Disclosure.AllowSensitive,
 			"allow_commitments": request.Disclosure.AllowCommitments,
+		},
+		"proof": map[string]any{
+			"hash":          request.Proof.Hash,
+			"commitments":   request.Proof.Commitments,
+			"zk_predicates": normalizedStringSet(request.Proof.ZKPredicates),
 		},
 		"context": actionScopeContext(request.Context),
 	}
