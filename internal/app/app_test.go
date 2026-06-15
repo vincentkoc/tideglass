@@ -802,6 +802,42 @@ func TestResolveIntentFullDisclosureScopesExternalAudiences(t *testing.T) {
 	}
 }
 
+func TestResolveIntentRedactsUnknownPreferenceKindsByDefault(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	intent, err := tg.ensureIntent(ctx, "social.dinner", "Dinner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "preference.health.medication",
+		Value:      "Take a private medication.",
+		Confidence: 0.95,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: claimID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	response, err := tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
+		URI:        "tideglass://v1/intent/social.dinner/current",
+		Contract:   IntentContract{RequiredSlots: []string{"preference.health.medication"}},
+		Disclosure: IntentDisclosure{Mode: "full"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasIntentClaimID(response.Claims, claimID) || !containsString(response.Policy.Redacted, "preference.health.medication") {
+		t.Fatalf("unknown preference kind was not redacted by default: %#v", response)
+	}
+}
+
 func TestResolveIntentActionGateUsesLosslessDuplicateKeys(t *testing.T) {
 	ctx := context.Background()
 	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))

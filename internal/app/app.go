@@ -4084,8 +4084,10 @@ func claimSensitivity(kind string) string {
 		return "private"
 	case kind == "preference.food.allergy" || kind == "preference.food.dietary_restriction":
 		return "private"
-	case strings.HasPrefix(kind, "preference.agent."), strings.HasPrefix(kind, "preference.project."), strings.HasPrefix(kind, "preference."), strings.HasPrefix(kind, "context."):
+	case strings.HasPrefix(kind, "preference.agent."), strings.HasPrefix(kind, "preference.project."):
 		return "normal"
+	case strings.HasPrefix(kind, "preference."), strings.HasPrefix(kind, "context."):
+		return "restricted"
 	default:
 		return "restricted"
 	}
