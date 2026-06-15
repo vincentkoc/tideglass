@@ -547,7 +547,7 @@ func (t *Tideglass) Ingest(ctx context.Context, opts IngestOptions) (IngestResul
 			if err != nil {
 				return IngestResult{}, err
 			}
-			if _, err := t.db.ExecContext(ctx, `insert or ignore into claim_evidence(claim_id,evidence_id,role) values(?,?,?)`, claimID, evidenceID, "supporting"); err != nil {
+			if err := linkClaimEvidence(ctx, t.db, claimID, evidenceID, "supporting"); err != nil {
 				return IngestResult{}, err
 			}
 			importedClaims++
@@ -563,7 +563,7 @@ func (t *Tideglass) Ingest(ctx context.Context, opts IngestOptions) (IngestResul
 			return IngestResult{}, err
 		}
 		if claim.EvidenceID != "" {
-			if _, err := t.db.ExecContext(ctx, `insert or ignore into claim_evidence(claim_id,evidence_id,role) values(?,?,?)`, claimID, claim.EvidenceID, "supporting"); err != nil {
+			if err := linkClaimEvidence(ctx, t.db, claimID, claim.EvidenceID, "supporting"); err != nil {
 				return IngestResult{}, err
 			}
 		}
@@ -622,7 +622,9 @@ func (t *Tideglass) Ask(ctx context.Context, opts AskOptions) (AskResult, error)
 			return AskResult{}, err
 		}
 		if claim.EvidenceID != "" {
-			_, _ = t.db.ExecContext(ctx, `insert or ignore into claim_evidence(claim_id,evidence_id,role) values(?,?,?)`, claimID, claim.EvidenceID, "supporting")
+			if err := linkClaimEvidence(ctx, t.db, claimID, claim.EvidenceID, "supporting"); err != nil {
+				return AskResult{}, err
+			}
 		}
 		if err := t.embedText(ctx, "claim", claimID, claim.Value); err != nil {
 			return AskResult{}, err
@@ -1821,6 +1823,22 @@ func nextRevision(ctx context.Context, execer revisionExecer) (int64, error) {
 		return 0, err
 	}
 	return result.LastInsertId()
+}
+
+func linkClaimEvidence(ctx context.Context, execer revisionExecer, claimID, evidenceID, role string) error {
+	result, err := execer.ExecContext(ctx, `insert or ignore into claim_evidence(claim_id,evidence_id,role) values(?,?,?)`, claimID, evidenceID, role)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return nil
+	}
+	_, err = nextRevision(ctx, execer)
+	return err
 }
 
 func currentRevision(ctx context.Context, queryer interface {

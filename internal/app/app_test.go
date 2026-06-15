@@ -372,6 +372,66 @@ func TestEditClaimChecksExpectedRevision(t *testing.T) {
 	}
 }
 
+func TestLinkClaimEvidenceAdvancesRevision(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	if err := tg.upsertSource(ctx, SourceStatus{ID: "codex", Kind: "import", Label: "Codex", Health: "ok"}); err != nil {
+		t.Fatal(err)
+	}
+	intent, err := tg.ensureIntent(ctx, "work.project.start", "Project start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "preference.project.validation",
+		Value:      "run tests",
+		Confidence: 0.8,
+		SourceMode: "inferred",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidenceID, err := tg.upsertArtifactEvidence(ctx, artifact{
+		SourceID:    "codex",
+		ExternalID:  "session-1",
+		Kind:        "message",
+		Title:       "session",
+		Snippet:     "user asked to run tests",
+		LocatorJSON: `{"turn":1}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := currentRevision(ctx, tg.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := linkClaimEvidence(ctx, tg.db, claimID, evidenceID, "supporting"); err != nil {
+		t.Fatal(err)
+	}
+	after, err := currentRevision(ctx, tg.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after <= before {
+		t.Fatalf("evidence link did not advance revision: before=%d after=%d", before, after)
+	}
+	if err := linkClaimEvidence(ctx, tg.db, claimID, evidenceID, "supporting"); err != nil {
+		t.Fatal(err)
+	}
+	unchanged, err := currentRevision(ctx, tg.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unchanged != after {
+		t.Fatalf("ignored duplicate evidence link advanced revision: after=%d unchanged=%d", after, unchanged)
+	}
+}
+
 func TestReviewAcceptKeepsEditedOverlay(t *testing.T) {
 	ctx := context.Background()
 	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
