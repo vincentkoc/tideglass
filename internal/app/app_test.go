@@ -712,6 +712,14 @@ func TestResolveIntentActionGateAuthorizesWithPolicyConstraint(t *testing.T) {
 	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: constraintID, Action: "accept", Reason: "test"}); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "policy.action.constraints",
+		Value:      `{"allow":true,"intent_kind":"work.project.start","task_mode":"act_gate","autonomy":"bounded_act","goal":"start another project","audience":"agent"}`,
+		Confidence: 0.99,
+		SourceMode: "explicit",
+	}); err != nil {
+		t.Fatal(err)
+	}
 	response, err = tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, Request: IntentRequestEnvelope{
 		URI:        "tideglass://v1/intent/work.project.start/current",
 		Task:       IntentTask{Mode: "act_gate", Autonomy: "bounded_act", Goal: "start the project"},
@@ -722,6 +730,29 @@ func TestResolveIntentActionGateAuthorizesWithPolicyConstraint(t *testing.T) {
 	}
 	if !response.Decision.MayAct || response.Decision.NeedsUserAnswer || response.Decision.Reason != "ready" || response.Status != "ready" {
 		t.Fatalf("explicit action constraint did not authorize bounded action: %#v", response)
+	}
+	constraintID, err = tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "policy.action.constraints",
+		Value:      `{"allow":false,"intent_kind":"work.project.start","task_mode":"act_gate","autonomy":"bounded_act","goal":"start the project","audience":"agent"}`,
+		Confidence: 0.99,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: constraintID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	response, err = tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, Request: IntentRequestEnvelope{
+		URI:        "tideglass://v1/intent/work.project.start/current",
+		Task:       IntentTask{Mode: "act_gate", Autonomy: "bounded_act", Goal: "start the project"},
+		Disclosure: IntentDisclosure{AllowSensitive: true},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Decision.MayAct || !response.Decision.NeedsUserAnswer || !hasBlockingQuestionSlot(response.Unresolved, "policy.action.constraints") {
+		t.Fatalf("newer denying action constraint did not revoke bounded action: %#v", response)
 	}
 }
 

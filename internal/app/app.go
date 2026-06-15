@@ -313,6 +313,7 @@ type ClaimOut struct {
 	SourceMode string   `json:"source_mode"`
 	UpdatedAt  string   `json:"updated_at,omitempty"`
 	Evidence   []string `json:"evidence,omitempty"`
+	Revision   int64    `json:"-"`
 }
 
 type EvidenceOut struct {
@@ -745,17 +746,19 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 		}
 		claims = eligibleClaimsForRequest(loaded, requireReviewed, maxAge)
 		policyFailedClaims = policyFailingClaims(loaded, claims)
+		hasScopedActionConstraint := false
 		if request.Task.Mode == "act_gate" {
 			actionGateClaims, err := t.loadActionGateClaims(ctx, intent.ID, kind, request.Contract.RequiredSlots)
 			if err != nil {
 				return IntentResponseEnvelope{}, err
 			}
+			_, _, hasScopedActionConstraint = latestMatchingActionConstraint(kind, actionGateClaims, request)
 			policyFailedClaims = mergeClaimOuts(policyFailedClaims, actionGatePolicyFailingClaims(kind, actionGateClaims, request, maxAge))
 		}
 		slotClaims := claimsForSlotSatisfaction(kind, loaded, request, maxAge)
 		unresolved = unresolvedIntentQuestions(intent.Kind, slotClaims)
 		unresolved = addRequiredSlotQuestions(unresolved, slotClaims, request.Contract.RequiredSlots)
-		if request.Task.Mode == "act_gate" && request.Task.Autonomy == "bounded_act" && !hasActionGateConstraint(kind, claims, request, maxAge) {
+		if request.Task.Mode == "act_gate" && request.Task.Autonomy == "bounded_act" && !hasScopedActionConstraint {
 			unresolved = append(unresolved, questionForSlot("policy.action.constraints", "critical", true))
 		}
 	} else {
@@ -1671,7 +1674,8 @@ select c.id, c.kind,
        coalesce(json_extract(e.patch_json, '$.value'), c.value) as value,
        c.confidence, c.status, c.source_mode,
        c.created_at, c.updated_at, coalesce(e.created_at, ''),
-       case when e.id is null then 0 else 1 end as has_value_edit
+       case when e.id is null then 0 else 1 end as has_value_edit,
+       c.revision
 from claims c
 left join edits e on e.id = (
   select id from edits
@@ -1696,7 +1700,7 @@ order by c.created_at desc`, intentID)
 		var claim materializedClaim
 		var hasValueEdit int
 		var valueEditCreatedAt string
-		if err := rows.Scan(&claim.ID, &claim.Kind, &claim.Value, &claim.Confidence, &claim.Status, &claim.SourceMode, &claim.CreatedAt, &claim.UpdatedAt, &valueEditCreatedAt, &hasValueEdit); err != nil {
+		if err := rows.Scan(&claim.ID, &claim.Kind, &claim.Value, &claim.Confidence, &claim.Status, &claim.SourceMode, &claim.CreatedAt, &claim.UpdatedAt, &valueEditCreatedAt, &hasValueEdit, &claim.Revision); err != nil {
 			return nil, err
 		}
 		if timestampAfter(valueEditCreatedAt, claim.UpdatedAt) {
@@ -1823,6 +1827,7 @@ order by c.created_at desc`, intentID)
 		if timestampAfter(valueEditCreatedAt, claim.UpdatedAt) {
 			claim.UpdatedAt = valueEditCreatedAt
 		}
+		claim.Revision = revision
 		normalized = losslessClaimValueKey(claim.Value)
 		duplicateKey := claim.Kind + "\x00" + normalized
 		if singletonClaimKind(claim.Kind) && claim.Status == "accepted" && revision > bestAcceptedSingleton[claim.Kind] {
@@ -1887,6 +1892,7 @@ order by c.created_at desc`, intentID)
 		if timestampAfter(valueEditCreatedAt, claim.UpdatedAt) {
 			claim.UpdatedAt = valueEditCreatedAt
 		}
+		claim.Revision = revision
 		if claim.Status == "accepted" && revision > bestAcceptedSingleton[claim.Kind] {
 			bestAcceptedSingleton[claim.Kind] = revision
 		}
@@ -3167,6 +3173,9 @@ func policyFailingClaims(loaded []ClaimOut, eligible []ClaimOut) []ClaimOut {
 	}
 	var out []ClaimOut
 	for _, claim := range loaded {
+		if actionConstraintClaimKind(claim.Kind) {
+			continue
+		}
 		if !eligibleByID[claim.ID] {
 			out = append(out, claim)
 		}
@@ -3182,8 +3191,16 @@ func actionGatePolicyFailingClaims(intentKind string, claims []ClaimOut, request
 		}
 	}
 	var out []ClaimOut
+	if latestClaim, latestConstraint, ok := latestMatchingActionConstraint(intentKind, claims, request); ok {
+		if latestClaim.Status != "accepted" || claimStale(latestClaim, maxAge) || belowConfidenceFloor(latestClaim, request) || !latestConstraint.Allow {
+			out = append(out, latestClaim)
+		}
+	}
 	for _, claim := range claims {
-		if !blocking[claim.Kind] && !strings.HasPrefix(claim.Kind, "boundary.") && !actionConstraintClaimKind(claim.Kind) {
+		if actionConstraintClaimKind(claim.Kind) {
+			continue
+		}
+		if !blocking[claim.Kind] && !strings.HasPrefix(claim.Kind, "boundary.") {
 			continue
 		}
 		if claim.Status != "accepted" || claimStale(claim, maxAge) || belowConfidenceFloor(claim, request) {
@@ -3194,15 +3211,11 @@ func actionGatePolicyFailingClaims(intentKind string, claims []ClaimOut, request
 }
 
 func hasActionGateConstraint(intentKind string, claims []ClaimOut, request IntentRequestEnvelope, maxAge time.Duration) bool {
-	for _, claim := range claims {
-		if claim.Status != "accepted" || claimStale(claim, maxAge) || belowConfidenceFloor(claim, request) {
-			continue
-		}
-		if actionConstraintAuthorizes(intentKind, claim, request) {
-			return true
-		}
+	claim, constraint, ok := latestMatchingActionConstraint(intentKind, claims, request)
+	if !ok {
+		return false
 	}
-	return false
+	return claim.Status == "accepted" && !claimStale(claim, maxAge) && !belowConfidenceFloor(claim, request) && constraint.Allow
 }
 
 type actionConstraintValue struct {
@@ -3215,35 +3228,66 @@ type actionConstraintValue struct {
 	Deadline   string `json:"deadline,omitempty"`
 }
 
-func actionConstraintAuthorizes(intentKind string, claim ClaimOut, request IntentRequestEnvelope) bool {
+func latestMatchingActionConstraint(intentKind string, claims []ClaimOut, request IntentRequestEnvelope) (ClaimOut, actionConstraintValue, bool) {
+	var latestClaim ClaimOut
+	var latestConstraint actionConstraintValue
+	var found bool
+	for _, claim := range claims {
+		constraint, ok := matchingActionConstraint(intentKind, claim, request)
+		if !ok {
+			continue
+		}
+		if !found || claimNewer(claim, latestClaim) {
+			latestClaim = claim
+			latestConstraint = constraint
+			found = true
+		}
+	}
+	return latestClaim, latestConstraint, found
+}
+
+func matchingActionConstraint(intentKind string, claim ClaimOut, request IntentRequestEnvelope) (actionConstraintValue, bool) {
 	if !actionConstraintClaimKind(claim.Kind) {
-		return false
+		return actionConstraintValue{}, false
 	}
 	var constraint actionConstraintValue
 	dec := json.NewDecoder(strings.NewReader(claim.Value))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&constraint); err != nil {
-		return false
-	}
-	if !constraint.Allow {
-		return false
+		return actionConstraintValue{}, false
 	}
 	if normalizeKind(constraint.IntentKind, "") != intentKind || strings.TrimSpace(constraint.IntentKind) == "" {
-		return false
+		return actionConstraintValue{}, false
 	}
 	if !sameRequiredConstraintValue(constraint.TaskMode, request.Task.Mode) {
-		return false
+		return actionConstraintValue{}, false
 	}
 	if !sameRequiredConstraintValue(constraint.Autonomy, request.Task.Autonomy) {
-		return false
+		return actionConstraintValue{}, false
 	}
 	if !sameRequiredConstraintValue(constraint.Goal, request.Task.Goal) {
-		return false
+		return actionConstraintValue{}, false
 	}
 	if !sameRequiredConstraintValue(constraint.Audience, request.Audience.Label()) {
+		return actionConstraintValue{}, false
+	}
+	if strings.TrimSpace(constraint.Deadline) != strings.TrimSpace(request.Task.Deadline) {
+		return actionConstraintValue{}, false
+	}
+	return constraint, true
+}
+
+func claimNewer(left, right ClaimOut) bool {
+	if left.Revision != right.Revision {
+		return left.Revision > right.Revision
+	}
+	if timestampAfter(left.UpdatedAt, right.UpdatedAt) {
+		return true
+	}
+	if timestampAfter(right.UpdatedAt, left.UpdatedAt) {
 		return false
 	}
-	return strings.TrimSpace(constraint.Deadline) == strings.TrimSpace(request.Task.Deadline)
+	return left.ID > right.ID
 }
 
 func sameRequiredConstraintValue(left, right string) bool {
