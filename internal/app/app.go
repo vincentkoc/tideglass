@@ -773,7 +773,7 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 	commitments := claimCommitmentsForClaims(claims)
 	filteredClaims, policy := applyIntentPolicy(kind, claims, unresolved, request, opts.AllowAction)
 	filteredClaims = addClaimCommitments(filteredClaims, request, commitments)
-	redactedBlocking := redactedBlockingQuestions(kind, policy.Redacted, request.Contract.RequiredSlots, unresolved)
+	redactedBlocking := redactedBlockingQuestions(kind, policy.Redacted, request.Contract.RequiredSlots, unresolved, request.Task.Mode)
 	if len(redactedBlocking) > 0 {
 		unresolved = append(unresolved, redactedBlocking...)
 	}
@@ -849,10 +849,7 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 		Claims:        filteredClaims,
 		Unresolved:    unresolved,
 		Policy:        policy,
-		Links: map[string]string{
-			"profile":    "tideglass://v1/profile/me/" + kind + "/current",
-			"disclosure": "tideglass://disclosure/" + kind + "/" + request.Audience.Label(),
-		},
+		Links:         map[string]string{},
 	}
 	if allowCommitments(request.Disclosure) {
 		response.Commitments = IntentCommitments{
@@ -3067,7 +3064,7 @@ func addRequiredSlotQuestions(unresolved []IntentQuestion, claims []ClaimOut, re
 	return out
 }
 
-func redactedBlockingQuestions(intentKind string, redacted []string, requiredSlots []string, existing []IntentQuestion) []IntentQuestion {
+func redactedBlockingQuestions(intentKind string, redacted []string, requiredSlots []string, existing []IntentQuestion, taskMode string) []IntentQuestion {
 	if len(redacted) == 0 {
 		return nil
 	}
@@ -3083,6 +3080,9 @@ func redactedBlockingQuestions(intentKind string, redacted []string, requiredSlo
 	}
 	var out []IntentQuestion
 	for _, kind := range redacted {
+		if actionConstraintClaimKind(kind) && taskMode != "act_gate" {
+			continue
+		}
 		if (blocking[kind] || strings.HasPrefix(kind, "boundary.") || actionConstraintClaimKind(kind)) && !haveBlockingQuestions[kind] {
 			out = append(out, questionForSlot(kind, "critical", true))
 			haveBlockingQuestions[kind] = true
