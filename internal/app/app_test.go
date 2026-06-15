@@ -1746,6 +1746,24 @@ func TestServiceHandlerResolvesIntentResource(t *testing.T) {
 		data, _ := io.ReadAll(unknownAudienceResponse.Body)
 		t.Fatalf("unknown audience field status = %d body=%s", unknownAudienceResponse.StatusCode, data)
 	}
+	trailingResolve, err := authedHTTP(t, http.MethodPost, server.URL+"/resolve", "application/json", strings.NewReader(`{"uri":"tideglass://disclosure/social.dinner/venue"}{}`), token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer trailingResolve.Body.Close()
+	if trailingResolve.StatusCode != http.StatusBadRequest {
+		data, _ := io.ReadAll(trailingResolve.Body)
+		t.Fatalf("trailing resolve status = %d body=%s", trailingResolve.StatusCode, data)
+	}
+	oversizedResolve, err := authedHTTP(t, http.MethodPost, server.URL+"/resolve", "application/json", strings.NewReader(`{"uri":"tideglass://disclosure/social.dinner/venue","context":{"blob":"`+strings.Repeat("x", 1<<20)+`"}}`), token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer oversizedResolve.Body.Close()
+	if oversizedResolve.StatusCode != http.StatusRequestEntityTooLarge {
+		data, _ := io.ReadAll(oversizedResolve.Body)
+		t.Fatalf("oversized resolve status = %d body=%s", oversizedResolve.StatusCode, data)
+	}
 	bad, err := authedHTTP(t, http.MethodGet, server.URL+"/resource?uri=tideglass://intent/", "", nil, token)
 	defer bad.Body.Close()
 	if bad.StatusCode != http.StatusBadRequest {

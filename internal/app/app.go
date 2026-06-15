@@ -1233,11 +1233,22 @@ func NewServiceHandlerWithToken(t *Tideglass, token string) http.Handler {
 		}
 		defer r.Body.Close()
 		var request IntentRequestEnvelope
-		dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+		body := http.MaxBytesReader(w, r.Body, 1<<20)
+		dec := json.NewDecoder(body)
 		dec.UseNumber()
 		dec.DisallowUnknownFields()
 		if err := dec.Decode(&request); err != nil {
+			var maxBytesErr *http.MaxBytesError
+			if errors.As(err, &maxBytesErr) {
+				writeHTTPError(w, http.StatusRequestEntityTooLarge, "request body too large")
+				return
+			}
 			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		var trailing any
+		if err := dec.Decode(&trailing); err != io.EOF {
+			writeHTTPError(w, http.StatusBadRequest, "request body must contain exactly one JSON object")
 			return
 		}
 		if err := authorizeHTTPResolveRequest(request); err != nil {
@@ -1546,7 +1557,9 @@ func (t *Tideglass) persistAuthorizedProfileSnapshot(ctx context.Context, reques
 	committed := false
 	defer func() {
 		if !committed {
-			_, _ = conn.ExecContext(ctx, `rollback`)
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			_, _ = conn.ExecContext(cleanupCtx, `rollback`)
 		}
 	}()
 	endRevision, err := currentRevision(ctx, conn)
@@ -3852,7 +3865,7 @@ func decisionReason(foundIntent bool, policy IntentPolicyEnvelope, mode, autonom
 		if mode == "act_gate" && autonomy == "bounded_act" && !allowAction {
 			return "action_authority_required"
 		}
-		if autonomy == "suggest_then_confirm" {
+		if mode == "act_gate" && autonomy == "suggest_then_confirm" {
 			return "confirmation_required"
 		}
 		return "autonomy_blocks_action"
