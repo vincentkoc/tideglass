@@ -865,6 +865,20 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 		response.Commitments.ResponseHash = response.ProfileHash
 	}
 	if !opts.NoPersist {
+		if response.Decision.MayAct {
+			snapshotID, authorized, err := t.persistAuthorizedProfileSnapshot(ctx, requestID, response, startRevision, request)
+			if err != nil {
+				return IntentResponseEnvelope{}, err
+			}
+			if authorized {
+				response.SnapshotID = snapshotID
+				if hasCommitments(response.Commitments) {
+					response.Commitments.SnapshotID = response.SnapshotID
+				}
+				return response, nil
+			}
+			response = failClosedActionSnapshot(response)
+		}
 		response.SnapshotID, err = t.persistProfileSnapshot(ctx, requestID, response)
 		if err != nil {
 			return IntentResponseEnvelope{}, err
@@ -874,6 +888,24 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 		}
 	}
 	return response, nil
+}
+
+func failClosedActionSnapshot(response IntentResponseEnvelope) IntentResponseEnvelope {
+	response.Unresolved = append(response.Unresolved, questionForSlot("policy.action.snapshot", "critical", true))
+	response.Policy.NeedsUserAnswer = true
+	response.Policy.MayAct = false
+	response.Policy.CapabilityRequired = append(response.Policy.CapabilityRequired, "consistent_snapshot")
+	response.Decision.MayAct = false
+	response.Decision.NeedsUserAnswer = true
+	response.Decision.Reason = "critical_slots_missing"
+	response.Status = "partial"
+	response.SnapshotID = ""
+	response.Commitments.SnapshotID = ""
+	response.ProfileHash = profileHash(response)
+	if hasCommitments(response.Commitments) {
+		response.Commitments.ResponseHash = response.ProfileHash
+	}
+	return response
 }
 
 func (t *Tideglass) EditClaim(ctx context.Context, opts EditOptions) (EditResult, error) {
@@ -1499,6 +1531,47 @@ values(?,?,?,?,?,?,?,?,?,?)`,
 }
 
 func (t *Tideglass) persistProfileSnapshot(ctx context.Context, requestID string, response IntentResponseEnvelope) (string, error) {
+	return persistProfileSnapshotWith(ctx, t.db, requestID, response)
+}
+
+func (t *Tideglass) persistAuthorizedProfileSnapshot(ctx context.Context, requestID string, response IntentResponseEnvelope, startRevision int64, request IntentRequestEnvelope) (string, bool, error) {
+	conn, err := t.db.Conn(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `begin immediate`); err != nil {
+		return "", false, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(ctx, `rollback`)
+		}
+	}()
+	endRevision, err := currentRevision(ctx, conn)
+	if err != nil {
+		return "", false, err
+	}
+	if endRevision != startRevision || !deadlineConstraintValid(request.Task.Deadline, request.Task.Deadline) {
+		return "", false, nil
+	}
+	snapshotID, err := persistProfileSnapshotWith(ctx, conn, requestID, response)
+	if err != nil {
+		return "", false, err
+	}
+	if _, err := conn.ExecContext(ctx, `commit`); err != nil {
+		return "", false, err
+	}
+	committed = true
+	return snapshotID, true, nil
+}
+
+type snapshotExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func persistProfileSnapshotWith(ctx context.Context, execer snapshotExecer, requestID string, response IntentResponseEnvelope) (string, error) {
 	snapshotID := id("snap")
 	response.SnapshotID = snapshotID
 	if hasCommitments(response.Commitments) {
@@ -1509,7 +1582,7 @@ func (t *Tideglass) persistProfileSnapshot(ctx context.Context, requestID string
 		return "", err
 	}
 	intentID := response.Intent.ID
-	_, err = t.db.ExecContext(ctx, `
+	_, err = execer.ExecContext(ctx, `
 insert into profile_snapshots(id,request_id,uri,resolved_uri,intent_id,response_json,profile_hash,created_at)
 values(?,?,?,?,?,?,?,?)`,
 		snapshotID, requestID, response.URI, response.ResolvedURI, intentID, string(responseJSON), response.ProfileHash, now())
