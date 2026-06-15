@@ -767,7 +767,7 @@ func TestResolveIntentActionGateIgnoresSupersededSingletonBoundaries(t *testing.
 	}
 	oldBoundaryID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
 		Kind:       "boundary.project.no_go",
-		Value:      "Old pending boundary.",
+		Value:      "New reviewed boundary.",
 		Confidence: 0.8,
 		SourceMode: "explicit",
 	})
@@ -1385,6 +1385,16 @@ func TestServiceHandlerResolvesIntentResource(t *testing.T) {
 	if unknownPolicyResponse.StatusCode != http.StatusBadRequest {
 		data, _ := io.ReadAll(unknownPolicyResponse.Body)
 		t.Fatalf("unknown policy field status = %d body=%s", unknownPolicyResponse.StatusCode, data)
+	}
+	unknownAudienceField := strings.NewReader(`{"uri":"tideglass://disclosure/social.dinner/venue","audience":{"shareWith":["venue"]}}`)
+	unknownAudienceResponse, err := authedHTTP(t, http.MethodPost, server.URL+"/resolve", "application/json", unknownAudienceField, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unknownAudienceResponse.Body.Close()
+	if unknownAudienceResponse.StatusCode != http.StatusBadRequest {
+		data, _ := io.ReadAll(unknownAudienceResponse.Body)
+		t.Fatalf("unknown audience field status = %d body=%s", unknownAudienceResponse.StatusCode, data)
 	}
 	bad, err := authedHTTP(t, http.MethodGet, server.URL+"/resource?uri=tideglass://intent/", "", nil, token)
 	defer bad.Body.Close()

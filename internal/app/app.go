@@ -123,7 +123,9 @@ func (audience *IntentAudience) UnmarshalJSON(data []byte) error {
 	}
 	type audienceAlias IntentAudience
 	var decoded audienceAlias
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&decoded); err != nil {
 		return err
 	}
 	*audience = IntentAudience(decoded)
@@ -871,7 +873,7 @@ func (t *Tideglass) EditClaim(ctx context.Context, opts EditOptions) (EditResult
 		_ = tx.Rollback()
 		return EditResult{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `update claims set status = 'active', updated_at = ?, revision = ? where id = ?`, now(), revision, opts.ClaimID); err != nil {
+	if _, err := tx.ExecContext(ctx, `update claims set status = 'active', normalized_value = ?, updated_at = ?, revision = ? where id = ?`, normalizeText(value), now(), revision, opts.ClaimID); err != nil {
 		_ = tx.Rollback()
 		return EditResult{}, err
 	}
@@ -1799,9 +1801,7 @@ order by c.created_at desc`, intentID)
 		if timestampAfter(valueEditCreatedAt, claim.UpdatedAt) {
 			claim.UpdatedAt = valueEditCreatedAt
 		}
-		if normalized == "" {
-			normalized = normalizeText(claim.Value)
-		}
+		normalized = normalizeText(claim.Value)
 		duplicateKey := claim.Kind + "\x00" + normalized
 		if singletonClaimKind(claim.Kind) && claim.Status == "accepted" && revision > bestAcceptedSingleton[claim.Kind] {
 			bestAcceptedSingleton[claim.Kind] = revision
