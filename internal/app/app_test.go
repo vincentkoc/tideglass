@@ -772,6 +772,18 @@ func TestResolveIntentV2ActionAndDisclosureContracts(t *testing.T) {
 	}
 	allowValues := false
 	allowCommitments := false
+	response, err = tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, Request: IntentRequestEnvelope{
+		URI:        "tideglass://v1/intent/work.project.start/current",
+		Task:       IntentTask{Mode: "act_gate", Autonomy: "bounded_act"},
+		Contract:   IntentContract{RequiredSlots: []string{"preference.agent.communication"}},
+		Disclosure: IntentDisclosure{AllowValues: &allowValues},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Decision.MayAct || !response.Decision.NeedsUserAnswer {
+		t.Fatalf("value-less action gate authorized action: %#v", response)
+	}
 	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
 		URI:        "tideglass://v1/intent/work.project.start/current",
 		Task:       IntentTask{Mode: "context", Autonomy: "context_only"},
@@ -863,6 +875,12 @@ func TestResolveIntentCanonicalLinksAndExistenceDisclosure(t *testing.T) {
 		Freshness: IntentFreshness{MaxAge: "-1h"},
 	}}); err == nil {
 		t.Fatal("expected negative freshness to fail closed")
+	}
+	if _, err := tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
+		URI:       "tideglass://intent/work.project.start",
+		Freshness: IntentFreshness{MaxAge: "106752d"},
+	}}); err == nil {
+		t.Fatal("expected overflowing freshness to fail closed")
 	}
 	for _, uri := range []string{"tideglass://intent/", "tideglass://unresolved/", "tideglass://profile/me//current", "tideglass://v1/v1/intent/work.project.start"} {
 		if _, err := tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{URI: uri}}); err == nil {

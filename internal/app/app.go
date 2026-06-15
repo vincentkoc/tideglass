@@ -2819,6 +2819,9 @@ func parseMaxAge(value string) (time.Duration, error) {
 		if err != nil || days <= 0 {
 			return 0, fmt.Errorf("invalid freshness.max_age %q", value)
 		}
+		if int64(days) > math.MaxInt64/int64(24*time.Hour) {
+			return 0, fmt.Errorf("invalid freshness.max_age %q", value)
+		}
 		return time.Duration(days) * 24 * time.Hour, nil
 	}
 	duration, err := time.ParseDuration(value)
@@ -2894,6 +2897,10 @@ func applyIntentPolicy(claims []ClaimOut, unresolved []IntentQuestion, request I
 		return out[i].ID < out[j].ID
 	})
 	policy.MayAct = !policy.NeedsUserAnswer
+	if request.Task.Mode == "act_gate" && !allowClaimValues(request.Disclosure) {
+		policy.NeedsUserAnswer = true
+		policy.MayAct = false
+	}
 	if !allowAction || request.Task.Mode != "act_gate" || request.Task.Autonomy == "context_only" || request.Task.Autonomy == "suggest_only" || request.Task.Autonomy == "suggest_then_confirm" || request.Task.Autonomy == "deny" {
 		policy.MayAct = false
 	}

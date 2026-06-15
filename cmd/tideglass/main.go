@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/vincentkoc/tideglass/internal/app"
 )
@@ -435,7 +436,6 @@ func runResolve(ctx context.Context, args []string) error {
 func runServe(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	addr := fs.String("addr", "127.0.0.1:8765", "listen address")
-	token := fs.String("token", "", "required service bearer token")
 	dbPath := fs.String("db", "", "database path")
 	if err := fs.Parse(normalizeFlagArgs(args)); err != nil {
 		return err
@@ -448,14 +448,18 @@ func runServe(ctx context.Context, args []string) error {
 		return err
 	}
 	defer tg.Close()
-	serviceToken := strings.TrimSpace(*token)
+	serviceToken := strings.TrimSpace(os.Getenv("TIDEGLASS_SERVICE_TOKEN"))
 	if serviceToken == "" {
-		serviceToken = strings.TrimSpace(os.Getenv("TIDEGLASS_SERVICE_TOKEN"))
+		return errors.New("serve requires TIDEGLASS_SERVICE_TOKEN")
 	}
-	if serviceToken == "" {
-		return errors.New("serve requires --token or TIDEGLASS_SERVICE_TOKEN")
+	server := &http.Server{
+		Addr:              *addr,
+		Handler:           app.NewServiceHandlerWithToken(tg, serviceToken),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
-	server := &http.Server{Addr: *addr, Handler: app.NewServiceHandlerWithToken(tg, serviceToken)}
 	fmt.Fprintf(os.Stderr, "tideglass: serving on http://%s\n", *addr)
 	fmt.Fprintln(os.Stderr, "tideglass: requests require Authorization: Bearer <token>")
 	err = server.ListenAndServe()
@@ -536,7 +540,6 @@ func normalizeFlagArgs(args []string) []string {
 		"request":   true,
 		"set":       true,
 		"addr":      true,
-		"token":     true,
 	}
 	var flags []string
 	var positionals []string

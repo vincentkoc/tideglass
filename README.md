@@ -49,7 +49,7 @@ Run the local service:
 
 ```sh
 export TIDEGLASS_SERVICE_TOKEN="$(openssl rand -hex 32)"
-tideglass serve --addr 127.0.0.1:8765 --token "$TIDEGLASS_SERVICE_TOKEN"
+tideglass serve --addr 127.0.0.1:8765
 curl -s http://127.0.0.1:8765/healthz
 curl -s -H "Authorization: Bearer $TIDEGLASS_SERVICE_TOKEN" \
   'http://127.0.0.1:8765/resource?uri=tideglass://intent/work.project.start'
