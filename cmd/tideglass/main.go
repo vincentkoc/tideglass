@@ -3,9 +3,11 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -55,6 +57,12 @@ func run(ctx context.Context, args []string) error {
 		return runDoctor(ctx, args)
 	case "context":
 		return runContext(ctx, args)
+	case "resolve":
+		return runResolve(ctx, args)
+	case "serve":
+		return runServe(ctx, args)
+	case "mcp":
+		return runMCP(ctx, args)
 	case "help", "-h", "--help":
 		usage()
 		return nil
@@ -385,6 +393,80 @@ func runContext(ctx context.Context, args []string) error {
 	return app.Print(result, *jsonOut)
 }
 
+func runResolve(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("resolve", flag.ContinueOnError)
+	requestPath := fs.String("request", "", "request envelope JSON path")
+	jsonOut := fs.Bool("json", false, "write JSON")
+	dbPath := fs.String("db", "", "database path")
+	if err := fs.Parse(normalizeFlagArgs(args)); err != nil {
+		return err
+	}
+	request := app.IntentRequestEnvelope{}
+	if strings.TrimSpace(*requestPath) != "" {
+		data, err := os.ReadFile(expandPath(*requestPath))
+		if err != nil {
+			return err
+		}
+		if err := json.Unmarshal(data, &request); err != nil {
+			return err
+		}
+	} else {
+		if fs.NArg() != 1 {
+			return errors.New("resolve requires a tideglass:// URI or --request")
+		}
+		request.URI = fs.Arg(0)
+	}
+	tg, err := app.Open(ctx, *dbPath)
+	if err != nil {
+		return err
+	}
+	defer tg.Close()
+	result, err := tg.ResolveIntent(ctx, app.ResolveOptions{Request: request})
+	if err != nil {
+		return err
+	}
+	return app.Print(result, *jsonOut)
+}
+
+func runServe(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	addr := fs.String("addr", "127.0.0.1:8765", "listen address")
+	dbPath := fs.String("db", "", "database path")
+	if err := fs.Parse(normalizeFlagArgs(args)); err != nil {
+		return err
+	}
+	tg, err := app.Open(ctx, *dbPath)
+	if err != nil {
+		return err
+	}
+	defer tg.Close()
+	server := &http.Server{Addr: *addr, Handler: app.NewServiceHandler(tg)}
+	fmt.Fprintf(os.Stderr, "tideglass: serving on http://%s\n", *addr)
+	err = server.ListenAndServe()
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
+}
+
+func runMCP(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
+	once := fs.Bool("once", false, "handle one JSON-RPC request on stdin")
+	dbPath := fs.String("db", "", "database path")
+	if err := fs.Parse(normalizeFlagArgs(args)); err != nil {
+		return err
+	}
+	if !*once {
+		return errors.New("mcp currently requires --once")
+	}
+	tg, err := app.Open(ctx, *dbPath)
+	if err != nil {
+		return err
+	}
+	defer tg.Close()
+	return app.HandleMCPOnce(ctx, tg, os.Stdin, os.Stdout)
+}
+
 func usage() {
 	fmt.Fprint(os.Stderr, `usage: tideglass <command> [options]
 
@@ -399,6 +481,9 @@ commands:
   profile export --kind <kind>|--intent <id>
   evidence show <claim-id>
 	  context --kind <kind> --for-agent codex
+	  resolve tideglass://intent/<kind> [--json]
+	  serve [--addr 127.0.0.1:8765]
+	  mcp --once
 	  doctor
 	  version
 	`)
@@ -416,7 +501,9 @@ func normalizeFlagArgs(args []string) []string {
 		"out":       true,
 		"path":      true,
 		"reason":    true,
+		"request":   true,
 		"set":       true,
+		"addr":      true,
 	}
 	var flags []string
 	var positionals []string

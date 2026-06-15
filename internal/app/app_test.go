@@ -9,6 +9,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -395,6 +397,189 @@ func TestAcceptedDuplicateSingletonBeatsNewerActive(t *testing.T) {
 	}
 	if len(claims) != 1 || claims[0].ID != acceptedID || claims[0].Status != "accepted" {
 		t.Fatalf("accepted duplicate was not authoritative: %#v", claims)
+	}
+}
+
+func TestResolveIntentAppliesPolicyAndPersistsSnapshot(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	intent, err := tg.ensureIntent(ctx, "work.project.start", "Project start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	normalID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "preference.agent.communication",
+		Value:      "Use terse updates.",
+		Confidence: 0.9,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: normalID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	privateID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "boundary.project.no_go",
+		Value:      "Do not touch release credentials.",
+		Confidence: 0.95,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: privateID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "preference.project.validation",
+		Value:      "Run every test.",
+		Confidence: 0.5,
+		SourceMode: "inferred",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{URI: "tideglass://intent/work.project.start"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.SchemaVersion != "tideglass.intent_response.v1" || first.ResolvedURI != "tideglass://profile/me/work.project.start/current" {
+		t.Fatalf("bad envelope metadata: %#v", first)
+	}
+	if first.ProfileHash == "" || !strings.HasPrefix(first.ProfileHash, "sha256:") || first.SnapshotID == "" {
+		t.Fatalf("missing hash/snapshot: %#v", first)
+	}
+	if len(first.Claims) != 1 || first.Claims[0].ID != normalID {
+		t.Fatalf("policy-filtered claims = %#v", first.Claims)
+	}
+	if first.Policy.MayAct != true || first.Policy.NeedsUserAnswer != false {
+		t.Fatalf("policy = %#v", first.Policy)
+	}
+	if !containsString(first.Policy.Redacted, "boundary.project.no_go") {
+		t.Fatalf("redactions = %#v", first.Policy.Redacted)
+	}
+	second, err := tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{URI: "tideglass://intent/work.project.start"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.ProfileHash != first.ProfileHash {
+		t.Fatalf("profile hash changed for same materialized response: %s != %s", second.ProfileHash, first.ProfileHash)
+	}
+	if second.SnapshotID == first.SnapshotID {
+		t.Fatalf("snapshot id should be unique per resolution: %s", second.SnapshotID)
+	}
+	var requests, snapshots int
+	if err := tg.db.QueryRowContext(ctx, `select count(*) from intent_requests`).Scan(&requests); err != nil {
+		t.Fatal(err)
+	}
+	if err := tg.db.QueryRowContext(ctx, `select count(*) from profile_snapshots`).Scan(&snapshots); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 2 || snapshots != 2 {
+		t.Fatalf("requests=%d snapshots=%d", requests, snapshots)
+	}
+}
+
+func TestResolveIntentSupportsDisclosureAndMissingIntent(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	response, err := tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{URI: "tideglass://disclosure/social.dinner/venue"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Intent.Kind != "social.dinner" || response.Policy.Audience != "venue" {
+		t.Fatalf("response = %#v", response)
+	}
+	if response.Status != "partial" || !response.Policy.NeedsUserAnswer || response.Policy.MayAct {
+		t.Fatalf("missing intent policy = %#v", response.Policy)
+	}
+	if len(response.Unresolved) == 0 || response.Unresolved[0].Kind != "preference.food.allergy" {
+		t.Fatalf("unresolved = %#v", response.Unresolved)
+	}
+}
+
+func TestServiceHandlerResolvesIntentResource(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	server := httptest.NewServer(NewServiceHandler(tg))
+	defer server.Close()
+	health, err := http.Get(server.URL + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer health.Body.Close()
+	if health.StatusCode != http.StatusOK {
+		t.Fatalf("health status = %d", health.StatusCode)
+	}
+	resource, err := http.Get(server.URL + "/resource?uri=tideglass://intent/work.project.start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resource.Body.Close()
+	if resource.StatusCode != http.StatusOK {
+		data, _ := io.ReadAll(resource.Body)
+		t.Fatalf("resource status = %d body=%s", resource.StatusCode, data)
+	}
+	var response IntentResponseEnvelope
+	if err := json.NewDecoder(resource.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Intent.Kind != "work.project.start" || response.ProfileHash == "" {
+		t.Fatalf("response = %#v", response)
+	}
+	body := strings.NewReader(`{"uri":"tideglass://disclosure/social.dinner/venue"}`)
+	resolve, err := http.Post(server.URL+"/resolve", "application/json", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resolve.Body.Close()
+	if resolve.StatusCode != http.StatusOK {
+		data, _ := io.ReadAll(resolve.Body)
+		t.Fatalf("resolve status = %d body=%s", resolve.StatusCode, data)
+	}
+	response = IntentResponseEnvelope{}
+	if err := json.NewDecoder(resolve.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Policy.Audience != "venue" || response.ResolvedURI != "tideglass://profile/me/social.dinner/current" {
+		t.Fatalf("resolve response = %#v", response)
+	}
+}
+
+func TestHandleMCPOnceReadsIntentResource(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	input := strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"tideglass://intent/work.project.start"}}`)
+	var output strings.Builder
+	if err := HandleMCPOnce(ctx, tg, input, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), `"jsonrpc": "2.0"`) || !strings.Contains(output.String(), `tideglass.intent_response.v1`) {
+		t.Fatalf("mcp output = %s", output.String())
+	}
+	input = strings.NewReader(`{"jsonrpc":"2.0","id":"tool-1","method":"tools/call","params":{"name":"tideglass.resolve_intent","arguments":{"uri":"tideglass://intent/work.project.start"}}}`)
+	output.Reset()
+	if err := HandleMCPOnce(ctx, tg, input, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), `"id": "tool-1"`) || !strings.Contains(output.String(), `tideglass.intent_response.v1`) {
+		t.Fatalf("mcp tool output = %s", output.String())
 	}
 }
 
@@ -1160,4 +1345,13 @@ func captureStdout(t *testing.T, fn func()) string {
 		t.Fatal(err)
 	}
 	return string(output)
+}
+
+func containsString(rows []string, value string) bool {
+	for _, row := range rows {
+		if row == value {
+			return true
+		}
+	}
+	return false
 }

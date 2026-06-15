@@ -17,6 +17,7 @@ import (
 	"io"
 	"io/fs"
 	"math"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -30,7 +31,7 @@ import (
 	"github.com/openclaw/crawlkit/vector"
 )
 
-const schemaVersion = 1
+const schemaVersion = 2
 
 type Tideglass struct {
 	store *store.Store
@@ -78,6 +79,77 @@ type ExportOptions struct {
 	Kind     string
 	Format   string
 	Out      string
+}
+
+type ResolveOptions struct {
+	Request IntentRequestEnvelope
+}
+
+type IntentActor struct {
+	Type    string `json:"type,omitempty"`
+	ID      string `json:"id,omitempty"`
+	Session string `json:"session,omitempty"`
+}
+
+type IntentFreshness struct {
+	MaxAge          string `json:"max_age,omitempty"`
+	RequireReviewed *bool  `json:"require_reviewed,omitempty"`
+}
+
+type IntentDisclosure struct {
+	Mode           string `json:"mode,omitempty"`
+	AllowEvidence  bool   `json:"allow_evidence,omitempty"`
+	AllowSensitive bool   `json:"allow_sensitive,omitempty"`
+}
+
+type IntentRequestEnvelope struct {
+	URI        string           `json:"uri"`
+	Actor      IntentActor      `json:"actor,omitempty"`
+	Purpose    string           `json:"purpose,omitempty"`
+	Audience   string           `json:"audience,omitempty"`
+	Freshness  IntentFreshness  `json:"freshness,omitempty"`
+	Disclosure IntentDisclosure `json:"disclosure,omitempty"`
+	Context    map[string]any   `json:"context,omitempty"`
+}
+
+type IntentResponseEnvelope struct {
+	SchemaVersion string                `json:"schema_version"`
+	URI           string                `json:"uri"`
+	ResolvedURI   string                `json:"resolved_uri"`
+	Intent        IntentOut             `json:"intent"`
+	Status        string                `json:"status"`
+	ProfileHash   string                `json:"profile_hash"`
+	SnapshotID    string                `json:"snapshot_id"`
+	Claims        []IntentClaimEnvelope `json:"claims"`
+	Unresolved    []IntentQuestion      `json:"unresolved"`
+	Policy        IntentPolicyEnvelope  `json:"policy"`
+	Links         map[string]string     `json:"links"`
+}
+
+type IntentClaimEnvelope struct {
+	ID          string   `json:"id"`
+	Kind        string   `json:"kind"`
+	Value       string   `json:"value,omitempty"`
+	Confidence  float64  `json:"confidence"`
+	Status      string   `json:"status"`
+	SourceMode  string   `json:"source_mode"`
+	Sensitivity string   `json:"sensitivity"`
+	Evidence    []string `json:"evidence,omitempty"`
+}
+
+type IntentQuestion struct {
+	Kind     string `json:"kind"`
+	Question string `json:"question"`
+	Priority string `json:"priority"`
+}
+
+type IntentPolicyEnvelope struct {
+	Audience        string   `json:"audience"`
+	DisclosureMode  string   `json:"disclosure_mode"`
+	MayAct          bool     `json:"may_act"`
+	NeedsUserAnswer bool     `json:"needs_user_answer"`
+	SafeToShare     []string `json:"safe_to_share"`
+	Redacted        []string `json:"redacted"`
 }
 
 type SourceStatus struct {
@@ -493,6 +565,78 @@ func (t *Tideglass) Profile(ctx context.Context, opts ProfileOptions) (ProfileRe
 	return result, nil
 }
 
+func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (IntentResponseEnvelope, error) {
+	request := opts.Request
+	request.URI = strings.TrimSpace(request.URI)
+	kind, audienceFromURI, err := parseIntentURI(request.URI)
+	if err != nil {
+		return IntentResponseEnvelope{}, err
+	}
+	if request.Audience == "" && audienceFromURI != "" {
+		request.Audience = audienceFromURI
+	}
+	request = normalizeIntentRequest(request)
+	requestID, err := t.persistIntentRequest(ctx, request)
+	if err != nil {
+		return IntentResponseEnvelope{}, err
+	}
+	intent, foundIntent, err := t.findIntentForResolve(ctx, kind)
+	if err != nil {
+		return IntentResponseEnvelope{}, err
+	}
+	var claims []ClaimOut
+	var unresolved []IntentQuestion
+	if foundIntent {
+		loaded, err := t.loadClaims(ctx, intent.ID)
+		if err != nil {
+			return IntentResponseEnvelope{}, err
+		}
+		loaded, _, err = t.attachClaimEvidence(ctx, loaded)
+		if err != nil {
+			return IntentResponseEnvelope{}, err
+		}
+		claims = loaded
+		unresolved = unresolvedIntentQuestions(intent.Kind, loaded)
+	} else {
+		intent = IntentOut{Kind: kind, Title: titleForKind(kind)}
+		unresolved = unresolvedIntentQuestions(kind, nil)
+	}
+	requireReviewed := true
+	if request.Freshness.RequireReviewed != nil {
+		requireReviewed = *request.Freshness.RequireReviewed
+	}
+	filteredClaims, policy := applyIntentPolicy(claims, unresolved, request, requireReviewed)
+	if !foundIntent {
+		policy.NeedsUserAnswer = true
+		policy.MayAct = false
+	}
+	status := "ready"
+	if !foundIntent || policy.NeedsUserAnswer {
+		status = "partial"
+	}
+	response := IntentResponseEnvelope{
+		SchemaVersion: "tideglass.intent_response.v1",
+		URI:           request.URI,
+		ResolvedURI:   "tideglass://profile/me/" + kind + "/current",
+		Intent:        intent,
+		Status:        status,
+		Claims:        filteredClaims,
+		Unresolved:    unresolved,
+		Policy:        policy,
+		Links: map[string]string{
+			"profile":    "tideglass://profile/me/" + kind + "/current",
+			"unresolved": "tideglass://unresolved/" + kind,
+			"disclosure": "tideglass://disclosure/" + kind + "/" + request.Audience,
+		},
+	}
+	response.ProfileHash = profileHash(response)
+	response.SnapshotID, err = t.persistProfileSnapshot(ctx, requestID, response)
+	if err != nil {
+		return IntentResponseEnvelope{}, err
+	}
+	return response, nil
+}
+
 func (t *Tideglass) EditClaim(ctx context.Context, opts EditOptions) (EditResult, error) {
 	if strings.TrimSpace(opts.ClaimID) == "" {
 		return EditResult{}, errors.New("claim id is required")
@@ -742,6 +886,121 @@ func (t *Tideglass) Doctor(ctx context.Context) (DoctorResult, error) {
 	return DoctorResult{DBPath: t.path, Schema: schemaVersion, Sources: sources.Sources, Checks: checks, GeneratedAt: now(), OverallState: state}, nil
 }
 
+func NewServiceHandler(t *Tideglass) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, map[string]any{"status": "ok", "schema": schemaVersion})
+	})
+	mux.HandleFunc("/resolve", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		defer r.Body.Close()
+		var request IntentRequestEnvelope
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&request); err != nil {
+			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		response, err := t.ResolveIntent(r.Context(), ResolveOptions{Request: request})
+		if err != nil {
+			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, response)
+	})
+	mux.HandleFunc("/resource", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		uri := r.URL.Query().Get("uri")
+		response, err := t.ResolveIntent(r.Context(), ResolveOptions{Request: IntentRequestEnvelope{URI: uri}})
+		if err != nil {
+			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, response)
+	})
+	return mux
+}
+
+func HandleMCPOnce(ctx context.Context, t *Tideglass, in io.Reader, out io.Writer) error {
+	var req struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      any             `json:"id,omitempty"`
+		Method  string          `json:"method"`
+		Params  json.RawMessage `json:"params,omitempty"`
+	}
+	if err := json.NewDecoder(io.LimitReader(in, 1<<20)).Decode(&req); err != nil {
+		return err
+	}
+	var result any
+	switch req.Method {
+	case "resources/read":
+		var params struct {
+			URI string `json:"uri"`
+		}
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			return err
+		}
+		response, err := t.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{URI: params.URI}})
+		if err != nil {
+			return err
+		}
+		text, err := json.MarshalIndent(response, "", "  ")
+		if err != nil {
+			return err
+		}
+		result = map[string]any{"contents": []map[string]any{{"uri": params.URI, "mimeType": "application/json", "text": string(text)}}}
+	case "tools/call":
+		var params struct {
+			Name      string                `json:"name"`
+			Arguments IntentRequestEnvelope `json:"arguments"`
+		}
+		if err := json.Unmarshal(req.Params, &params); err != nil {
+			return err
+		}
+		if params.Name != "tideglass.resolve_intent" {
+			return fmt.Errorf("unsupported mcp tool %q", params.Name)
+		}
+		response, err := t.ResolveIntent(ctx, ResolveOptions{Request: params.Arguments})
+		if err != nil {
+			return err
+		}
+		result = map[string]any{"content": []map[string]any{{"type": "text", "text": mustJSONText(response)}}}
+	default:
+		return fmt.Errorf("unsupported mcp method %q", req.Method)
+	}
+	enc := json.NewEncoder(out)
+	enc.SetIndent("", "  ")
+	return enc.Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": result})
+}
+
+func writeHTTPJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(value)
+}
+
+func writeHTTPError(w http.ResponseWriter, status int, message string) {
+	writeHTTPJSON(w, status, map[string]any{"error": message})
+}
+
+func mustJSONText(value any) string {
+	data, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return "{}"
+	}
+	return string(data)
+}
+
 func (t *Tideglass) ensureIntent(ctx context.Context, kind, title string) (IntentOut, error) {
 	kind = normalizeKind(kind, "")
 	var existing IntentOut
@@ -775,6 +1034,58 @@ func (t *Tideglass) findIntent(ctx context.Context, intentID, kind string) (Inte
 		return IntentOut{}, err
 	}
 	return intent, nil
+}
+
+func (t *Tideglass) findIntentForResolve(ctx context.Context, kind string) (IntentOut, bool, error) {
+	var intent IntentOut
+	err := t.db.QueryRowContext(ctx, `select id,kind,title from intents where kind = ? and status = 'active' order by updated_at desc limit 1`, kind).Scan(&intent.ID, &intent.Kind, &intent.Title)
+	if err == nil {
+		return intent, true, nil
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return IntentOut{}, false, nil
+	}
+	return IntentOut{}, false, err
+}
+
+func (t *Tideglass) persistIntentRequest(ctx context.Context, request IntentRequestEnvelope) (string, error) {
+	actorJSON, err := json.Marshal(request.Actor)
+	if err != nil {
+		return "", err
+	}
+	freshnessJSON, err := json.Marshal(request.Freshness)
+	if err != nil {
+		return "", err
+	}
+	disclosureJSON, err := json.Marshal(request.Disclosure)
+	if err != nil {
+		return "", err
+	}
+	contextJSON, err := json.Marshal(nonNilMap(request.Context))
+	if err != nil {
+		return "", err
+	}
+	requestID := id("req")
+	_, err = t.db.ExecContext(ctx, `
+insert into intent_requests(id,uri,actor_json,purpose,audience,freshness_json,disclosure_json,context_json,created_at)
+values(?,?,?,?,?,?,?,?,?)`,
+		requestID, request.URI, string(actorJSON), request.Purpose, request.Audience, string(freshnessJSON), string(disclosureJSON), string(contextJSON), now())
+	return requestID, err
+}
+
+func (t *Tideglass) persistProfileSnapshot(ctx context.Context, requestID string, response IntentResponseEnvelope) (string, error) {
+	snapshotID := id("snap")
+	response.SnapshotID = snapshotID
+	responseJSON, err := json.Marshal(response)
+	if err != nil {
+		return "", err
+	}
+	intentID := response.Intent.ID
+	_, err = t.db.ExecContext(ctx, `
+insert into profile_snapshots(id,request_id,uri,resolved_uri,intent_id,response_json,profile_hash,created_at)
+values(?,?,?,?,?,?,?,?)`,
+		snapshotID, requestID, response.URI, response.ResolvedURI, intentID, string(responseJSON), response.ProfileHash, now())
+	return snapshotID, err
 }
 
 func (t *Tideglass) upsertSource(ctx context.Context, source SourceStatus) error {
@@ -1859,6 +2170,201 @@ func unresolvedQuestions(kind string, claims []ClaimOut) []string {
 	return out
 }
 
+func unresolvedIntentQuestions(kind string, claims []ClaimOut) []IntentQuestion {
+	have := map[string]bool{}
+	for _, claim := range claims {
+		have[claim.Kind] = true
+	}
+	need := map[string][]struct {
+		Kind     string
+		Question string
+		Priority string
+	}{
+		"social.dinner": {
+			{"preference.food.allergy", "Any allergies or hard dietary restrictions?", "critical"},
+			{"preference.food.budget", "What dinner budget range is comfortable?", "normal"},
+			{"preference.social.group_size", "What group size feels good with strangers?", "normal"},
+			{"boundary.social.topic", "Any topics to avoid with strangers?", "normal"},
+		},
+		"social.dating": {
+			{"preference.dating.relationship_goal", "What relationship goal should be explicit?", "critical"},
+			{"boundary.dating.dealbreaker", "What dealbreakers should never be inferred?", "critical"},
+			{"boundary.dating.safety", "What safety boundaries should be explicit?", "critical"},
+		},
+		"work.new_job": {
+			{"preference.work.communication", "What communication cadence should a new team know?", "normal"},
+			{"boundary.work.focus_time", "What focus-time boundaries matter?", "normal"},
+		},
+		"work.project.start": {
+			{"boundary.project.no_go", "Any project-specific no-go areas?", "normal"},
+			{"context.project.related_repos", "Which repos are definitely in scope?", "normal"},
+		},
+	}
+	rows := need[kind]
+	if len(rows) == 0 && strings.HasPrefix(kind, "work.") {
+		rows = need["work.project.start"]
+	}
+	out := make([]IntentQuestion, 0, len(rows))
+	for _, row := range rows {
+		if !have[row.Kind] {
+			out = append(out, IntentQuestion(row))
+		}
+	}
+	return out
+}
+
+func normalizeIntentRequest(request IntentRequestEnvelope) IntentRequestEnvelope {
+	request.URI = strings.TrimSpace(request.URI)
+	request.Actor.Type = strings.TrimSpace(request.Actor.Type)
+	if request.Actor.Type == "" {
+		request.Actor.Type = "agent"
+	}
+	request.Actor.ID = strings.TrimSpace(request.Actor.ID)
+	if request.Actor.ID == "" {
+		request.Actor.ID = "local"
+	}
+	request.Audience = strings.TrimSpace(request.Audience)
+	if request.Audience == "" {
+		request.Audience = "agent"
+	}
+	request.Disclosure.Mode = strings.TrimSpace(request.Disclosure.Mode)
+	if request.Disclosure.Mode == "" {
+		request.Disclosure.Mode = "minimal"
+	}
+	if request.Context == nil {
+		request.Context = map[string]any{}
+	}
+	return request
+}
+
+func parseIntentURI(rawURI string) (string, string, error) {
+	uri := strings.TrimSpace(rawURI)
+	if uri == "" {
+		return "", "", errors.New("intent request uri is required")
+	}
+	if !strings.HasPrefix(uri, "tideglass://") {
+		return "", "", fmt.Errorf("unsupported intent uri %q", rawURI)
+	}
+	rest := strings.TrimPrefix(uri, "tideglass://")
+	parts := strings.Split(rest, "/")
+	switch {
+	case len(parts) == 2 && parts[0] == "intent":
+		return normalizeKind(parts[1], ""), "", nil
+	case len(parts) == 5 && parts[0] == "profile" && parts[1] == "me" && parts[4] == "current":
+		return normalizeKind(parts[2], ""), "", nil
+	case len(parts) == 3 && parts[0] == "disclosure":
+		return normalizeKind(parts[1], ""), parts[2], nil
+	default:
+		return "", "", fmt.Errorf("unsupported intent uri %q", rawURI)
+	}
+}
+
+func applyIntentPolicy(claims []ClaimOut, unresolved []IntentQuestion, request IntentRequestEnvelope, requireReviewed bool) ([]IntentClaimEnvelope, IntentPolicyEnvelope) {
+	policy := IntentPolicyEnvelope{
+		Audience:        request.Audience,
+		DisclosureMode:  request.Disclosure.Mode,
+		SafeToShare:     []string{},
+		Redacted:        []string{},
+		NeedsUserAnswer: hasCriticalUnresolved(unresolved),
+	}
+	out := make([]IntentClaimEnvelope, 0, len(claims))
+	redacted := map[string]bool{}
+	shareable := map[string]bool{}
+	for _, claim := range claims {
+		if requireReviewed && claim.Status != "accepted" {
+			continue
+		}
+		sensitivity := claimSensitivity(claim.Kind)
+		envelope := IntentClaimEnvelope{
+			ID:          claim.ID,
+			Kind:        claim.Kind,
+			Value:       claim.Value,
+			Confidence:  claim.Confidence,
+			Status:      claim.Status,
+			SourceMode:  claim.SourceMode,
+			Sensitivity: sensitivity,
+		}
+		if request.Disclosure.AllowEvidence {
+			envelope.Evidence = claim.Evidence
+		}
+		if shouldRedactClaim(request.Disclosure, sensitivity) {
+			redacted[claim.Kind] = true
+			if request.Disclosure.Mode == "existence" {
+				envelope.Value = ""
+				envelope.Evidence = nil
+				out = append(out, envelope)
+			}
+			continue
+		}
+		if request.Disclosure.Mode == "existence" {
+			envelope.Value = ""
+			envelope.Evidence = nil
+		}
+		shareable[claim.Kind] = true
+		out = append(out, envelope)
+	}
+	for kind := range shareable {
+		policy.SafeToShare = append(policy.SafeToShare, kind)
+	}
+	for kind := range redacted {
+		policy.Redacted = append(policy.Redacted, kind)
+	}
+	sort.Strings(policy.SafeToShare)
+	sort.Strings(policy.Redacted)
+	policy.MayAct = !policy.NeedsUserAnswer
+	return out, policy
+}
+
+func shouldRedactClaim(disclosure IntentDisclosure, sensitivity string) bool {
+	if disclosure.AllowSensitive {
+		return false
+	}
+	switch sensitivity {
+	case "private", "restricted":
+		return true
+	default:
+		return false
+	}
+}
+
+func claimSensitivity(kind string) string {
+	switch {
+	case strings.HasPrefix(kind, "boundary."):
+		return "private"
+	case strings.HasPrefix(kind, "preference.dating."):
+		return "private"
+	case kind == "preference.food.allergy" || kind == "preference.food.dietary_restriction":
+		return "private"
+	case strings.HasPrefix(kind, "preference.agent."), strings.HasPrefix(kind, "preference.project."), strings.HasPrefix(kind, "preference."), strings.HasPrefix(kind, "context."):
+		return "normal"
+	default:
+		return "normal"
+	}
+}
+
+func hasCriticalUnresolved(rows []IntentQuestion) bool {
+	for _, row := range rows {
+		if row.Priority == "critical" {
+			return true
+		}
+	}
+	return false
+}
+
+func profileHash(response IntentResponseEnvelope) string {
+	response.ProfileHash = ""
+	response.SnapshotID = ""
+	data, _ := json.Marshal(response)
+	return "sha256:" + hashBytes(data)
+}
+
+func nonNilMap(value map[string]any) map[string]any {
+	if value == nil {
+		return map[string]any{}
+	}
+	return value
+}
+
 func singletonClaimKind(kind string) bool {
 	if kind == "preference.agent.imported_memory" {
 		return false
@@ -2684,8 +3190,33 @@ create table if not exists runs (
   finished_at text
 );
 
+create table if not exists intent_requests (
+  id text primary key,
+  uri text not null,
+  actor_json text not null default '{}',
+  purpose text not null default '',
+  audience text not null default 'agent',
+  freshness_json text not null default '{}',
+  disclosure_json text not null default '{}',
+  context_json text not null default '{}',
+  created_at text not null
+);
+
+create table if not exists profile_snapshots (
+  id text primary key,
+  request_id text references intent_requests(id),
+  uri text not null,
+  resolved_uri text not null,
+  intent_id text,
+  response_json text not null,
+  profile_hash text not null,
+  created_at text not null
+);
+
 create index if not exists idx_claims_intent_kind on claims(intent_id, kind);
 create index if not exists idx_claims_scope on claims(scope);
 create index if not exists idx_evidence_artifact on evidence(source_artifact_id);
 create index if not exists idx_embeddings_owner on embeddings(owner_kind, owner_id);
+create index if not exists idx_intent_requests_uri on intent_requests(uri);
+create index if not exists idx_profile_snapshots_hash on profile_snapshots(profile_hash);
 `
