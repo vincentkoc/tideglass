@@ -625,6 +625,85 @@ func TestResolveIntentActionGateProcessesScopedCriticalClaims(t *testing.T) {
 	}
 }
 
+func TestResolveIntentActionGateUsesLosslessDuplicateKeys(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	intent, err := tg.ensureIntent(ctx, "social.dinner", "Dinner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	allergyID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{Kind: "preference.food.allergy", Value: "No allergies.", Confidence: 0.95, SourceMode: "explicit"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: allergyID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	topicID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{Kind: "boundary.social.topic", Value: "External publishing", Confidence: 0.95, SourceMode: "explicit"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: topicID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.insertClaim(ctx, intent.ID, candidateClaim{Kind: "boundary.social.topic", Value: "No external publishing", Confidence: 0.95, SourceMode: "explicit"}); err != nil {
+		t.Fatal(err)
+	}
+	response, err := tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, Request: IntentRequestEnvelope{
+		URI:        "tideglass://v1/intent/social.dinner/current",
+		Task:       IntentTask{Mode: "act_gate", Autonomy: "bounded_act"},
+		Disclosure: IntentDisclosure{AllowSensitive: true},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Decision.MayAct || !response.Decision.NeedsUserAnswer || !hasBlockingQuestionSlot(response.Unresolved, "boundary.social.topic") {
+		t.Fatalf("lossy duplicate key suppressed distinct pending boundary: %#v", response)
+	}
+}
+
+func TestResolveIntentMigratesLegacyEditedAcceptedClaims(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	intent, err := tg.ensureIntent(ctx, "social.dinner", "Dinner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{Kind: "preference.food.allergy", Value: "No allergies.", Confidence: 0.95, SourceMode: "explicit"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: claimID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.db.ExecContext(ctx, `insert into edits(id,claim_id,operation,patch_json,reason,created_at) values(?,?,?,?,?,?)`,
+		id("edt"), claimID, "supersede", `{"value":"Shellfish allergy."}`, "legacy edit", "2030-01-01T00:00:00.000000000Z"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tg.ensureIntentRequestSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	response, err := tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, Request: IntentRequestEnvelope{
+		URI:        "tideglass://v1/intent/social.dinner/current",
+		Task:       IntentTask{Mode: "act_gate", Autonomy: "bounded_act"},
+		Disclosure: IntentDisclosure{AllowSensitive: true},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Decision.MayAct || !response.Decision.NeedsUserAnswer || !hasBlockingQuestionSlot(response.Unresolved, "preference.food.allergy") {
+		t.Fatalf("legacy edited accepted claim authorized action: %#v", response)
+	}
+}
+
 func TestResolveIntentActionGateFailsClosedWithoutConstraints(t *testing.T) {
 	ctx := context.Background()
 	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))

@@ -1801,7 +1801,7 @@ order by c.created_at desc`, intentID)
 		if timestampAfter(valueEditCreatedAt, claim.UpdatedAt) {
 			claim.UpdatedAt = valueEditCreatedAt
 		}
-		normalized = normalizeText(claim.Value)
+		normalized = losslessClaimValueKey(claim.Value)
 		duplicateKey := claim.Kind + "\x00" + normalized
 		if singletonClaimKind(claim.Kind) && claim.Status == "accepted" && revision > bestAcceptedSingleton[claim.Kind] {
 			bestAcceptedSingleton[claim.Kind] = revision
@@ -2148,6 +2148,25 @@ func (t *Tideglass) ensureIntentRequestSchema(ctx context.Context) error {
 		if _, err := t.db.ExecContext(ctx, `alter table claims add column revision integer not null default 0`); err != nil {
 			return err
 		}
+	}
+	if _, err := t.db.ExecContext(ctx, `
+update claims
+set status = 'active',
+    updated_at = coalesce((
+      select max(created_at) from edits
+      where edits.claim_id = claims.id and json_extract(patch_json, '$.value') is not null
+    ), updated_at)
+where status = 'accepted'
+  and exists (
+    select 1 from edits value_edits
+    where value_edits.claim_id = claims.id
+      and json_extract(value_edits.patch_json, '$.value') is not null
+      and julianday(value_edits.created_at) > coalesce((
+        select max(julianday(review_edits.created_at)) from edits review_edits
+        where review_edits.claim_id = claims.id and review_edits.operation = 'accept'
+      ), 0)
+  )`); err != nil {
+		return err
 	}
 	return nil
 }
@@ -3171,6 +3190,10 @@ func timestampAfter(left, right string) bool {
 
 func belowConfidenceFloor(claim ClaimOut, request IntentRequestEnvelope) bool {
 	return request.Contract.ConfidenceFloor > 0 && claim.Confidence < request.Contract.ConfidenceFloor
+}
+
+func losslessClaimValueKey(value string) string {
+	return strings.Join(strings.Fields(strings.ToLower(strings.TrimSpace(value))), " ")
 }
 
 func parseMaxAge(value string) (time.Duration, error) {
