@@ -750,6 +750,58 @@ func TestResolveIntentMinimalDisclosureMarksOmittedCriticalClaims(t *testing.T) 
 	}
 }
 
+func TestResolveIntentFullDisclosureScopesExternalAudiences(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	intent, err := tg.ensureIntent(ctx, "work.project.start", "Project start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	communicationID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "preference.agent.communication",
+		Value:      "Use terse updates.",
+		Confidence: 0.95,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: communicationID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	validationID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "preference.project.validation",
+		Value:      "Run every test.",
+		Confidence: 0.95,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: validationID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	response, err := tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
+		URI:        "tideglass://v1/intent/work.project.start/current",
+		Audience:   IntentAudience{Type: "service", ID: "external-tool"},
+		Contract:   IntentContract{RequiredSlots: []string{"preference.agent.communication"}},
+		Disclosure: IntentDisclosure{Mode: "full", AllowSensitive: true},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Claims) != 1 || response.Claims[0].ID != communicationID {
+		t.Fatalf("external full disclosure leaked unrelated claims: %#v", response.Claims)
+	}
+	if hasIntentClaimID(response.Claims, validationID) {
+		t.Fatalf("external full disclosure leaked validation claim: %#v", response.Claims)
+	}
+}
+
 func TestResolveIntentActionGateUsesLosslessDuplicateKeys(t *testing.T) {
 	ctx := context.Background()
 	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
@@ -3177,6 +3229,15 @@ func hasQuestionSlot(rows []IntentQuestion, value string) bool {
 }
 
 func hasClaimID(rows []ClaimOut, id string) bool {
+	for _, row := range rows {
+		if row.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func hasIntentClaimID(rows []IntentClaimEnvelope, id string) bool {
 	for _, row := range rows {
 		if row.ID == id {
 			return true

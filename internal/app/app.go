@@ -3824,11 +3824,12 @@ func applyIntentPolicy(intentKind string, claims []ClaimOut, unresolved []Intent
 	redacted := map[string]bool{}
 	shareable := map[string]bool{}
 	existenceSeen := map[string]bool{}
+	scopeByRelevance := request.Disclosure.Mode == "minimal" || !audienceIsLocal(request.Audience) || !audienceShareTargetsAreLocal(request)
 	for _, claim := range claims {
 		if request.Contract.ConfidenceFloor > 0 && claim.Confidence < request.Contract.ConfidenceFloor {
 			continue
 		}
-		if request.Disclosure.Mode == "minimal" && !claimRelevantToRequest(claim.Kind, request) && !claimRequiredForActionGate(intentKind, claim.Kind, request) {
+		if scopeByRelevance && !claimRelevantToRequest(claim.Kind, request) && !claimRequiredForActionGate(intentKind, claim.Kind, request) {
 			if omittedClaimBlocksReadiness(intentKind, claim.Kind, request) {
 				redacted[claim.Kind] = true
 			}
