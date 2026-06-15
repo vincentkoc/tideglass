@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCodexImportKeepsConversationAndFiltersInstructionBlocks(t *testing.T) {
@@ -677,9 +678,26 @@ func TestResolveIntentActionGateAuthorizesWithPolicyConstraint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	deadline := time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano)
+	constraintValue := func(allow bool, goal string) string {
+		t.Helper()
+		data, err := json.Marshal(map[string]any{
+			"allow":         allow,
+			"intent_kind":   "work.project.start",
+			"task_mode":     "act_gate",
+			"autonomy":      "bounded_act",
+			"goal":          goal,
+			"audience_type": "agent",
+			"deadline":      deadline,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
 	constraintID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
 		Kind:       "policy.action.constraints",
-		Value:      `{"allow":false,"intent_kind":"work.project.start","task_mode":"act_gate","autonomy":"bounded_act","goal":"start the project","audience":"agent"}`,
+		Value:      constraintValue(false, "start the project"),
 		Confidence: 0.99,
 		SourceMode: "explicit",
 	})
@@ -691,7 +709,7 @@ func TestResolveIntentActionGateAuthorizesWithPolicyConstraint(t *testing.T) {
 	}
 	response, err := tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, Request: IntentRequestEnvelope{
 		URI:        "tideglass://v1/intent/work.project.start/current",
-		Task:       IntentTask{Mode: "act_gate", Autonomy: "bounded_act", Goal: "start the project"},
+		Task:       IntentTask{Mode: "act_gate", Autonomy: "bounded_act", Goal: "start the project", Deadline: deadline},
 		Disclosure: IntentDisclosure{AllowSensitive: true},
 	}})
 	if err != nil {
@@ -702,7 +720,7 @@ func TestResolveIntentActionGateAuthorizesWithPolicyConstraint(t *testing.T) {
 	}
 	constraintID, err = tg.insertClaim(ctx, intent.ID, candidateClaim{
 		Kind:       "policy.action.constraints",
-		Value:      `{"allow":true,"intent_kind":"work.project.start","task_mode":"act_gate","autonomy":"bounded_act","goal":"start the project","audience":"agent"}`,
+		Value:      constraintValue(true, "start the project"),
 		Confidence: 0.99,
 		SourceMode: "explicit",
 	})
@@ -714,7 +732,7 @@ func TestResolveIntentActionGateAuthorizesWithPolicyConstraint(t *testing.T) {
 	}
 	if _, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
 		Kind:       "policy.action.constraints",
-		Value:      `{"allow":true,"intent_kind":"work.project.start","task_mode":"act_gate","autonomy":"bounded_act","goal":"start another project","audience":"agent"}`,
+		Value:      constraintValue(true, "start another project"),
 		Confidence: 0.99,
 		SourceMode: "explicit",
 	}); err != nil {
@@ -722,7 +740,7 @@ func TestResolveIntentActionGateAuthorizesWithPolicyConstraint(t *testing.T) {
 	}
 	response, err = tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, Request: IntentRequestEnvelope{
 		URI:        "tideglass://v1/intent/work.project.start/current",
-		Task:       IntentTask{Mode: "act_gate", Autonomy: "bounded_act", Goal: "start the project"},
+		Task:       IntentTask{Mode: "act_gate", Autonomy: "bounded_act", Goal: "start the project", Deadline: deadline},
 		Disclosure: IntentDisclosure{AllowSensitive: true},
 	}})
 	if err != nil {
@@ -731,9 +749,21 @@ func TestResolveIntentActionGateAuthorizesWithPolicyConstraint(t *testing.T) {
 	if !response.Decision.MayAct || response.Decision.NeedsUserAnswer || response.Decision.Reason != "ready" || response.Status != "ready" {
 		t.Fatalf("explicit action constraint did not authorize bounded action: %#v", response)
 	}
+	response, err = tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, Request: IntentRequestEnvelope{
+		URI:        "tideglass://v1/intent/work.project.start/current",
+		Task:       IntentTask{Mode: "act_gate", Autonomy: "bounded_act", Goal: "start the project", Deadline: deadline},
+		Audience:   IntentAudience{Type: "agent", ShareWith: []string{"external-service"}},
+		Disclosure: IntentDisclosure{AllowSensitive: true},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Decision.MayAct || !response.Decision.NeedsUserAnswer || !hasBlockingQuestionSlot(response.Unresolved, "policy.action.constraints") {
+		t.Fatalf("unbound share_with target authorized bounded action: %#v", response)
+	}
 	constraintID, err = tg.insertClaim(ctx, intent.ID, candidateClaim{
 		Kind:       "policy.action.constraints",
-		Value:      `{"allow":false,"intent_kind":"work.project.start","task_mode":"act_gate","autonomy":"bounded_act","goal":"start the project","audience":"agent"}`,
+		Value:      constraintValue(false, "start the project"),
 		Confidence: 0.99,
 		SourceMode: "explicit",
 	})
@@ -745,7 +775,7 @@ func TestResolveIntentActionGateAuthorizesWithPolicyConstraint(t *testing.T) {
 	}
 	response, err = tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, Request: IntentRequestEnvelope{
 		URI:        "tideglass://v1/intent/work.project.start/current",
-		Task:       IntentTask{Mode: "act_gate", Autonomy: "bounded_act", Goal: "start the project"},
+		Task:       IntentTask{Mode: "act_gate", Autonomy: "bounded_act", Goal: "start the project", Deadline: deadline},
 		Disclosure: IntentDisclosure{AllowSensitive: true},
 	}})
 	if err != nil {
@@ -753,6 +783,38 @@ func TestResolveIntentActionGateAuthorizesWithPolicyConstraint(t *testing.T) {
 	}
 	if response.Decision.MayAct || !response.Decision.NeedsUserAnswer || !hasBlockingQuestionSlot(response.Unresolved, "policy.action.constraints") {
 		t.Fatalf("newer denying action constraint did not revoke bounded action: %#v", response)
+	}
+}
+
+func TestActionConstraintRejectsMalformedOrExpiredValues(t *testing.T) {
+	deadline := time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano)
+	value := func(deadline string) string {
+		t.Helper()
+		data, err := json.Marshal(map[string]any{
+			"allow":         true,
+			"intent_kind":   "work.project.start",
+			"task_mode":     "act_gate",
+			"autonomy":      "bounded_act",
+			"goal":          "start the project",
+			"audience_type": "agent",
+			"deadline":      deadline,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+	request := normalizeIntentRequest(IntentRequestEnvelope{
+		URI:  "tideglass://v1/intent/work.project.start/current",
+		Task: IntentTask{Mode: "act_gate", Autonomy: "bounded_act", Goal: "start the project", Deadline: deadline},
+	})
+	if _, ok := matchingActionConstraint("work.project.start", ClaimOut{Kind: "policy.action.constraints", Value: value(deadline) + `{}`}, request); ok {
+		t.Fatal("trailing JSON authorized action constraint")
+	}
+	expired := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano)
+	request.Task.Deadline = expired
+	if _, ok := matchingActionConstraint("work.project.start", ClaimOut{Kind: "policy.action.constraints", Value: value(expired)}, request); ok {
+		t.Fatal("expired deadline authorized action constraint")
 	}
 }
 
@@ -1333,6 +1395,16 @@ func TestResolveIntentV2ActionAndDisclosureContracts(t *testing.T) {
 	}
 	if len(response.Claims) != 0 || len(response.Policy.SafeToShare) != 0 {
 		t.Fatalf("external minimal response leaked unrelated claims: claims=%#v policy=%#v", response.Claims, response.Policy)
+	}
+	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
+		URI:      "tideglass://v1/intent/work.project.start/current",
+		Audience: IntentAudience{Type: "service", ID: "local"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Claims) != 0 || len(response.Policy.SafeToShare) != 0 {
+		t.Fatalf("reserved external audience id leaked unrelated claims: claims=%#v policy=%#v", response.Claims, response.Policy)
 	}
 	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
 		URI:      "tideglass://v1/intent/work.project.start/current",

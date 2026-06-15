@@ -3219,13 +3219,15 @@ func hasActionGateConstraint(intentKind string, claims []ClaimOut, request Inten
 }
 
 type actionConstraintValue struct {
-	Allow      bool   `json:"allow"`
-	IntentKind string `json:"intent_kind"`
-	TaskMode   string `json:"task_mode"`
-	Autonomy   string `json:"autonomy"`
-	Goal       string `json:"goal"`
-	Audience   string `json:"audience"`
-	Deadline   string `json:"deadline,omitempty"`
+	Allow        bool     `json:"allow"`
+	IntentKind   string   `json:"intent_kind"`
+	TaskMode     string   `json:"task_mode"`
+	Autonomy     string   `json:"autonomy"`
+	Goal         string   `json:"goal"`
+	AudienceType string   `json:"audience_type"`
+	AudienceID   string   `json:"audience_id,omitempty"`
+	ShareWith    []string `json:"share_with,omitempty"`
+	Deadline     string   `json:"deadline"`
 }
 
 func latestMatchingActionConstraint(intentKind string, claims []ClaimOut, request IntentRequestEnvelope) (ClaimOut, actionConstraintValue, bool) {
@@ -3256,22 +3258,32 @@ func matchingActionConstraint(intentKind string, claim ClaimOut, request IntentR
 	if err := dec.Decode(&constraint); err != nil {
 		return actionConstraintValue{}, false
 	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		return actionConstraintValue{}, false
+	}
 	if normalizeKind(constraint.IntentKind, "") != intentKind || strings.TrimSpace(constraint.IntentKind) == "" {
 		return actionConstraintValue{}, false
 	}
-	if !sameRequiredConstraintValue(constraint.TaskMode, request.Task.Mode) {
+	if !sameRequiredEnumConstraintValue(constraint.TaskMode, request.Task.Mode) {
 		return actionConstraintValue{}, false
 	}
-	if !sameRequiredConstraintValue(constraint.Autonomy, request.Task.Autonomy) {
+	if !sameRequiredEnumConstraintValue(constraint.Autonomy, request.Task.Autonomy) {
 		return actionConstraintValue{}, false
 	}
-	if !sameRequiredConstraintValue(constraint.Goal, request.Task.Goal) {
+	if !sameRequiredExactConstraintValue(constraint.Goal, request.Task.Goal) {
 		return actionConstraintValue{}, false
 	}
-	if !sameRequiredConstraintValue(constraint.Audience, request.Audience.Label()) {
+	if !sameRequiredExactConstraintValue(constraint.AudienceType, request.Audience.Type) {
 		return actionConstraintValue{}, false
 	}
-	if strings.TrimSpace(constraint.Deadline) != strings.TrimSpace(request.Task.Deadline) {
+	if strings.TrimSpace(constraint.AudienceID) != strings.TrimSpace(request.Audience.ID) {
+		return actionConstraintValue{}, false
+	}
+	if !sameStringSet(constraint.ShareWith, request.Audience.ShareWith) {
+		return actionConstraintValue{}, false
+	}
+	if !deadlineConstraintValid(constraint.Deadline, request.Task.Deadline) {
 		return actionConstraintValue{}, false
 	}
 	return constraint, true
@@ -3290,10 +3302,58 @@ func claimNewer(left, right ClaimOut) bool {
 	return left.ID > right.ID
 }
 
-func sameRequiredConstraintValue(left, right string) bool {
+func sameRequiredEnumConstraintValue(left, right string) bool {
 	left = strings.TrimSpace(left)
 	right = strings.TrimSpace(right)
 	return left != "" && right != "" && strings.EqualFold(left, right)
+}
+
+func sameRequiredExactConstraintValue(left, right string) bool {
+	left = strings.TrimSpace(left)
+	right = strings.TrimSpace(right)
+	return left != "" && right != "" && left == right
+}
+
+func sameStringSet(left, right []string) bool {
+	leftValues := normalizedStringSet(left)
+	rightValues := normalizedStringSet(right)
+	if len(leftValues) != len(rightValues) {
+		return false
+	}
+	for index := range leftValues {
+		if leftValues[index] != rightValues[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizedStringSet(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := map[string]bool{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func deadlineConstraintValid(left, right string) bool {
+	left = strings.TrimSpace(left)
+	right = strings.TrimSpace(right)
+	if left == "" || right == "" || left != right {
+		return false
+	}
+	deadline, err := time.Parse(time.RFC3339Nano, left)
+	if err != nil {
+		return false
+	}
+	return time.Now().Before(deadline)
 }
 
 func stringSliceContains(rows []string, value string) bool {
@@ -3518,8 +3578,8 @@ func claimRelevantToRequest(kind string, request IntentRequestEnvelope) bool {
 	if !audienceShareTargetsAreLocal(request) {
 		return false
 	}
-	audience := request.Audience.Label()
-	return audience == "agent" || audience == "local"
+	audienceType := strings.TrimSpace(request.Audience.Type)
+	return audienceType == "agent" || audienceType == "local"
 }
 
 func audienceShareTargetsAreLocal(request IntentRequestEnvelope) bool {
