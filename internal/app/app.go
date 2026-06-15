@@ -709,6 +709,7 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 		return IntentResponseEnvelope{}, err
 	}
 	var claims []ClaimOut
+	var policyFailedClaims []ClaimOut
 	var unresolved []IntentQuestion
 	requireReviewed := true
 	if request.Freshness.RequireReviewed != nil {
@@ -728,7 +729,8 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 			return IntentResponseEnvelope{}, err
 		}
 		claims = eligibleClaimsForRequest(loaded, requireReviewed, maxAge)
-		slotClaims := claimsForSlotSatisfaction(claims, request)
+		policyFailedClaims = policyFailingClaims(loaded, claims)
+		slotClaims := claimsForSlotSatisfaction(loaded, request, maxAge)
 		unresolved = unresolvedIntentQuestions(intent.Kind, slotClaims)
 		unresolved = addRequiredSlotQuestions(unresolved, slotClaims, request.Contract.RequiredSlots)
 	} else {
@@ -743,7 +745,14 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 	if len(redactedBlocking) > 0 {
 		unresolved = append(unresolved, redactedBlocking...)
 	}
+	if request.Task.Mode == "act_gate" && len(claims) == 0 && len(policyFailedClaims) > 0 {
+		unresolved = append(unresolved, questionForSlot("policy.claim.review_or_freshness", "critical", true))
+	}
 	if hasCriticalUnresolved(redactedBlocking) || hasRedactedCriticalClaim(kind, policy.Redacted) {
+		policy.NeedsUserAnswer = true
+		policy.MayAct = false
+	}
+	if request.Task.Mode == "act_gate" && len(claims) == 0 && len(policyFailedClaims) > 0 {
 		policy.NeedsUserAnswer = true
 		policy.MayAct = false
 	}
@@ -763,7 +772,7 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 	}
 	decision := IntentDecision{
 		MayAct:          policy.MayAct,
-		Reason:          decisionReason(foundIntent, policy, request.Task.Autonomy),
+		Reason:          decisionReason(foundIntent, policy, request.Task.Mode, request.Task.Autonomy, opts.AllowAction),
 		Autonomy:        request.Task.Autonomy,
 		NeedsUserAnswer: policy.NeedsUserAnswer,
 	}
@@ -2763,9 +2772,29 @@ func eligibleClaimsForRequest(claims []ClaimOut, requireReviewed bool, maxAge ti
 	return out
 }
 
-func claimsForSlotSatisfaction(claims []ClaimOut, request IntentRequestEnvelope) []ClaimOut {
+func policyFailingClaims(loaded []ClaimOut, eligible []ClaimOut) []ClaimOut {
+	eligibleByID := map[string]bool{}
+	for _, claim := range eligible {
+		eligibleByID[claim.ID] = true
+	}
+	var out []ClaimOut
+	for _, claim := range loaded {
+		if !eligibleByID[claim.ID] {
+			out = append(out, claim)
+		}
+	}
+	return out
+}
+
+func claimsForSlotSatisfaction(claims []ClaimOut, request IntentRequestEnvelope, maxAge time.Duration) []ClaimOut {
 	out := make([]ClaimOut, 0, len(claims))
 	for _, claim := range claims {
+		if maxAge > 0 && claim.UpdatedAt != "" {
+			updatedAt, err := time.Parse(time.RFC3339, claim.UpdatedAt)
+			if err != nil || time.Since(updatedAt) > maxAge {
+				continue
+			}
+		}
 		if request.Task.Mode == "act_gate" && claim.Status != "accepted" {
 			continue
 		}
@@ -2925,13 +2954,16 @@ func claimRoot(claims []IntentClaimEnvelope) string {
 	return "sha256:" + hashBytes(data)
 }
 
-func decisionReason(foundIntent bool, policy IntentPolicyEnvelope, autonomy string) string {
+func decisionReason(foundIntent bool, policy IntentPolicyEnvelope, mode, autonomy string, allowAction bool) string {
 	switch {
 	case !foundIntent:
 		return "intent_missing"
 	case policy.NeedsUserAnswer:
 		return "critical_slots_missing"
 	case !policy.MayAct:
+		if mode == "act_gate" && autonomy == "bounded_act" && !allowAction {
+			return "action_authority_required"
+		}
 		if autonomy == "suggest_then_confirm" {
 			return "confirmation_required"
 		}

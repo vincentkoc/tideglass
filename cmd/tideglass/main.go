@@ -3,8 +3,6 @@ package main
 import (
 	"bufio"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -437,7 +435,7 @@ func runResolve(ctx context.Context, args []string) error {
 func runServe(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	addr := fs.String("addr", "127.0.0.1:8765", "listen address")
-	token := fs.String("token", "", "service bearer token; generated when omitted")
+	token := fs.String("token", "", "required service bearer token")
 	dbPath := fs.String("db", "", "database path")
 	if err := fs.Parse(normalizeFlagArgs(args)); err != nil {
 		return err
@@ -455,28 +453,16 @@ func runServe(ctx context.Context, args []string) error {
 		serviceToken = strings.TrimSpace(os.Getenv("TIDEGLASS_SERVICE_TOKEN"))
 	}
 	if serviceToken == "" {
-		var err error
-		serviceToken, err = randomToken()
-		if err != nil {
-			return err
-		}
+		return errors.New("serve requires --token or TIDEGLASS_SERVICE_TOKEN")
 	}
 	server := &http.Server{Addr: *addr, Handler: app.NewServiceHandlerWithToken(tg, serviceToken)}
 	fmt.Fprintf(os.Stderr, "tideglass: serving on http://%s\n", *addr)
-	fmt.Fprintf(os.Stderr, "tideglass: set Authorization: Bearer %s\n", serviceToken)
+	fmt.Fprintln(os.Stderr, "tideglass: requests require Authorization: Bearer <token>")
 	err = server.ListenAndServe()
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
 	return err
-}
-
-func randomToken() (string, error) {
-	var raw [32]byte
-	if _, err := rand.Read(raw[:]); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(raw[:]), nil
 }
 
 func validateServeAddr(addr string) error {
