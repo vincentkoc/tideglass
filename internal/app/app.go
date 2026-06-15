@@ -84,7 +84,9 @@ type ExportOptions struct {
 }
 
 type ResolveOptions struct {
-	Request IntentRequestEnvelope
+	Request     IntentRequestEnvelope
+	AllowAction bool
+	NoPersist   bool
 }
 
 type IntentActor struct {
@@ -683,9 +685,16 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 	if err := validateIntentRequest(request); err != nil {
 		return IntentResponseEnvelope{}, err
 	}
-	requestID, err := t.persistIntentRequest(ctx, request)
-	if err != nil {
-		return IntentResponseEnvelope{}, err
+	requestID := request.RequestID
+	if requestID == "" {
+		requestID = id("req")
+	}
+	if !opts.NoPersist {
+		var err error
+		requestID, err = t.persistIntentRequest(ctx, request)
+		if err != nil {
+			return IntentResponseEnvelope{}, err
+		}
 	}
 	intent, foundIntent, err := t.findIntentForResolve(ctx, kind)
 	if err != nil {
@@ -719,7 +728,7 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 		unresolved = unresolvedIntentQuestions(kind, nil)
 		unresolved = addRequiredSlotQuestions(unresolved, nil, request.Contract.RequiredSlots)
 	}
-	filteredClaims, policy := applyIntentPolicy(claims, unresolved, request)
+	filteredClaims, policy := applyIntentPolicy(claims, unresolved, request, opts.AllowAction)
 	filteredClaims = addClaimCommitments(filteredClaims, request)
 	redactedBlocking := redactedBlockingQuestions(kind, policy.Redacted, request.Contract.RequiredSlots, unresolved)
 	if len(redactedBlocking) > 0 {
@@ -776,11 +785,15 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 	if allowCommitments(request.Disclosure) {
 		response.Commitments.ResponseHash = response.ProfileHash
 	}
-	response.SnapshotID, err = t.persistProfileSnapshot(ctx, requestID, response)
-	if err != nil {
-		return IntentResponseEnvelope{}, err
+	if !opts.NoPersist {
+		response.SnapshotID, err = t.persistProfileSnapshot(ctx, requestID, response)
+		if err != nil {
+			return IntentResponseEnvelope{}, err
+		}
+		if hasCommitments(response.Commitments) {
+			response.Commitments.SnapshotID = response.SnapshotID
+		}
 	}
-	response.Commitments.SnapshotID = response.SnapshotID
 	return response, nil
 }
 
@@ -796,6 +809,9 @@ func (t *Tideglass) EditClaim(ctx context.Context, opts EditOptions) (EditResult
 	editID := id("edt")
 	if _, err := t.db.ExecContext(ctx, `insert into edits(id,claim_id,operation,patch_json,reason,created_at) values(?,?,?,?,?,?)`,
 		editID, opts.ClaimID, "supersede", string(patch), opts.Reason, now()); err != nil {
+		return EditResult{}, err
+	}
+	if _, err := t.db.ExecContext(ctx, `update claims set status = 'active', updated_at = ? where id = ?`, now(), opts.ClaimID); err != nil {
 		return EditResult{}, err
 	}
 	return EditResult{EditID: editID, ClaimID: opts.ClaimID, Value: value}, nil
@@ -1055,6 +1071,10 @@ func NewServiceHandler(t *Tideglass) http.Handler {
 			writeHTTPError(w, http.StatusForbidden, "forbidden host")
 			return
 		}
+		if !authorizedHTTPWrite(r) {
+			writeHTTPError(w, http.StatusForbidden, "forbidden write")
+			return
+		}
 		defer r.Body.Close()
 		var request IntentRequestEnvelope
 		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&request); err != nil {
@@ -1082,7 +1102,7 @@ func NewServiceHandler(t *Tideglass) http.Handler {
 			return
 		}
 		uri := r.URL.Query().Get("uri")
-		response, err := t.ResolveIntent(r.Context(), ResolveOptions{Request: IntentRequestEnvelope{URI: uri}})
+		response, err := t.ResolveIntent(r.Context(), ResolveOptions{Request: IntentRequestEnvelope{URI: uri}, NoPersist: true})
 		if err != nil {
 			writeHTTPError(w, statusForResolveError(err), err.Error())
 			return
@@ -1111,7 +1131,7 @@ func HandleMCPOnce(ctx context.Context, t *Tideglass, in io.Reader, out io.Write
 		if err := json.Unmarshal(req.Params, &params); err != nil {
 			return err
 		}
-		response, err := t.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{URI: params.URI}})
+		response, err := t.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{URI: params.URI}, NoPersist: true})
 		if err != nil {
 			return err
 		}
@@ -1168,6 +1188,21 @@ func authorizedHTTPHost(r *http.Request) bool {
 	}
 	host = strings.Trim(strings.ToLower(host), "[]")
 	return host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
+func authorizedHTTPWrite(r *http.Request) bool {
+	contentType := strings.ToLower(strings.TrimSpace(strings.Split(r.Header.Get("Content-Type"), ";")[0]))
+	if contentType != "application/json" {
+		return false
+	}
+	if strings.EqualFold(r.Header.Get("Sec-Fetch-Site"), "cross-site") {
+		return false
+	}
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin != "" && !strings.HasPrefix(origin, "http://127.0.0.1") && !strings.HasPrefix(origin, "http://localhost") && !strings.HasPrefix(origin, "http://[::1]") {
+		return false
+	}
+	return true
 }
 
 func authorizeHTTPResolveRequest(request IntentRequestEnvelope) error {
@@ -1295,7 +1330,9 @@ values(?,?,?,?,?,?,?,?,?,?)`,
 func (t *Tideglass) persistProfileSnapshot(ctx context.Context, requestID string, response IntentResponseEnvelope) (string, error) {
 	snapshotID := id("snap")
 	response.SnapshotID = snapshotID
-	response.Commitments.SnapshotID = snapshotID
+	if hasCommitments(response.Commitments) {
+		response.Commitments.SnapshotID = snapshotID
+	}
 	responseJSON, err := json.Marshal(response)
 	if err != nil {
 		return "", err
@@ -2704,8 +2741,11 @@ func parseMaxAge(value string) (time.Duration, error) {
 	return duration, nil
 }
 
-func applyIntentPolicy(claims []ClaimOut, unresolved []IntentQuestion, request IntentRequestEnvelope) ([]IntentClaimEnvelope, IntentPolicyEnvelope) {
+func applyIntentPolicy(claims []ClaimOut, unresolved []IntentQuestion, request IntentRequestEnvelope, allowAction bool) ([]IntentClaimEnvelope, IntentPolicyEnvelope) {
 	freshness := "reviewed"
+	if request.Freshness.RequireReviewed != nil && !*request.Freshness.RequireReviewed {
+		freshness = "unreviewed_allowed"
+	}
 	if request.Freshness.MaxAge != "" {
 		freshness += "_" + request.Freshness.MaxAge
 	}
@@ -2767,7 +2807,7 @@ func applyIntentPolicy(claims []ClaimOut, unresolved []IntentQuestion, request I
 		return out[i].ID < out[j].ID
 	})
 	policy.MayAct = !policy.NeedsUserAnswer
-	if request.Task.Mode != "act_gate" || request.Task.Autonomy == "context_only" || request.Task.Autonomy == "suggest_only" || request.Task.Autonomy == "suggest_then_confirm" || request.Task.Autonomy == "deny" {
+	if !allowAction || request.Task.Mode != "act_gate" || request.Task.Autonomy == "context_only" || request.Task.Autonomy == "suggest_only" || request.Task.Autonomy == "suggest_then_confirm" || request.Task.Autonomy == "deny" {
 		policy.MayAct = false
 	}
 	return out, policy
@@ -2792,6 +2832,10 @@ func claimCommitment(claim IntentClaimEnvelope) string {
 		"value":  claim.Value,
 	})
 	return "sha256:" + hashBytes(data)
+}
+
+func hasCommitments(commitments IntentCommitments) bool {
+	return commitments.ResponseHash != "" || commitments.ClaimRoot != "" || commitments.SnapshotID != "" || commitments.Algorithm != ""
 }
 
 func claimRoot(claims []IntentClaimEnvelope) string {
@@ -2851,6 +2895,8 @@ func existenceClaimEnvelope(claim ClaimOut) IntentClaimEnvelope {
 
 func claimSensitivity(kind string) string {
 	switch {
+	case kind == "preference.agent.imported_memory":
+		return "restricted"
 	case strings.HasPrefix(kind, "boundary."):
 		return "private"
 	case strings.HasPrefix(kind, "preference.dating."):
@@ -2860,7 +2906,7 @@ func claimSensitivity(kind string) string {
 	case strings.HasPrefix(kind, "preference.agent."), strings.HasPrefix(kind, "preference.project."), strings.HasPrefix(kind, "preference."), strings.HasPrefix(kind, "context."):
 		return "normal"
 	default:
-		return "normal"
+		return "restricted"
 	}
 }
 

@@ -443,7 +443,7 @@ func TestResolveIntentAppliesPolicyAndPersistsSnapshot(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	first, err := tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
+	first, err := tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, Request: IntentRequestEnvelope{
 		URI: "tideglass://v1/intent/work.project.start/current",
 		Task: IntentTask{
 			Mode:     "act_gate",
@@ -496,7 +496,7 @@ func TestResolveIntentAppliesPolicyAndPersistsSnapshot(t *testing.T) {
 	if !containsString(first.Policy.Redacted, "boundary.project.no_go") {
 		t.Fatalf("redactions = %#v", first.Policy.Redacted)
 	}
-	second, err := tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
+	second, err := tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, Request: IntentRequestEnvelope{
 		URI:  "tideglass://intent/work.project.start",
 		Task: IntentTask{Mode: "act_gate", Autonomy: "bounded_act"},
 	}})
@@ -603,6 +603,9 @@ func TestResolveIntentUnreviewedAndStaleClaimsDoNotSatisfyCriticalSlots(t *testi
 	if !response.Policy.NeedsUserAnswer || response.Policy.MayAct || !hasQuestionSlot(response.Unresolved, "preference.food.allergy") {
 		t.Fatalf("unreviewed critical claim satisfied action slot: %#v", response)
 	}
+	if response.Policy.Freshness != "unreviewed_allowed" {
+		t.Fatalf("unreviewed freshness was mislabeled: %#v", response.Policy)
+	}
 	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: unreviewedID, Action: "accept", Reason: "test"}); err != nil {
 		t.Fatal(err)
 	}
@@ -623,7 +626,22 @@ func TestResolveIntentUnreviewedAndStaleClaimsDoNotSatisfyCriticalSlots(t *testi
 	if _, err := tg.EditClaim(ctx, EditOptions{ClaimID: unreviewedID, Value: "No shellfish or peanuts.", Reason: "fresh edit"}); err != nil {
 		t.Fatal(err)
 	}
-	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
+	response, err = tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, Request: IntentRequestEnvelope{
+		URI:        "tideglass://intent/social.dinner",
+		Task:       IntentTask{Mode: "act_gate", Autonomy: "bounded_act"},
+		Freshness:  IntentFreshness{MaxAge: "1h"},
+		Disclosure: IntentDisclosure{AllowSensitive: true},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !response.Policy.NeedsUserAnswer || response.Policy.MayAct {
+		t.Fatalf("fresh edit was authorized before re-review: response=%#v", response)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: unreviewedID, Action: "accept", Reason: "review edited value"}); err != nil {
+		t.Fatal(err)
+	}
+	response, err = tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, Request: IntentRequestEnvelope{
 		URI:        "tideglass://intent/social.dinner",
 		Task:       IntentTask{Mode: "act_gate", Autonomy: "bounded_act"},
 		Freshness:  IntentFreshness{MaxAge: "1h"},
@@ -633,7 +651,7 @@ func TestResolveIntentUnreviewedAndStaleClaimsDoNotSatisfyCriticalSlots(t *testi
 		t.Fatal(err)
 	}
 	if response.Policy.NeedsUserAnswer || !response.Policy.MayAct || len(response.Claims) != 1 || response.Claims[0].Value != "No shellfish or peanuts." {
-		t.Fatalf("fresh edit was treated as stale: response=%#v", response)
+		t.Fatalf("reviewed fresh edit was treated as stale: response=%#v", response)
 	}
 	staleOnlyID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
 		Kind:       "preference.food.dietary_restriction",
@@ -689,6 +707,18 @@ func TestResolveIntentV2ActionAndDisclosureContracts(t *testing.T) {
 	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: claimID, Action: "accept", Reason: "test"}); err != nil {
 		t.Fatal(err)
 	}
+	rawMemoryID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "preference.agent.imported_memory",
+		Value:      "raw private exported memory",
+		Confidence: 0.9,
+		SourceMode: "inferred",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: rawMemoryID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
 	response, err := tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
 		URI:      "tideglass://v1/intent/work.project.start/current",
 		Task:     IntentTask{Mode: "act_gate", Autonomy: "bounded_act"},
@@ -699,6 +729,9 @@ func TestResolveIntentV2ActionAndDisclosureContracts(t *testing.T) {
 	}
 	if response.Decision.MayAct || !response.Decision.NeedsUserAnswer || !hasQuestionSlot(response.Unresolved, "preference.project.validation") {
 		t.Fatalf("required slot did not gate action: %#v", response)
+	}
+	if !containsString(response.Policy.Redacted, "preference.agent.imported_memory") {
+		t.Fatalf("imported memory was not redacted: %#v", response.Policy)
 	}
 	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
 		URI:      "tideglass://v1/intent/work.project.start/current",
@@ -846,6 +879,10 @@ func TestServiceHandlerResolvesIntentResource(t *testing.T) {
 	if health.StatusCode != http.StatusOK {
 		t.Fatalf("health status = %d", health.StatusCode)
 	}
+	var requestsBeforeResource int
+	if err := tg.db.QueryRowContext(ctx, `select count(*) from intent_requests`).Scan(&requestsBeforeResource); err != nil {
+		t.Fatal(err)
+	}
 	resource, err := http.Get(server.URL + "/resource?uri=tideglass://intent/work.project.start")
 	if err != nil {
 		t.Fatal(err)
@@ -861,6 +898,23 @@ func TestServiceHandlerResolvesIntentResource(t *testing.T) {
 	}
 	if response.Intent.Kind != "work.project.start" || response.ProfileHash == "" {
 		t.Fatalf("response = %#v", response)
+	}
+	var requestsAfterResource int
+	if err := tg.db.QueryRowContext(ctx, `select count(*) from intent_requests`).Scan(&requestsAfterResource); err != nil {
+		t.Fatal(err)
+	}
+	if requestsAfterResource != requestsBeforeResource {
+		t.Fatalf("resource read persisted request: before=%d after=%d", requestsBeforeResource, requestsAfterResource)
+	}
+	csrf := strings.NewReader(`{"uri":"tideglass://disclosure/social.dinner/venue"}`)
+	csrfResponse, err := http.Post(server.URL+"/resolve", "text/plain", csrf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer csrfResponse.Body.Close()
+	if csrfResponse.StatusCode != http.StatusForbidden {
+		data, _ := io.ReadAll(csrfResponse.Body)
+		t.Fatalf("text/plain resolve status = %d body=%s", csrfResponse.StatusCode, data)
 	}
 	body := strings.NewReader(`{"uri":"tideglass://disclosure/social.dinner/venue"}`)
 	resolve, err := http.Post(server.URL+"/resolve", "application/json", body)
