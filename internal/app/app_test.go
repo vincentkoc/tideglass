@@ -748,7 +748,7 @@ func TestResolveIntentActionGateIgnoresSupersededSingletonBoundaries(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tg.db.ExecContext(ctx, `update claims set updated_at = ? where id = ?`, "2024-01-01T00:00:00Z", oldBoundaryID); err != nil {
+	if _, err := tg.db.ExecContext(ctx, `update claims set updated_at = ?, revision = 0 where id = ?`, "2024-01-01T00:00:00Z", oldBoundaryID); err != nil {
 		t.Fatal(err)
 	}
 	newBoundaryID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{

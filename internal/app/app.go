@@ -1803,7 +1803,7 @@ order by c.created_at desc`, intentID)
 	out := make([]ClaimOut, 0, len(claims))
 	for _, claim := range claims {
 		revision := actionGateClaimRevisions[claim.ID]
-		if singletonClaimKind(claim.Kind) && bestAcceptedSingleton[claim.Kind] > 0 && revision > 0 && revision < bestAcceptedSingleton[claim.Kind] {
+		if singletonClaimKind(claim.Kind) && bestAcceptedSingleton[claim.Kind] > 0 && revision < bestAcceptedSingleton[claim.Kind] {
 			continue
 		}
 		out = append(out, claim)
