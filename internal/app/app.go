@@ -3209,7 +3209,7 @@ func belowConfidenceFloor(claim ClaimOut, request IntentRequestEnvelope) bool {
 }
 
 func losslessClaimValueKey(value string) string {
-	return strings.Join(strings.Fields(strings.ToLower(strings.TrimSpace(value))), " ")
+	return strings.Join(strings.Fields(strings.TrimSpace(value)), " ")
 }
 
 func parseMaxAge(value string) (time.Duration, error) {
