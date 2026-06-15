@@ -679,8 +679,15 @@ func TestResolveIntentActionGateAuthorizesWithPolicyConstraint(t *testing.T) {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano)
+	baseActionRequest := normalizeIntentRequest(IntentRequestEnvelope{
+		URI:        "tideglass://v1/intent/work.project.start/current",
+		Task:       IntentTask{Mode: "act_gate", Autonomy: "bounded_act", Goal: "start the project", Deadline: deadline},
+		Disclosure: IntentDisclosure{AllowSensitive: true},
+	})
 	constraintValue := func(allow bool, goal string) string {
 		t.Helper()
+		request := baseActionRequest
+		request.Task.Goal = goal
 		data, err := json.Marshal(map[string]any{
 			"allow":         allow,
 			"intent_kind":   "work.project.start",
@@ -689,6 +696,7 @@ func TestResolveIntentActionGateAuthorizesWithPolicyConstraint(t *testing.T) {
 			"goal":          goal,
 			"audience_type": "agent",
 			"deadline":      deadline,
+			"scope_hash":    actionScopeHash(request),
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -788,7 +796,11 @@ func TestResolveIntentActionGateAuthorizesWithPolicyConstraint(t *testing.T) {
 
 func TestActionConstraintRejectsMalformedOrExpiredValues(t *testing.T) {
 	deadline := time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano)
-	value := func(deadline string) string {
+	request := normalizeIntentRequest(IntentRequestEnvelope{
+		URI:  "tideglass://v1/intent/work.project.start/current",
+		Task: IntentTask{Mode: "act_gate", Autonomy: "bounded_act", Goal: "start the project", Deadline: deadline},
+	})
+	value := func(deadline string, request IntentRequestEnvelope) string {
 		t.Helper()
 		data, err := json.Marshal(map[string]any{
 			"allow":         true,
@@ -798,22 +810,19 @@ func TestActionConstraintRejectsMalformedOrExpiredValues(t *testing.T) {
 			"goal":          "start the project",
 			"audience_type": "agent",
 			"deadline":      deadline,
+			"scope_hash":    actionScopeHash(request),
 		})
 		if err != nil {
 			t.Fatal(err)
 		}
 		return string(data)
 	}
-	request := normalizeIntentRequest(IntentRequestEnvelope{
-		URI:  "tideglass://v1/intent/work.project.start/current",
-		Task: IntentTask{Mode: "act_gate", Autonomy: "bounded_act", Goal: "start the project", Deadline: deadline},
-	})
-	if _, ok := matchingActionConstraint("work.project.start", ClaimOut{Kind: "policy.action.constraints", Value: value(deadline) + `{}`}, request); ok {
+	if _, ok := matchingActionConstraint("work.project.start", ClaimOut{Kind: "policy.action.constraints", Value: value(deadline, request) + `{}`}, request); ok {
 		t.Fatal("trailing JSON authorized action constraint")
 	}
 	expired := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano)
 	request.Task.Deadline = expired
-	if _, ok := matchingActionConstraint("work.project.start", ClaimOut{Kind: "policy.action.constraints", Value: value(expired)}, request); ok {
+	if _, ok := matchingActionConstraint("work.project.start", ClaimOut{Kind: "policy.action.constraints", Value: value(expired, request)}, request); ok {
 		t.Fatal("expired deadline authorized action constraint")
 	}
 }

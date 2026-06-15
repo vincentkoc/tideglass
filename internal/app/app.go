@@ -690,6 +690,10 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 	request := opts.Request
 	request.Context = cloneContextMap(request.Context)
 	request.URI = strings.TrimSpace(request.URI)
+	startRevision, err := currentRevision(ctx, t.db)
+	if err != nil {
+		return IntentResponseEnvelope{}, err
+	}
 	kind, audienceFromURI, err := parseIntentURI(request.URI)
 	if err != nil {
 		return IntentResponseEnvelope{}, err
@@ -804,6 +808,18 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 		policy.NeedsUserAnswer = true
 		policy.MayAct = false
 		policy.CapabilityRequired = append(policy.CapabilityRequired, "user_confirmation")
+	}
+	if policy.MayAct {
+		endRevision, err := currentRevision(ctx, t.db)
+		if err != nil {
+			return IntentResponseEnvelope{}, err
+		}
+		if endRevision != startRevision {
+			unresolved = append(unresolved, questionForSlot("policy.action.snapshot", "critical", true))
+			policy.NeedsUserAnswer = true
+			policy.MayAct = false
+			policy.CapabilityRequired = append(policy.CapabilityRequired, "consistent_snapshot")
+		}
 	}
 	status := "ready"
 	if !foundIntent || policy.NeedsUserAnswer {
@@ -1666,6 +1682,16 @@ func nextRevision(ctx context.Context, execer revisionExecer) (int64, error) {
 		return 0, err
 	}
 	return result.LastInsertId()
+}
+
+func currentRevision(ctx context.Context, queryer interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}) (int64, error) {
+	var revision int64
+	if err := queryer.QueryRowContext(ctx, `select coalesce(max(id), 0) from revisions`).Scan(&revision); err != nil {
+		return 0, err
+	}
+	return revision, nil
 }
 
 func (t *Tideglass) loadClaims(ctx context.Context, intentID string) ([]ClaimOut, error) {
@@ -3017,6 +3043,8 @@ func defaultSlotQuestion(slot string) string {
 		return "What budget range is comfortable?"
 	case "policy.action.confirmation":
 		return "Confirm this suggested action before Tideglass treats it as approved."
+	case "policy.action.snapshot":
+		return "Retry after Tideglass resolves a consistent action-policy snapshot."
 	default:
 		return "What should Tideglass know for " + slot + "?"
 	}
@@ -3228,6 +3256,7 @@ type actionConstraintValue struct {
 	AudienceID   string   `json:"audience_id,omitempty"`
 	ShareWith    []string `json:"share_with,omitempty"`
 	Deadline     string   `json:"deadline"`
+	ScopeHash    string   `json:"scope_hash"`
 }
 
 func latestMatchingActionConstraint(intentKind string, claims []ClaimOut, request IntentRequestEnvelope) (ClaimOut, actionConstraintValue, bool) {
@@ -3284,6 +3313,9 @@ func matchingActionConstraint(intentKind string, claim ClaimOut, request IntentR
 		return actionConstraintValue{}, false
 	}
 	if !deadlineConstraintValid(constraint.Deadline, request.Task.Deadline) {
+		return actionConstraintValue{}, false
+	}
+	if !sameRequiredExactConstraintValue(constraint.ScopeHash, actionScopeHash(request)) {
 		return actionConstraintValue{}, false
 	}
 	return constraint, true
@@ -3354,6 +3386,48 @@ func deadlineConstraintValid(left, right string) bool {
 		return false
 	}
 	return time.Now().Before(deadline)
+}
+
+func actionScopeHash(request IntentRequestEnvelope) string {
+	scope := map[string]any{
+		"actor": map[string]any{
+			"type":         request.Actor.Type,
+			"id":           request.Actor.ID,
+			"session":      request.Actor.Session,
+			"trust_tier":   request.Actor.TrustTier,
+			"capabilities": normalizedStringSet(request.Actor.Capabilities),
+		},
+		"task": map[string]any{
+			"goal":     request.Task.Goal,
+			"mode":     request.Task.Mode,
+			"stakes":   request.Task.Stakes,
+			"autonomy": request.Task.Autonomy,
+			"deadline": request.Task.Deadline,
+		},
+		"audience": map[string]any{
+			"type":       request.Audience.Type,
+			"id":         request.Audience.ID,
+			"share_with": normalizedStringSet(request.Audience.ShareWith),
+		},
+		"context": actionScopeContext(request.Context),
+	}
+	data, _ := json.Marshal(scope)
+	return "sha256:" + hashBytes(data)
+}
+
+func actionScopeContext(contextMap map[string]any) map[string]any {
+	if len(contextMap) == 0 {
+		return map[string]any{}
+	}
+	out := make(map[string]any, len(contextMap))
+	for key, value := range contextMap {
+		key = strings.TrimSpace(key)
+		if key == "" || key == "server_authority" || key == "client_request_id" {
+			continue
+		}
+		out[key] = value
+	}
+	return out
 }
 
 func stringSliceContains(rows []string, value string) bool {
