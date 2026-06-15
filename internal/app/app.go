@@ -73,9 +73,10 @@ type EditOptions struct {
 }
 
 type ReviewOptions struct {
-	ClaimID string
-	Action  string
-	Reason  string
+	ClaimID          string
+	Action           string
+	Reason           string
+	ExpectedRevision int64
 }
 
 type ExportOptions struct {
@@ -341,9 +342,10 @@ type ProfileResult struct {
 }
 
 type EditResult struct {
-	EditID  string `json:"edit_id"`
-	ClaimID string `json:"claim_id"`
-	Value   string `json:"value"`
+	EditID   string `json:"edit_id"`
+	ClaimID  string `json:"claim_id"`
+	Value    string `json:"value"`
+	Revision int64  `json:"revision,omitempty"`
 }
 
 type ReviewResult struct {
@@ -936,7 +938,7 @@ func (t *Tideglass) EditClaim(ctx context.Context, opts EditOptions) (EditResult
 	if err := tx.Commit(); err != nil {
 		return EditResult{}, err
 	}
-	return EditResult{EditID: editID, ClaimID: opts.ClaimID, Value: value}, nil
+	return EditResult{EditID: editID, ClaimID: opts.ClaimID, Value: value, Revision: revision}, nil
 }
 
 func (t *Tideglass) ReviewClaim(ctx context.Context, opts ReviewOptions) (ReviewResult, error) {
@@ -965,6 +967,10 @@ func (t *Tideglass) ReviewClaim(ctx context.Context, opts ReviewOptions) (Review
 	if err := tx.QueryRowContext(ctx, `select status, revision from claims where id = ?`, claimID).Scan(&currentStatus, &currentRevision); err != nil {
 		_ = tx.Rollback()
 		return ReviewResult{}, err
+	}
+	if opts.ExpectedRevision > 0 && currentRevision != opts.ExpectedRevision {
+		_ = tx.Rollback()
+		return ReviewResult{}, fmt.Errorf("claim revision changed: got %d, want %d", currentRevision, opts.ExpectedRevision)
 	}
 	revision, err := nextRevision(ctx, tx)
 	if err != nil {
@@ -3574,7 +3580,7 @@ func actionScopeContext(contextMap map[string]any) map[string]any {
 	}
 	out := make(map[string]any, len(contextMap))
 	for key, value := range contextMap {
-		if key == "" || key == "server_authority" || key == "client_request_id" {
+		if key == "server_authority" || key == "client_request_id" {
 			continue
 		}
 		out[key] = value

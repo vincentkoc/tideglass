@@ -203,7 +203,7 @@ func runReview(ctx context.Context, args []string) error {
 		}
 		switch strings.TrimSpace(strings.ToLower(answer)) {
 		case "a", "accept":
-			if _, err := tg.ReviewClaim(ctx, app.ReviewOptions{ClaimID: claim.ID, Action: "accept", Reason: "interactive review"}); err != nil {
+			if _, err := tg.ReviewClaim(ctx, app.ReviewOptions{ClaimID: claim.ID, Action: "accept", Reason: "interactive review", ExpectedRevision: claim.Revision}); err != nil {
 				return err
 			}
 			reviewed++
@@ -219,16 +219,17 @@ func runReview(ctx context.Context, args []string) error {
 				fmt.Println("skipped empty edit")
 				continue
 			}
-			if _, err := tg.EditClaim(ctx, app.EditOptions{ClaimID: claim.ID, Value: value, Reason: "interactive review edit"}); err != nil {
+			edit, err := tg.EditClaim(ctx, app.EditOptions{ClaimID: claim.ID, Value: value, Reason: "interactive review edit"})
+			if err != nil {
 				return err
 			}
-			if _, err := tg.ReviewClaim(ctx, app.ReviewOptions{ClaimID: claim.ID, Action: "accept", Reason: "interactive review edit"}); err != nil {
+			if _, err := tg.ReviewClaim(ctx, app.ReviewOptions{ClaimID: claim.ID, Action: "accept", Reason: "interactive review edit", ExpectedRevision: edit.Revision}); err != nil {
 				return err
 			}
 			reviewed++
 			fmt.Println("edited and accepted")
 		case "r", "reject":
-			if _, err := tg.ReviewClaim(ctx, app.ReviewOptions{ClaimID: claim.ID, Action: "reject", Reason: "interactive review"}); err != nil {
+			if _, err := tg.ReviewClaim(ctx, app.ReviewOptions{ClaimID: claim.ID, Action: "reject", Reason: "interactive review", ExpectedRevision: claim.Revision}); err != nil {
 				return err
 			}
 			reviewed++
