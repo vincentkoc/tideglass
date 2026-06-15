@@ -725,6 +725,17 @@ func TestResolveIntentV2ActionAndDisclosureContracts(t *testing.T) {
 	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: rawMemoryID, Action: "accept", Reason: "test"}); err != nil {
 		t.Fatal(err)
 	}
+	response, err := tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, Request: IntentRequestEnvelope{
+		URI:      "tideglass://v1/intent/work.project.start/current",
+		Task:     IntentTask{Mode: "act_gate", Autonomy: "bounded_act"},
+		Contract: IntentContract{RequiredSlots: []string{"boundary.project.no_go"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Decision.MayAct || !response.Decision.NeedsUserAnswer || !hasBlockingQuestionSlot(response.Unresolved, "boundary.project.no_go") {
+		t.Fatalf("required built-in boundary slot did not block action: %#v", response)
+	}
 	boundaryID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
 		Kind:       "boundary.project.no_go",
 		Value:      "Do not publish externally without explicit review.",
@@ -734,7 +745,7 @@ func TestResolveIntentV2ActionAndDisclosureContracts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	response, err := tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
+	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
 		URI:        "tideglass://v1/intent/work.project.start/current",
 		Task:       IntentTask{Mode: "act_gate", Autonomy: "bounded_act"},
 		Contract:   IntentContract{RequiredSlots: []string{"preference.project.validation"}},
@@ -770,6 +781,32 @@ func TestResolveIntentV2ActionAndDisclosureContracts(t *testing.T) {
 	}
 	if response.Decision.MayAct || !response.Decision.NeedsUserAnswer || !hasQuestionSlot(response.Unresolved, "boundary.project.no_go") {
 		t.Fatalf("unreviewed boundary claim authorized action: %#v", response)
+	}
+	requireReviewed := false
+	response, err = tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, Request: IntentRequestEnvelope{
+		URI:        "tideglass://v1/intent/work.project.start/current",
+		Task:       IntentTask{Mode: "act_gate", Autonomy: "bounded_act"},
+		Contract:   IntentContract{RequiredSlots: []string{"preference.agent.communication"}},
+		Freshness:  IntentFreshness{RequireReviewed: &requireReviewed},
+		Disclosure: IntentDisclosure{AllowSensitive: true},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Decision.MayAct || !response.Decision.NeedsUserAnswer || !hasBlockingQuestionSlot(response.Unresolved, "boundary.project.no_go") {
+		t.Fatalf("unreviewed boundary claim bypassed action with require_reviewed=false: %#v", response)
+	}
+	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
+		URI:        "tideglass://v1/intent/work.project.start/current",
+		Task:       IntentTask{Mode: "context", Autonomy: "context_only"},
+		Freshness:  IntentFreshness{RequireReviewed: &requireReviewed},
+		Disclosure: IntentDisclosure{AllowSensitive: true},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Status != "ready" || response.Policy.NeedsUserAnswer || hasBlockingQuestionSlot(response.Unresolved, "boundary.project.no_go") {
+		t.Fatalf("context resolve emitted action-gate blockers: %#v", response)
 	}
 	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: boundaryID, Action: "accept", Reason: "test"}); err != nil {
 		t.Fatal(err)
@@ -1909,6 +1946,19 @@ func hasQuestionSlot(rows []IntentQuestion, value string) bool {
 			slot = row.Kind
 		}
 		if slot == value {
+			return true
+		}
+	}
+	return false
+}
+
+func hasBlockingQuestionSlot(rows []IntentQuestion, value string) bool {
+	for _, row := range rows {
+		slot := row.Slot
+		if slot == "" {
+			slot = row.Kind
+		}
+		if slot == value && (row.Priority == "critical" || row.BlocksAction) {
 			return true
 		}
 	}

@@ -730,6 +730,9 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 		}
 		claims = eligibleClaimsForRequest(loaded, requireReviewed, maxAge)
 		policyFailedClaims = policyFailingClaims(loaded, claims)
+		if request.Task.Mode == "act_gate" {
+			policyFailedClaims = mergeClaimOuts(policyFailedClaims, actionGatePolicyFailingClaims(kind, loaded, request, maxAge))
+		}
 		slotClaims := claimsForSlotSatisfaction(loaded, request, maxAge)
 		unresolved = unresolvedIntentQuestions(intent.Kind, slotClaims)
 		unresolved = addRequiredSlotQuestions(unresolved, slotClaims, request.Contract.RequiredSlots)
@@ -745,9 +748,12 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 	if len(redactedBlocking) > 0 {
 		unresolved = append(unresolved, redactedBlocking...)
 	}
-	policyFailedBlocking := policyFailedBlockingQuestions(kind, policyFailedClaims, request.Contract.RequiredSlots, unresolved)
-	if len(policyFailedBlocking) > 0 {
-		unresolved = append(unresolved, policyFailedBlocking...)
+	var policyFailedBlocking []IntentQuestion
+	if request.Task.Mode == "act_gate" {
+		policyFailedBlocking = policyFailedBlockingQuestions(kind, policyFailedClaims, request.Contract.RequiredSlots, unresolved)
+		if len(policyFailedBlocking) > 0 {
+			unresolved = append(unresolved, policyFailedBlocking...)
+		}
 	}
 	if request.Task.Mode == "act_gate" && len(claims) == 0 && len(policyFailedClaims) > 0 {
 		unresolved = append(unresolved, questionForSlot("policy.claim.review_or_freshness", "critical", true))
@@ -2587,14 +2593,21 @@ func addRequiredSlotQuestions(unresolved []IntentQuestion, claims []ClaimOut, re
 	for _, claim := range claims {
 		haveClaims[claim.Kind] = true
 	}
-	haveQuestions := map[string]bool{}
-	for _, question := range unresolved {
-		haveQuestions[questionSlot(question)] = true
-	}
 	out := append([]IntentQuestion{}, unresolved...)
 	for _, slot := range requiredSlots {
 		slot = strings.TrimSpace(slot)
-		if slot == "" || haveClaims[slot] || haveQuestions[slot] {
+		if slot == "" || haveClaims[slot] {
+			continue
+		}
+		promoted := false
+		for index := range out {
+			if questionSlot(out[index]) == slot {
+				out[index].Priority = "critical"
+				out[index].BlocksAction = true
+				promoted = true
+			}
+		}
+		if promoted {
 			continue
 		}
 		out = append(out, questionForSlot(slot, "critical", true))
@@ -2830,14 +2843,47 @@ func policyFailingClaims(loaded []ClaimOut, eligible []ClaimOut) []ClaimOut {
 	return out
 }
 
+func actionGatePolicyFailingClaims(intentKind string, claims []ClaimOut, request IntentRequestEnvelope, maxAge time.Duration) []ClaimOut {
+	blocking := criticalClaimKinds(intentKind)
+	for _, slot := range request.Contract.RequiredSlots {
+		if strings.TrimSpace(slot) != "" {
+			blocking[strings.TrimSpace(slot)] = true
+		}
+	}
+	var out []ClaimOut
+	for _, claim := range claims {
+		if !blocking[claim.Kind] && !strings.HasPrefix(claim.Kind, "boundary.") {
+			continue
+		}
+		if claim.Status != "accepted" || claimStale(claim, maxAge) {
+			out = append(out, claim)
+		}
+	}
+	return out
+}
+
+func mergeClaimOuts(primary []ClaimOut, extra []ClaimOut) []ClaimOut {
+	seen := map[string]bool{}
+	out := make([]ClaimOut, 0, len(primary)+len(extra))
+	for _, claim := range primary {
+		seen[claim.ID] = true
+		out = append(out, claim)
+	}
+	for _, claim := range extra {
+		if seen[claim.ID] {
+			continue
+		}
+		seen[claim.ID] = true
+		out = append(out, claim)
+	}
+	return out
+}
+
 func claimsForSlotSatisfaction(claims []ClaimOut, request IntentRequestEnvelope, maxAge time.Duration) []ClaimOut {
 	out := make([]ClaimOut, 0, len(claims))
 	for _, claim := range claims {
-		if maxAge > 0 && claim.UpdatedAt != "" {
-			updatedAt, err := time.Parse(time.RFC3339, claim.UpdatedAt)
-			if err != nil || time.Since(updatedAt) > maxAge {
-				continue
-			}
+		if claimStale(claim, maxAge) {
+			continue
 		}
 		if request.Task.Mode == "act_gate" && claim.Status != "accepted" {
 			continue
@@ -2851,6 +2897,14 @@ func claimsForSlotSatisfaction(claims []ClaimOut, request IntentRequestEnvelope,
 		out = append(out, claim)
 	}
 	return out
+}
+
+func claimStale(claim ClaimOut, maxAge time.Duration) bool {
+	if maxAge <= 0 || claim.UpdatedAt == "" {
+		return false
+	}
+	updatedAt, err := time.Parse(time.RFC3339, claim.UpdatedAt)
+	return err != nil || time.Since(updatedAt) > maxAge
 }
 
 func parseMaxAge(value string) (time.Duration, error) {
