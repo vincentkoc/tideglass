@@ -725,10 +725,20 @@ func TestResolveIntentV2ActionAndDisclosureContracts(t *testing.T) {
 	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: rawMemoryID, Action: "accept", Reason: "test"}); err != nil {
 		t.Fatal(err)
 	}
+	boundaryID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "boundary.project.no_go",
+		Value:      "Do not publish externally without explicit review.",
+		Confidence: 0.9,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	response, err := tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
-		URI:      "tideglass://v1/intent/work.project.start/current",
-		Task:     IntentTask{Mode: "act_gate", Autonomy: "bounded_act"},
-		Contract: IntentContract{RequiredSlots: []string{"preference.project.validation"}},
+		URI:        "tideglass://v1/intent/work.project.start/current",
+		Task:       IntentTask{Mode: "act_gate", Autonomy: "bounded_act"},
+		Contract:   IntentContract{RequiredSlots: []string{"preference.project.validation"}},
+		Disclosure: IntentDisclosure{Mode: "full"},
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -750,9 +760,45 @@ func TestResolveIntentV2ActionAndDisclosureContracts(t *testing.T) {
 	if response.Decision.MayAct || !hasQuestionSlot(response.Unresolved, "preference.agent.communication") {
 		t.Fatalf("low-confidence claim satisfied required slot: %#v", response)
 	}
+	response, err = tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, Request: IntentRequestEnvelope{
+		URI:      "tideglass://v1/intent/work.project.start/current",
+		Task:     IntentTask{Mode: "act_gate", Autonomy: "bounded_act"},
+		Contract: IntentContract{RequiredSlots: []string{"preference.agent.communication"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Decision.MayAct || !response.Decision.NeedsUserAnswer || !hasQuestionSlot(response.Unresolved, "boundary.project.no_go") {
+		t.Fatalf("unreviewed boundary claim authorized action: %#v", response)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: boundaryID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
 	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
-		URI:  "tideglass://v1/intent/work.project.start/current",
-		Task: IntentTask{Mode: "act_gate", Autonomy: "suggest_then_confirm"},
+		URI:      "tideglass://v1/intent/work.project.start/current",
+		Audience: IntentAudience{Type: "service", ID: "venue"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Claims) != 0 || len(response.Policy.SafeToShare) != 0 {
+		t.Fatalf("external minimal response leaked unrelated claims: claims=%#v policy=%#v", response.Claims, response.Policy)
+	}
+	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
+		URI:      "tideglass://v1/intent/work.project.start/current",
+		Audience: IntentAudience{Type: "service", ID: "venue"},
+		Contract: IntentContract{OptionalSlots: []string{"preference.agent.communication"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Claims) != 1 || response.Claims[0].Kind != "preference.agent.communication" {
+		t.Fatalf("contract-scoped minimal response = %#v", response.Claims)
+	}
+	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
+		URI:        "tideglass://v1/intent/work.project.start/current",
+		Task:       IntentTask{Mode: "act_gate", Autonomy: "suggest_then_confirm"},
+		Disclosure: IntentDisclosure{AllowSensitive: true},
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -876,6 +922,12 @@ func TestResolveIntentCanonicalLinksAndExistenceDisclosure(t *testing.T) {
 		Disclosure: IntentDisclosure{Mode: "verbose"},
 	}}); err == nil {
 		t.Fatal("expected unsupported disclosure mode to fail closed")
+	}
+	if _, err := tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
+		URI:  "tideglass://intent/work.project.start",
+		Task: IntentTask{Mode: "review"},
+	}}); err == nil {
+		t.Fatal("expected unsupported review task mode to fail closed")
 	}
 	if _, err := tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
 		URI:       "tideglass://intent/work.project.start",

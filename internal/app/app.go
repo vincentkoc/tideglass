@@ -745,10 +745,18 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 	if len(redactedBlocking) > 0 {
 		unresolved = append(unresolved, redactedBlocking...)
 	}
+	policyFailedBlocking := policyFailedBlockingQuestions(kind, policyFailedClaims, request.Contract.RequiredSlots, unresolved)
+	if len(policyFailedBlocking) > 0 {
+		unresolved = append(unresolved, policyFailedBlocking...)
+	}
 	if request.Task.Mode == "act_gate" && len(claims) == 0 && len(policyFailedClaims) > 0 {
 		unresolved = append(unresolved, questionForSlot("policy.claim.review_or_freshness", "critical", true))
 	}
 	if hasCriticalUnresolved(redactedBlocking) || hasRedactedCriticalClaim(kind, policy.Redacted) {
+		policy.NeedsUserAnswer = true
+		policy.MayAct = false
+	}
+	if request.Task.Mode == "act_gate" && len(policyFailedBlocking) > 0 {
 		policy.NeedsUserAnswer = true
 		policy.MayAct = false
 	}
@@ -2604,14 +2612,37 @@ func redactedBlockingQuestions(intentKind string, redacted []string, requiredSlo
 			blocking[strings.TrimSpace(slot)] = true
 		}
 	}
-	haveQuestions := map[string]bool{}
+	haveBlockingQuestions := map[string]bool{}
 	for _, question := range existing {
-		haveQuestions[questionSlot(question)] = true
+		haveBlockingQuestions[questionSlot(question)] = question.Priority == "critical" || question.BlocksAction
 	}
 	var out []IntentQuestion
 	for _, kind := range redacted {
-		if (blocking[kind] || strings.HasPrefix(kind, "boundary.")) && !haveQuestions[kind] {
+		if (blocking[kind] || strings.HasPrefix(kind, "boundary.")) && !haveBlockingQuestions[kind] {
 			out = append(out, questionForSlot(kind, "critical", true))
+		}
+	}
+	return out
+}
+
+func policyFailedBlockingQuestions(intentKind string, claims []ClaimOut, requiredSlots []string, existing []IntentQuestion) []IntentQuestion {
+	if len(claims) == 0 {
+		return nil
+	}
+	blocking := criticalClaimKinds(intentKind)
+	for _, slot := range requiredSlots {
+		if strings.TrimSpace(slot) != "" {
+			blocking[strings.TrimSpace(slot)] = true
+		}
+	}
+	haveBlockingQuestions := map[string]bool{}
+	for _, question := range existing {
+		haveBlockingQuestions[questionSlot(question)] = question.Priority == "critical" || question.BlocksAction
+	}
+	var out []IntentQuestion
+	for _, claim := range claims {
+		if (blocking[claim.Kind] || strings.HasPrefix(claim.Kind, "boundary.")) && !haveBlockingQuestions[claim.Kind] {
+			out = append(out, questionForSlot(claim.Kind, "critical", true))
 		}
 	}
 	return out
@@ -2724,7 +2755,7 @@ func validateIntentRequest(request IntentRequestEnvelope) error {
 		return fmt.Errorf("unsupported disclosure mode %q", request.Disclosure.Mode)
 	}
 	switch request.Task.Mode {
-	case "context", "slot_fill", "act_gate", "compare", "handoff", "review":
+	case "context", "slot_fill", "act_gate", "compare", "handoff":
 	default:
 		return fmt.Errorf("unsupported task mode %q", request.Task.Mode)
 	}
@@ -2864,6 +2895,9 @@ func applyIntentPolicy(claims []ClaimOut, unresolved []IntentQuestion, request I
 	redacted := map[string]bool{}
 	shareable := map[string]bool{}
 	for _, claim := range claims {
+		if request.Disclosure.Mode == "minimal" && !claimRelevantToRequest(claim.Kind, request) && !claimRequiredForActionGate(claim.Kind, request) {
+			continue
+		}
 		sensitivity := claimSensitivity(claim.Kind)
 		envelope := IntentClaimEnvelope{
 			ID:          claim.ID,
@@ -2918,6 +2952,28 @@ func applyIntentPolicy(claims []ClaimOut, unresolved []IntentQuestion, request I
 		policy.MayAct = false
 	}
 	return out, policy
+}
+
+func claimRelevantToRequest(kind string, request IntentRequestEnvelope) bool {
+	for _, slot := range request.Contract.RequiredSlots {
+		if kind == strings.TrimSpace(slot) {
+			return true
+		}
+	}
+	for _, slot := range request.Contract.OptionalSlots {
+		if kind == strings.TrimSpace(slot) {
+			return true
+		}
+	}
+	if len(request.Contract.RequiredSlots) > 0 || len(request.Contract.OptionalSlots) > 0 {
+		return false
+	}
+	audience := request.Audience.Label()
+	return audience == "agent" || audience == "local" || audience == request.Actor.ID
+}
+
+func claimRequiredForActionGate(kind string, request IntentRequestEnvelope) bool {
+	return request.Task.Mode == "act_gate" && strings.HasPrefix(kind, "boundary.")
 }
 
 func addClaimCommitments(claims []IntentClaimEnvelope, request IntentRequestEnvelope, commitments map[string]string) []IntentClaimEnvelope {
