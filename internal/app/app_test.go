@@ -712,6 +712,44 @@ func TestResolveIntentActionGateProcessesScopedCriticalClaims(t *testing.T) {
 	}
 }
 
+func TestResolveIntentMinimalDisclosureMarksOmittedCriticalClaims(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	intent, err := tg.ensureIntent(ctx, "social.dinner", "Dinner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "preference.food.allergy",
+		Value:      "Shellfish allergy.",
+		Confidence: 0.95,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: claimID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	response, err := tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
+		URI:        "tideglass://v1/disclosure/social.dinner/venue",
+		Disclosure: IntentDisclosure{Mode: "minimal"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Status == "ready" || !response.Decision.NeedsUserAnswer || response.Policy.MayAct {
+		t.Fatalf("minimal disclosure silently omitted critical claim: %#v", response)
+	}
+	if !containsString(response.Policy.Redacted, "preference.food.allergy") || !hasBlockingQuestionSlot(response.Unresolved, "preference.food.allergy") {
+		t.Fatalf("omitted critical claim was not marked unresolved/redacted: %#v", response)
+	}
+}
+
 func TestResolveIntentActionGateUsesLosslessDuplicateKeys(t *testing.T) {
 	ctx := context.Background()
 	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
@@ -750,6 +788,87 @@ func TestResolveIntentActionGateUsesLosslessDuplicateKeys(t *testing.T) {
 	}
 	if response.Decision.MayAct || !response.Decision.NeedsUserAnswer || !hasBlockingQuestionSlot(response.Unresolved, "boundary.social.topic") {
 		t.Fatalf("lossy duplicate key suppressed distinct pending boundary: %#v", response)
+	}
+}
+
+func TestResolveIntentActionGateSnapshotsLosslessAcceptedBoundaries(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	intent, err := tg.ensureIntent(ctx, "social.dinner", "Dinner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	allergyID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{Kind: "preference.food.allergy", Value: "No allergies.", Confidence: 0.95, SourceMode: "explicit"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: allergyID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	noTopicID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{Kind: "boundary.social.topic", Value: "No external publishing", Confidence: 0.95, SourceMode: "explicit"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: noTopicID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	yesTopicID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{Kind: "boundary.social.topic", Value: "External publishing", Confidence: 0.95, SourceMode: "explicit"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: yesTopicID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano)
+	request := normalizeIntentRequest(IntentRequestEnvelope{
+		URI:        "tideglass://v1/intent/social.dinner/current",
+		Task:       IntentTask{Mode: "act_gate", Autonomy: "bounded_act", Goal: "book dinner", Deadline: deadline},
+		Disclosure: IntentDisclosure{AllowSensitive: true},
+	})
+	constraintJSON, err := json.Marshal(map[string]any{
+		"allow":         true,
+		"intent_kind":   "social.dinner",
+		"task_mode":     "act_gate",
+		"autonomy":      "bounded_act",
+		"goal":          "book dinner",
+		"audience_type": "agent",
+		"deadline":      deadline,
+		"scope_hash":    actionScopeHash(request),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	constraintID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "policy.action.constraints",
+		Value:      string(constraintJSON),
+		Confidence: 0.99,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: constraintID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	response, err := tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, Request: request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !response.Decision.MayAct || response.Decision.NeedsUserAnswer || response.Status != "ready" {
+		t.Fatalf("lossless accepted boundaries blocked authorization: %#v", response)
+	}
+	foundNoTopic := false
+	for _, claim := range response.Claims {
+		if claim.ID == noTopicID {
+			foundNoTopic = true
+		}
+	}
+	if !foundNoTopic {
+		t.Fatalf("authorized response omitted lossless accepted boundary: %#v", response.Claims)
 	}
 }
 
@@ -1235,7 +1354,10 @@ func TestLoadActionGateClaimsTreatsRevisionZeroAcceptedSingletonAsAuthoritative(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tg.db.ExecContext(ctx, `update claims set revision = 0 where id in (?, ?)`, acceptedID, activeID); err != nil {
+	if _, err := tg.db.ExecContext(ctx, `update claims set revision = 0, updated_at = ? where id = ?`, "2024-01-02T00:00:00Z", acceptedID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.db.ExecContext(ctx, `update claims set revision = 0, updated_at = ? where id = ?`, "2024-01-01T00:00:00Z", activeID); err != nil {
 		t.Fatal(err)
 	}
 	claims, err := tg.loadActionGateClaims(ctx, intent.ID, "work.project.start", nil)
@@ -1247,6 +1369,53 @@ func TestLoadActionGateClaimsTreatsRevisionZeroAcceptedSingletonAsAuthoritative(
 	}
 	if !hasClaimID(claims, acceptedID) {
 		t.Fatalf("revision-zero accepted singleton missing from action gate claims: %#v", claims)
+	}
+}
+
+func TestLoadActionGateClaimsKeepsNewerRevisionZeroPendingSingleton(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	intent, err := tg.ensureIntent(ctx, "work.project.start", "Project start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	acceptedID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "boundary.project.no_go",
+		Value:      "Old accepted boundary.",
+		Confidence: 0.9,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: acceptedID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	pendingID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "boundary.project.no_go",
+		Value:      "New pending boundary.",
+		Confidence: 0.95,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.db.ExecContext(ctx, `update claims set revision = 0, updated_at = ? where id = ?`, "2024-01-01T00:00:00Z", acceptedID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.db.ExecContext(ctx, `update claims set revision = 0, updated_at = ? where id = ?`, "2024-01-02T00:00:00Z", pendingID); err != nil {
+		t.Fatal(err)
+	}
+	claims, err := tg.loadActionGateClaims(ctx, intent.ID, "work.project.start", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasClaimID(claims, pendingID) {
+		t.Fatalf("newer revision-zero pending singleton was hidden: %#v", claims)
 	}
 }
 
@@ -1350,6 +1519,27 @@ func TestLoadReviewCandidateClaimsPreservesDuplicateDecisions(t *testing.T) {
 	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: rejectedDuplicateID, Action: "reject", Reason: "test"}); err != nil {
 		t.Fatal(err)
 	}
+	acceptedBoundaryID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "boundary.project.no_go",
+		Value:      "No external publishing.",
+		Confidence: 0.9,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: acceptedBoundaryID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	losslessCandidateID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "boundary.project.no_go",
+		Value:      "External publishing.",
+		Confidence: 0.8,
+		SourceMode: "inferred",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	acceptedSingletonID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
 		Kind:       "preference.project.validation",
 		Value:      "Run the full suite.",
@@ -1383,6 +1573,9 @@ func TestLoadReviewCandidateClaimsPreservesDuplicateDecisions(t *testing.T) {
 	}
 	if !hasClaimID(candidates, freshCandidateID) {
 		t.Fatalf("fresh singleton candidate was hidden: %#v", candidates)
+	}
+	if !hasClaimID(candidates, losslessCandidateID) {
+		t.Fatalf("losslessly distinct singleton candidate was hidden: %#v", candidates)
 	}
 }
 

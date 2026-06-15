@@ -751,18 +751,27 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 		if err != nil {
 			return IntentResponseEnvelope{}, err
 		}
-		claims = eligibleClaimsForRequest(loaded, requireReviewed, maxAge)
-		policyFailedClaims = policyFailingClaims(loaded, claims)
+		loadedForPolicy := loaded
 		hasScopedActionConstraint := false
 		if request.Task.Mode == "act_gate" {
 			actionGateClaims, err := t.loadActionGateClaims(ctx, intent.ID, kind, request.Contract.RequiredSlots)
 			if err != nil {
 				return IntentResponseEnvelope{}, err
 			}
+			actionGateClaims, _, err = t.attachClaimEvidence(ctx, actionGateClaims)
+			if err != nil {
+				return IntentResponseEnvelope{}, err
+			}
+			loadedForPolicy = mergeClaimOuts(loadedForPolicy, actionGateClaims)
 			_, _, hasScopedActionConstraint = latestMatchingActionConstraint(kind, actionGateClaims, request)
+			claims = eligibleClaimsForRequest(loadedForPolicy, requireReviewed, maxAge)
+			policyFailedClaims = policyFailingClaims(loadedForPolicy, claims)
 			policyFailedClaims = mergeClaimOuts(policyFailedClaims, actionGatePolicyFailingClaims(kind, actionGateClaims, request, maxAge))
+		} else {
+			claims = eligibleClaimsForRequest(loadedForPolicy, requireReviewed, maxAge)
+			policyFailedClaims = policyFailingClaims(loadedForPolicy, claims)
 		}
-		slotClaims := claimsForSlotSatisfaction(kind, loaded, request, maxAge)
+		slotClaims := claimsForSlotSatisfaction(kind, loadedForPolicy, request, maxAge)
 		unresolved = unresolvedIntentQuestions(intent.Kind, slotClaims)
 		unresolved = addRequiredSlotQuestions(unresolved, slotClaims, request.Contract.RequiredSlots)
 		if request.Task.Mode == "act_gate" && request.Task.Autonomy == "bounded_act" && !hasScopedActionConstraint {
@@ -1817,14 +1826,15 @@ func currentRevision(ctx context.Context, queryer interface {
 }
 
 type observedRevision struct {
-	revision int64
-	ok       bool
+	revision  int64
+	updatedAt string
+	ok        bool
 }
 
-func recordLatestRevision(revisions map[string]observedRevision, key string, revision int64) {
+func recordLatestRevision(revisions map[string]observedRevision, key string, revision int64, updatedAt string) {
 	current := revisions[key]
-	if !current.ok || revision > current.revision {
-		revisions[key] = observedRevision{revision: revision, ok: true}
+	if !current.ok || revision > current.revision || (revision == current.revision && timestampAfter(updatedAt, current.updatedAt)) {
+		revisions[key] = observedRevision{revision: revision, updatedAt: updatedAt, ok: true}
 	}
 }
 
@@ -1991,10 +2001,10 @@ order by c.created_at desc`, intentID)
 		normalized = losslessClaimValueKey(claim.Value)
 		duplicateKey := claim.Kind + "\x00" + normalized
 		if singletonClaimKind(claim.Kind) && claim.Status == "accepted" {
-			recordLatestRevision(bestAcceptedSingleton, claim.Kind, revision)
+			recordLatestRevision(bestAcceptedSingleton, claim.Kind, revision, claim.UpdatedAt)
 		}
 		if claim.Status == "accepted" {
-			recordLatestRevision(bestAcceptedDuplicate, duplicateKey, revision)
+			recordLatestRevision(bestAcceptedDuplicate, duplicateKey, revision, claim.UpdatedAt)
 		}
 		claims = append(claims, claim)
 		actionGateClaimRevisions[claim.ID] = revision
@@ -2011,11 +2021,15 @@ order by c.created_at desc`, intentID)
 			continue
 		}
 		singletonAcceptedRevision := bestAcceptedSingleton[claim.Kind]
-		if singletonClaimKind(claim.Kind) && singletonAcceptedRevision.ok && claim.Status == "accepted" && revision < singletonAcceptedRevision.revision {
-			continue
+		if singletonClaimKind(claim.Kind) && singletonAcceptedRevision.ok && claim.Status == "accepted" {
+			if revision < singletonAcceptedRevision.revision || (revision == singletonAcceptedRevision.revision && timestampAfter(singletonAcceptedRevision.updatedAt, claim.UpdatedAt)) {
+				continue
+			}
 		}
-		if singletonClaimKind(claim.Kind) && singletonAcceptedRevision.ok && claim.Status != "accepted" && revision <= singletonAcceptedRevision.revision {
-			continue
+		if singletonClaimKind(claim.Kind) && singletonAcceptedRevision.ok && claim.Status != "accepted" {
+			if revision < singletonAcceptedRevision.revision || (revision == singletonAcceptedRevision.revision && !timestampAfter(claim.UpdatedAt, singletonAcceptedRevision.updatedAt)) {
+				continue
+			}
 		}
 		out = append(out, claim)
 	}
@@ -2067,7 +2081,7 @@ order by c.created_at desc`, intentID)
 		claim.Revision = revision
 		claim.HasValueEdit = hasValueEdit == 1
 		claim.ClaimOut.UpdatedAt = claim.UpdatedAt
-		claim.Normalized = normalizeText(claim.Value)
+		claim.Normalized = losslessClaimValueKey(claim.Value)
 		rowsOut = append(rowsOut, claim)
 	}
 	if err := rows.Err(); err != nil {
@@ -2114,7 +2128,7 @@ order by c.created_at desc`, intentID)
 	bestAcceptedSingleton := map[string]observedRevision{}
 	for _, claim := range deduped {
 		if claim.Status == "accepted" {
-			recordLatestRevision(bestAcceptedSingleton, claim.Kind, claim.Revision)
+			recordLatestRevision(bestAcceptedSingleton, claim.Kind, claim.Revision, claim.UpdatedAt)
 		}
 	}
 	out := make([]ClaimOut, 0, len(deduped))
@@ -2123,8 +2137,10 @@ order by c.created_at desc`, intentID)
 			continue
 		}
 		acceptedRevision := bestAcceptedSingleton[claim.Kind]
-		if acceptedRevision.ok && claim.Revision <= acceptedRevision.revision {
-			continue
+		if acceptedRevision.ok {
+			if claim.Revision < acceptedRevision.revision || (claim.Revision == acceptedRevision.revision && !timestampAfter(claim.UpdatedAt, acceptedRevision.updatedAt)) {
+				continue
+			}
 		}
 		out = append(out, claim.ClaimOut)
 	}
@@ -3813,6 +3829,9 @@ func applyIntentPolicy(intentKind string, claims []ClaimOut, unresolved []Intent
 			continue
 		}
 		if request.Disclosure.Mode == "minimal" && !claimRelevantToRequest(claim.Kind, request) && !claimRequiredForActionGate(intentKind, claim.Kind, request) {
+			if omittedClaimBlocksReadiness(intentKind, claim.Kind, request) {
+				redacted[claim.Kind] = true
+			}
 			continue
 		}
 		sensitivity := claimSensitivity(claim.Kind)
@@ -3880,6 +3899,18 @@ func applyIntentPolicy(intentKind string, claims []ClaimOut, unresolved []Intent
 		policy.MayAct = true
 	}
 	return out, policy
+}
+
+func omittedClaimBlocksReadiness(intentKind, kind string, request IntentRequestEnvelope) bool {
+	if criticalClaimKinds(intentKind)[kind] {
+		return true
+	}
+	for _, slot := range request.Contract.RequiredSlots {
+		if kind == strings.TrimSpace(slot) {
+			return true
+		}
+	}
+	return false
 }
 
 func claimRelevantToRequest(kind string, request IntentRequestEnvelope) bool {
