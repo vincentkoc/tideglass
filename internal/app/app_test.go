@@ -613,7 +613,8 @@ func TestResolveIntentActionGateFailsClosedWithoutConstraints(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tg.Close()
-	if _, err := tg.ensureIntent(ctx, "work.project.start", "Project start"); err != nil {
+	intent, err := tg.ensureIntent(ctx, "work.project.start", "Project start")
+	if err != nil {
 		t.Fatal(err)
 	}
 	response, err := tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, Request: IntentRequestEnvelope{
@@ -625,6 +626,28 @@ func TestResolveIntentActionGateFailsClosedWithoutConstraints(t *testing.T) {
 	}
 	if response.Decision.MayAct || !response.Decision.NeedsUserAnswer || !hasBlockingQuestionSlot(response.Unresolved, "policy.action.constraints") {
 		t.Fatalf("empty action gate authorized action: %#v", response)
+	}
+	claimID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "preference.agent.communication",
+		Value:      "Use terse updates.",
+		Confidence: 0.9,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: claimID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	response, err = tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, Request: IntentRequestEnvelope{
+		URI:  "tideglass://v1/intent/work.project.start/current",
+		Task: IntentTask{Mode: "act_gate", Autonomy: "bounded_act"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Decision.MayAct || !response.Decision.NeedsUserAnswer || !hasBlockingQuestionSlot(response.Unresolved, "policy.action.constraints") {
+		t.Fatalf("unrelated accepted claim authorized action: %#v", response)
 	}
 }
 
@@ -682,6 +705,67 @@ func TestResolveIntentActionGateScansPendingSingletonBoundaries(t *testing.T) {
 	}
 	if response.Decision.MayAct || !response.Decision.NeedsUserAnswer || !hasBlockingQuestionSlot(response.Unresolved, "boundary.project.no_go") {
 		t.Fatalf("pending singleton boundary was hidden by accepted boundary: %#v", response)
+	}
+}
+
+func TestResolveIntentActionGateIgnoresSupersededSingletonBoundaries(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	intent, err := tg.ensureIntent(ctx, "work.project.start", "Project start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	communicationID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "preference.agent.communication",
+		Value:      "Use terse updates.",
+		Confidence: 0.9,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: communicationID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	oldBoundaryID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "boundary.project.no_go",
+		Value:      "Old pending boundary.",
+		Confidence: 0.8,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.db.ExecContext(ctx, `update claims set updated_at = ? where id = ?`, "2024-01-01T00:00:00Z", oldBoundaryID); err != nil {
+		t.Fatal(err)
+	}
+	newBoundaryID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "boundary.project.no_go",
+		Value:      "New reviewed boundary.",
+		Confidence: 0.95,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: newBoundaryID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	response, err := tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, Request: IntentRequestEnvelope{
+		URI:        "tideglass://v1/intent/work.project.start/current",
+		Task:       IntentTask{Mode: "act_gate", Autonomy: "bounded_act"},
+		Contract:   IntentContract{RequiredSlots: []string{"preference.agent.communication"}},
+		Disclosure: IntentDisclosure{AllowSensitive: true},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Decision.MayAct == false || response.Decision.NeedsUserAnswer || hasBlockingQuestionSlot(response.Unresolved, "boundary.project.no_go") {
+		t.Fatalf("superseded singleton boundary blocked action: %#v", response)
 	}
 }
 
@@ -919,6 +1003,9 @@ func TestResolveIntentV2ActionAndDisclosureContracts(t *testing.T) {
 	}
 	if response.Decision.MayAct || !hasQuestionSlot(response.Unresolved, "preference.agent.communication") {
 		t.Fatalf("low-confidence claim satisfied required slot: %#v", response)
+	}
+	if len(response.Claims) != 0 {
+		t.Fatalf("low-confidence claim leaked through response floor: %#v", response.Claims)
 	}
 	response, err = tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, Request: IntentRequestEnvelope{
 		URI:      "tideglass://v1/intent/work.project.start/current",

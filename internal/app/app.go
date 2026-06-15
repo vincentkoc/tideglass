@@ -743,7 +743,7 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 		slotClaims := claimsForSlotSatisfaction(kind, loaded, request, maxAge)
 		unresolved = unresolvedIntentQuestions(intent.Kind, slotClaims)
 		unresolved = addRequiredSlotQuestions(unresolved, slotClaims, request.Contract.RequiredSlots)
-		if request.Task.Mode == "act_gate" && len(claims) == 0 && len(policyFailedClaims) == 0 {
+		if request.Task.Mode == "act_gate" && !hasActionGateConstraint(kind, claims, request, maxAge) && len(policyFailedClaims) == 0 {
 			unresolved = append(unresolved, questionForSlot("policy.action.constraints", "critical", true))
 		}
 	} else {
@@ -1714,6 +1714,7 @@ order by c.created_at desc`, intentID)
 	}
 	defer rows.Close()
 	var claims []ClaimOut
+	bestAcceptedSingleton := map[string]string{}
 	for rows.Next() {
 		var claim ClaimOut
 		var valueEditCreatedAt string
@@ -1726,9 +1727,22 @@ order by c.created_at desc`, intentID)
 		if valueEditCreatedAt > claim.UpdatedAt {
 			claim.UpdatedAt = valueEditCreatedAt
 		}
+		if singletonClaimKind(claim.Kind) && claim.Status == "accepted" && claim.UpdatedAt > bestAcceptedSingleton[claim.Kind] {
+			bestAcceptedSingleton[claim.Kind] = claim.UpdatedAt
+		}
 		claims = append(claims, claim)
 	}
-	return claims, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	out := claims[:0]
+	for _, claim := range claims {
+		if singletonClaimKind(claim.Kind) && claim.Status != "accepted" && bestAcceptedSingleton[claim.Kind] != "" && claim.UpdatedAt < bestAcceptedSingleton[claim.Kind] {
+			continue
+		}
+		out = append(out, claim)
+	}
+	return out, nil
 }
 
 func (t *Tideglass) attachClaimEvidence(ctx context.Context, claims []ClaimOut) ([]ClaimOut, []EvidenceOut, error) {
@@ -2914,6 +2928,24 @@ func actionGatePolicyFailingClaims(intentKind string, claims []ClaimOut, request
 	return out
 }
 
+func hasActionGateConstraint(intentKind string, claims []ClaimOut, request IntentRequestEnvelope, maxAge time.Duration) bool {
+	blocking := criticalClaimKinds(intentKind)
+	for _, slot := range request.Contract.RequiredSlots {
+		if strings.TrimSpace(slot) != "" {
+			blocking[strings.TrimSpace(slot)] = true
+		}
+	}
+	for _, claim := range claims {
+		if claim.Status != "accepted" || claimStale(claim, maxAge) {
+			continue
+		}
+		if blocking[claim.Kind] || strings.HasPrefix(claim.Kind, "boundary.") {
+			return true
+		}
+	}
+	return false
+}
+
 func mergeClaimOuts(primary []ClaimOut, extra []ClaimOut) []ClaimOut {
 	seen := map[string]bool{}
 	out := make([]ClaimOut, 0, len(primary)+len(extra))
@@ -3013,6 +3045,9 @@ func applyIntentPolicy(intentKind string, claims []ClaimOut, unresolved []Intent
 	redacted := map[string]bool{}
 	shareable := map[string]bool{}
 	for _, claim := range claims {
+		if request.Contract.ConfidenceFloor > 0 && claim.Confidence < request.Contract.ConfidenceFloor {
+			continue
+		}
 		if request.Disclosure.Mode == "minimal" && !claimRelevantToRequest(claim.Kind, request) && !claimRequiredForActionGate(intentKind, claim.Kind, request) {
 			continue
 		}
