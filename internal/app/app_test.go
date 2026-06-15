@@ -695,6 +695,31 @@ func TestResolveIntentMigratesLegacyEditedAcceptedClaims(t *testing.T) {
 	if err := tg.ensureIntentRequestSchema(ctx); err != nil {
 		t.Fatal(err)
 	}
+	rejectedID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{Kind: "boundary.social.topic", Value: "Old rejected topic.", Confidence: 0.8, SourceMode: "explicit"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: rejectedID, Action: "reject", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	var rejectCreatedAt string
+	if err := tg.db.QueryRowContext(ctx, `select created_at from edits where claim_id = ? and operation = 'reject' order by rowid desc limit 1`, rejectedID).Scan(&rejectCreatedAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.db.ExecContext(ctx, `insert into edits(id,claim_id,operation,patch_json,reason,created_at) values(?,?,?,?,?,?)`,
+		id("edt"), rejectedID, "supersede", `{"value":"Fresh rejected edit."}`, "legacy edit", rejectCreatedAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := tg.ensureIntentRequestSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var status string
+	if err := tg.db.QueryRowContext(ctx, `select status from claims where id = ?`, rejectedID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "active" {
+		t.Fatalf("legacy rejected edited claim status = %s, want active", status)
+	}
 	response, err := tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, Request: IntentRequestEnvelope{
 		URI:        "tideglass://v1/intent/social.dinner/current",
 		Task:       IntentTask{Mode: "act_gate", Autonomy: "bounded_act"},

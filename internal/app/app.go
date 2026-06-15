@@ -2158,7 +2158,7 @@ set status = 'active',
       select max(created_at) from edits
       where edits.claim_id = claims.id and json_extract(patch_json, '$.value') is not null
     ), updated_at)
-where status = 'accepted'
+where status in ('accepted', 'rejected')
   and exists (
     select 1 from edits value_edits
     where value_edits.claim_id = claims.id
@@ -2172,16 +2172,16 @@ where status = 'accepted'
       and (
         julianday(value_edits.created_at) > coalesce((
           select max(julianday(review_edits.created_at)) from edits review_edits
-          where review_edits.claim_id = claims.id and review_edits.operation = 'accept'
+          where review_edits.claim_id = claims.id and review_edits.operation in ('accept', 'reject')
         ), 0)
         or (
           julianday(value_edits.created_at) = coalesce((
             select max(julianday(review_edits.created_at)) from edits review_edits
-            where review_edits.claim_id = claims.id and review_edits.operation = 'accept'
+            where review_edits.claim_id = claims.id and review_edits.operation in ('accept', 'reject')
           ), 0)
           and value_edits.rowid > coalesce((
             select latest_review.rowid from edits latest_review
-            where latest_review.claim_id = claims.id and latest_review.operation = 'accept'
+            where latest_review.claim_id = claims.id and latest_review.operation in ('accept', 'reject')
             order by julianday(latest_review.created_at) desc, latest_review.rowid desc limit 1
           ), 0)
         )
