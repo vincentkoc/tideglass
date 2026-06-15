@@ -757,8 +757,8 @@ func TestResolveIntentV2ActionAndDisclosureContracts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if response.Decision.MayAct || response.Decision.Reason != "confirmation_required" {
-		t.Fatalf("suggest_then_confirm authorized action: %#v", response.Decision)
+	if response.Status != "partial" || response.Decision.MayAct || response.Decision.Reason != "confirmation_required" {
+		t.Fatalf("suggest_then_confirm authorized action: status=%s decision=%#v", response.Status, response.Decision)
 	}
 	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
 		URI:  "tideglass://v1/intent/work.project.start/current",
@@ -848,6 +848,9 @@ func TestResolveIntentCanonicalLinksAndExistenceDisclosure(t *testing.T) {
 	}
 	if claim.ID != "" || claim.Value != "" || claim.Confidence != 0 || claim.SourceMode != "" || claim.Sensitivity != "" || len(claim.Evidence) != 0 {
 		t.Fatalf("existence claim leaked metadata: %#v", claim)
+	}
+	if claim.Commitment != "" || response.Commitments.ResponseHash != "" {
+		t.Fatalf("existence response emitted hidden-value commitments: claim=%#v commitments=%#v", claim, response.Commitments)
 	}
 	if _, err := tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
 		URI:        "tideglass://intent/work.project.start",

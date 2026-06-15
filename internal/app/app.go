@@ -754,6 +754,9 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 	if !foundIntent || policy.NeedsUserAnswer {
 		status = "partial"
 	}
+	if foundIntent && request.Task.Mode == "act_gate" && !policy.MayAct {
+		status = "partial"
+	}
 	if !foundIntent {
 		status = "missing"
 	}
@@ -779,7 +782,6 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 			"profile":    "tideglass://v1/profile/me/" + kind + "/current",
 			"slots":      "tideglass://v1/intent/" + kind + "/slots",
 			"unresolved": "tideglass://v1/intent/" + kind + "/unresolved",
-			"schema":     "tideglass://v1/schema/response-envelope/v2",
 			"disclosure": "tideglass://disclosure/" + kind + "/" + request.Audience.Label(),
 		},
 	}
@@ -2737,6 +2739,9 @@ func claimsForSlotSatisfaction(claims []ClaimOut, request IntentRequestEnvelope)
 		if request.Task.Mode == "act_gate" && claim.Status != "accepted" {
 			continue
 		}
+		if claim.Status != "accepted" && !request.Freshness.AcceptInferredForQuestions {
+			continue
+		}
 		if request.Contract.ConfidenceFloor > 0 && claim.Confidence < request.Contract.ConfidenceFloor {
 			continue
 		}
@@ -2923,7 +2928,7 @@ func allowClaimValues(disclosure IntentDisclosure) bool {
 }
 
 func allowCommitments(disclosure IntentDisclosure) bool {
-	return disclosure.AllowCommitments != nil && *disclosure.AllowCommitments
+	return disclosure.AllowCommitments != nil && *disclosure.AllowCommitments && allowClaimValues(disclosure) && disclosure.Mode != "existence"
 }
 
 func existenceClaimEnvelope(claim ClaimOut) IntentClaimEnvelope {
