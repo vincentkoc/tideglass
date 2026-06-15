@@ -24,9 +24,49 @@ go run ./cmd/tideglass ingest codex --path ~/.codex/sessions --limit 200
 go run ./cmd/tideglass ask --kind work.project.start "i am starting a new OpenClaw project"
 go run ./cmd/tideglass review --kind work.project.start
 go run ./cmd/tideglass context --kind work.project.start --for-agent codex
+go run ./cmd/tideglass resolve tideglass://intent/work.project.start --json
 ```
 
 The default database lives at `~/.tideglass/tideglass.db`.
+
+## Intent Service
+
+Agents should treat Tideglass as a local intent service, not as a profile-file
+parser. The stable boundary is a URI-addressed request envelope served through
+the CLI, local HTTP, and MCP. Portable files are snapshots of resolved resources,
+not the canonical agent interface.
+
+```sh
+tideglass resolve tideglass://intent/work.project.start --json
+```
+
+The response includes the resolved intent URI, accepted policy-filtered claims,
+unresolved questions, a disclosure policy, action gating, a `sha256:` profile
+hash, and an immutable snapshot ID. Request envelopes and response snapshots are
+stored in the same SQLite database for audit and replay.
+
+Run the local service:
+
+```sh
+export TIDEGLASS_SERVICE_TOKEN="$(openssl rand -hex 32)"
+tideglass serve --addr 127.0.0.1:8765
+curl -s http://127.0.0.1:8765/healthz
+curl -s -H "Authorization: Bearer $TIDEGLASS_SERVICE_TOKEN" \
+  'http://127.0.0.1:8765/resource?uri=tideglass://intent/work.project.start'
+```
+
+Minimal MCP-style one-shot resource reads are available for agent wrappers while
+the long-running MCP server is being built:
+
+```sh
+printf '{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"tideglass://intent/work.project.start"}}' |
+  tideglass mcp --once
+```
+
+The deeper design spec lives at `~/.spec/tideglass-intent-service-mcp.md`. The
+current branch proves the transport and policy boundary; the next step is the v2
+agentic envelope with task mode, autonomy, required slots, commitments, and real
+MCP `resources/*` + `tools/*` support.
 
 ## Review Loop
 

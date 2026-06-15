@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -17,11 +18,14 @@ import (
 	"io"
 	"io/fs"
 	"math"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -30,7 +34,7 @@ import (
 	"github.com/openclaw/crawlkit/vector"
 )
 
-const schemaVersion = 1
+const schemaVersion = 3
 
 type Tideglass struct {
 	store *store.Store
@@ -55,22 +59,25 @@ type AskOptions struct {
 }
 
 type ProfileOptions struct {
-	IntentID string
-	Kind     string
-	ForAgent string
-	Budget   int
+	IntentID         string
+	Kind             string
+	ForAgent         string
+	Budget           int
+	ReviewCandidates bool
 }
 
 type EditOptions struct {
-	ClaimID string
-	Value   string
-	Reason  string
+	ClaimID          string
+	Value            string
+	Reason           string
+	ExpectedRevision *int64
 }
 
 type ReviewOptions struct {
-	ClaimID string
-	Action  string
-	Reason  string
+	ClaimID          string
+	Action           string
+	Reason           string
+	ExpectedRevision *int64
 }
 
 type ExportOptions struct {
@@ -78,6 +85,178 @@ type ExportOptions struct {
 	Kind     string
 	Format   string
 	Out      string
+}
+
+type ResolveOptions struct {
+	Request     IntentRequestEnvelope
+	AllowAction bool
+	NoPersist   bool
+}
+
+type IntentActor struct {
+	Type         string   `json:"type,omitempty"`
+	ID           string   `json:"id,omitempty"`
+	Session      string   `json:"session,omitempty"`
+	TrustTier    string   `json:"trust_tier,omitempty"`
+	Capabilities []string `json:"capabilities,omitempty"`
+}
+
+type IntentTask struct {
+	Goal     string `json:"goal,omitempty"`
+	Mode     string `json:"mode,omitempty"`
+	Stakes   string `json:"stakes,omitempty"`
+	Autonomy string `json:"autonomy,omitempty"`
+	Deadline string `json:"deadline,omitempty"`
+}
+
+type IntentAudience struct {
+	Type      string   `json:"type,omitempty"`
+	ID        string   `json:"id,omitempty"`
+	ShareWith []string `json:"share_with,omitempty"`
+}
+
+func (audience *IntentAudience) UnmarshalJSON(data []byte) error {
+	var label string
+	if err := json.Unmarshal(data, &label); err == nil {
+		audience.Type = strings.TrimSpace(label)
+		audience.ID = ""
+		audience.ShareWith = nil
+		return nil
+	}
+	type audienceAlias IntentAudience
+	var decoded audienceAlias
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&decoded); err != nil {
+		return err
+	}
+	*audience = IntentAudience(decoded)
+	return nil
+}
+
+func (audience IntentAudience) Label() string {
+	if strings.TrimSpace(audience.ID) != "" {
+		return strings.TrimSpace(audience.ID)
+	}
+	if strings.TrimSpace(audience.Type) != "" {
+		return strings.TrimSpace(audience.Type)
+	}
+	return "agent"
+}
+
+type IntentContract struct {
+	Output          string   `json:"output,omitempty"`
+	RequiredSlots   []string `json:"required_slots,omitempty"`
+	OptionalSlots   []string `json:"optional_slots,omitempty"`
+	ConfidenceFloor float64  `json:"confidence_floor,omitempty"`
+	AskStrategy     string   `json:"ask_strategy,omitempty"`
+}
+
+type IntentProof struct {
+	Hash         string   `json:"hash,omitempty"`
+	Commitments  string   `json:"commitments,omitempty"`
+	ZKPredicates []string `json:"zk_predicates,omitempty"`
+}
+
+type IntentFreshness struct {
+	MaxAge                     string `json:"max_age,omitempty"`
+	RequireReviewed            *bool  `json:"require_reviewed,omitempty"`
+	AcceptInferredForQuestions bool   `json:"accept_inferred_for_questions,omitempty"`
+}
+
+type IntentDisclosure struct {
+	Mode             string `json:"mode,omitempty"`
+	AllowValues      *bool  `json:"allow_values,omitempty"`
+	AllowEvidence    bool   `json:"allow_evidence,omitempty"`
+	AllowSensitive   bool   `json:"allow_sensitive,omitempty"`
+	AllowCommitments *bool  `json:"allow_commitments,omitempty"`
+}
+
+type IntentRequestEnvelope struct {
+	SchemaVersion string           `json:"schema_version,omitempty"`
+	RequestID     string           `json:"request_id,omitempty"`
+	URI           string           `json:"uri"`
+	Actor         IntentActor      `json:"actor,omitempty"`
+	Task          IntentTask       `json:"task,omitempty"`
+	Purpose       string           `json:"purpose,omitempty"`
+	Audience      IntentAudience   `json:"audience,omitempty"`
+	Freshness     IntentFreshness  `json:"freshness,omitempty"`
+	Disclosure    IntentDisclosure `json:"disclosure,omitempty"`
+	Contract      IntentContract   `json:"contract,omitempty"`
+	Context       map[string]any   `json:"context,omitempty"`
+	Proof         IntentProof      `json:"proof,omitempty"`
+}
+
+type IntentResponseEnvelope struct {
+	SchemaVersion string                `json:"schema_version"`
+	RequestID     string                `json:"request_id,omitempty"`
+	URI           string                `json:"uri"`
+	ResolvedURI   string                `json:"resolved_uri"`
+	Resource      IntentResource        `json:"resource,omitempty"`
+	Intent        IntentOut             `json:"intent"`
+	Status        string                `json:"status"`
+	Decision      IntentDecision        `json:"decision,omitempty"`
+	ProfileHash   string                `json:"profile_hash,omitempty"`
+	SnapshotID    string                `json:"snapshot_id,omitempty"`
+	Claims        []IntentClaimEnvelope `json:"claims"`
+	Unresolved    []IntentQuestion      `json:"unresolved"`
+	Policy        IntentPolicyEnvelope  `json:"policy"`
+	Commitments   IntentCommitments     `json:"commitments,omitempty"`
+	Links         map[string]string     `json:"links"`
+}
+
+type IntentResource struct {
+	Type    string `json:"type,omitempty"`
+	Kind    string `json:"kind,omitempty"`
+	Title   string `json:"title,omitempty"`
+	Version string `json:"version,omitempty"`
+}
+
+type IntentDecision struct {
+	MayAct          bool   `json:"may_act"`
+	Reason          string `json:"reason,omitempty"`
+	Autonomy        string `json:"autonomy,omitempty"`
+	NeedsUserAnswer bool   `json:"needs_user_answer"`
+}
+
+type IntentCommitments struct {
+	ResponseHash string `json:"response_hash,omitempty"`
+	ClaimRoot    string `json:"claim_root,omitempty"`
+	SnapshotID   string `json:"snapshot_id,omitempty"`
+	Algorithm    string `json:"algorithm,omitempty"`
+}
+
+type IntentClaimEnvelope struct {
+	ID          string   `json:"id,omitempty"`
+	Kind        string   `json:"kind"`
+	Value       string   `json:"value,omitempty"`
+	Confidence  float64  `json:"confidence,omitempty"`
+	Status      string   `json:"status"`
+	SourceMode  string   `json:"source_mode,omitempty"`
+	Sensitivity string   `json:"sensitivity,omitempty"`
+	FreshAt     string   `json:"fresh_at,omitempty"`
+	Commitment  string   `json:"commitment,omitempty"`
+	Evidence    []string `json:"evidence,omitempty"`
+}
+
+type IntentQuestion struct {
+	Kind         string `json:"kind"`
+	Slot         string `json:"slot,omitempty"`
+	Question     string `json:"question"`
+	Priority     string `json:"priority"`
+	BlocksAction bool   `json:"blocks_action,omitempty"`
+	AnswerType   string `json:"answer_type,omitempty"`
+}
+
+type IntentPolicyEnvelope struct {
+	Audience           string   `json:"audience"`
+	DisclosureMode     string   `json:"disclosure_mode"`
+	MayAct             bool     `json:"may_act"`
+	NeedsUserAnswer    bool     `json:"needs_user_answer"`
+	SafeToShare        []string `json:"safe_to_share"`
+	Redacted           []string `json:"redacted"`
+	Freshness          string   `json:"freshness,omitempty"`
+	CapabilityRequired []string `json:"capability_required,omitempty"`
 }
 
 type SourceStatus struct {
@@ -128,13 +307,16 @@ type ExpansionOut struct {
 }
 
 type ClaimOut struct {
-	ID         string   `json:"id"`
-	Kind       string   `json:"kind"`
-	Value      string   `json:"value"`
-	Confidence float64  `json:"confidence"`
-	Status     string   `json:"status"`
-	SourceMode string   `json:"source_mode"`
-	Evidence   []string `json:"evidence,omitempty"`
+	ID           string   `json:"id"`
+	Kind         string   `json:"kind"`
+	Value        string   `json:"value"`
+	Confidence   float64  `json:"confidence"`
+	Status       string   `json:"status"`
+	SourceMode   string   `json:"source_mode"`
+	UpdatedAt    string   `json:"updated_at,omitempty"`
+	Evidence     []string `json:"evidence,omitempty"`
+	ReviewReason string   `json:"review_reason,omitempty"`
+	Revision     int64    `json:"-"`
 }
 
 type EvidenceOut struct {
@@ -162,9 +344,10 @@ type ProfileResult struct {
 }
 
 type EditResult struct {
-	EditID  string `json:"edit_id"`
-	ClaimID string `json:"claim_id"`
-	Value   string `json:"value"`
+	EditID   string `json:"edit_id"`
+	ClaimID  string `json:"claim_id"`
+	Value    string `json:"value"`
+	Revision int64  `json:"revision,omitempty"`
 }
 
 type ReviewResult struct {
@@ -241,6 +424,10 @@ func Open(ctx context.Context, dbPath string) (*Tideglass, error) {
 	}
 	tg := &Tideglass{store: st, db: st.DB(), path: path}
 	if err := tg.ensureEvidenceSearch(ctx); err != nil {
+		_ = st.Close()
+		return nil, err
+	}
+	if err := tg.ensureIntentRequestSchema(ctx); err != nil {
 		_ = st.Close()
 		return nil, err
 	}
@@ -361,7 +548,7 @@ func (t *Tideglass) Ingest(ctx context.Context, opts IngestOptions) (IngestResul
 			if err != nil {
 				return IngestResult{}, err
 			}
-			if _, err := t.db.ExecContext(ctx, `insert or ignore into claim_evidence(claim_id,evidence_id,role) values(?,?,?)`, claimID, evidenceID, "supporting"); err != nil {
+			if err := t.linkClaimEvidence(ctx, claimID, evidenceID, "supporting"); err != nil {
 				return IngestResult{}, err
 			}
 			importedClaims++
@@ -377,7 +564,7 @@ func (t *Tideglass) Ingest(ctx context.Context, opts IngestOptions) (IngestResul
 			return IngestResult{}, err
 		}
 		if claim.EvidenceID != "" {
-			if _, err := t.db.ExecContext(ctx, `insert or ignore into claim_evidence(claim_id,evidence_id,role) values(?,?,?)`, claimID, claim.EvidenceID, "supporting"); err != nil {
+			if err := t.linkClaimEvidence(ctx, claimID, claim.EvidenceID, "supporting"); err != nil {
 				return IngestResult{}, err
 			}
 		}
@@ -436,7 +623,9 @@ func (t *Tideglass) Ask(ctx context.Context, opts AskOptions) (AskResult, error)
 			return AskResult{}, err
 		}
 		if claim.EvidenceID != "" {
-			_, _ = t.db.ExecContext(ctx, `insert or ignore into claim_evidence(claim_id,evidence_id,role) values(?,?,?)`, claimID, claim.EvidenceID, "supporting")
+			if err := t.linkClaimEvidence(ctx, claimID, claim.EvidenceID, "supporting"); err != nil {
+				return AskResult{}, err
+			}
 		}
 		if err := t.embedText(ctx, "claim", claimID, claim.Value); err != nil {
 			return AskResult{}, err
@@ -480,6 +669,13 @@ func (t *Tideglass) Profile(ctx context.Context, opts ProfileOptions) (ProfileRe
 	if err != nil {
 		return ProfileResult{}, err
 	}
+	if opts.ReviewCandidates {
+		reviewClaims, err := t.loadReviewCandidateClaims(ctx, intent.ID)
+		if err != nil {
+			return ProfileResult{}, err
+		}
+		claims = mergeClaimOuts(claims, reviewClaims)
+	}
 	evidence := []EvidenceOut(nil)
 	claims, evidence, err = t.attachClaimEvidence(ctx, claims)
 	if err != nil {
@@ -493,8 +689,238 @@ func (t *Tideglass) Profile(ctx context.Context, opts ProfileOptions) (ProfileRe
 	return result, nil
 }
 
+func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (IntentResponseEnvelope, error) {
+	if opts.NoPersist && opts.AllowAction {
+		return IntentResponseEnvelope{}, errors.New("action authorization requires persisted audit")
+	}
+	request := opts.Request
+	request.Context = cloneContextMap(request.Context)
+	request.URI = strings.TrimSpace(request.URI)
+	startRevision, err := currentRevision(ctx, t.db)
+	if err != nil {
+		return IntentResponseEnvelope{}, err
+	}
+	kind, audienceFromURI, err := parseIntentURI(request.URI)
+	if err != nil {
+		return IntentResponseEnvelope{}, err
+	}
+	if audienceFromURI != "" {
+		request.Audience.Type = audienceFromURI
+		request.Audience.ID = ""
+	}
+	request = normalizeIntentRequest(request)
+	if err := validateIntentRequest(request); err != nil {
+		return IntentResponseEnvelope{}, err
+	}
+	requestID := id("req")
+	if request.Context == nil {
+		request.Context = map[string]any{}
+	}
+	if strings.TrimSpace(request.RequestID) != "" {
+		request.Context["client_request_id"] = strings.TrimSpace(request.RequestID)
+	}
+	request.Context["server_authority"] = map[string]any{
+		"allow_action": opts.AllowAction,
+	}
+	request.RequestID = requestID
+	if !opts.NoPersist {
+		var err error
+		requestID, err = t.persistIntentRequest(ctx, request, requestID)
+		if err != nil {
+			return IntentResponseEnvelope{}, err
+		}
+	}
+	intent, foundIntent, err := t.findIntentForResolve(ctx, kind)
+	if err != nil {
+		return IntentResponseEnvelope{}, err
+	}
+	var claims []ClaimOut
+	var policyFailedClaims []ClaimOut
+	var unresolved []IntentQuestion
+	requireReviewed := true
+	if request.Freshness.RequireReviewed != nil {
+		requireReviewed = *request.Freshness.RequireReviewed
+	}
+	maxAge, err := parseMaxAge(request.Freshness.MaxAge)
+	if err != nil {
+		return IntentResponseEnvelope{}, err
+	}
+	if foundIntent {
+		loaded, err := t.loadClaims(ctx, intent.ID)
+		if err != nil {
+			return IntentResponseEnvelope{}, err
+		}
+		loaded, _, err = t.attachClaimEvidence(ctx, loaded)
+		if err != nil {
+			return IntentResponseEnvelope{}, err
+		}
+		loadedForPolicy := loaded
+		hasScopedActionConstraint := false
+		if request.Task.Mode == "act_gate" {
+			actionGateClaims, err := t.loadActionGateClaims(ctx, intent.ID, kind, request.Contract.RequiredSlots)
+			if err != nil {
+				return IntentResponseEnvelope{}, err
+			}
+			actionGateClaims, _, err = t.attachClaimEvidence(ctx, actionGateClaims)
+			if err != nil {
+				return IntentResponseEnvelope{}, err
+			}
+			loadedForPolicy = mergeClaimOuts(loadedForPolicy, actionGateClaims)
+			_, _, hasScopedActionConstraint = latestMatchingActionConstraint(kind, actionGateClaims, request)
+			claims = eligibleClaimsForRequest(loadedForPolicy, requireReviewed, maxAge)
+			policyFailedClaims = policyFailingClaims(loadedForPolicy, claims)
+			policyFailedClaims = mergeClaimOuts(policyFailedClaims, actionGatePolicyFailingClaims(kind, actionGateClaims, request, maxAge))
+		} else {
+			claims = eligibleClaimsForRequest(loadedForPolicy, requireReviewed, maxAge)
+			policyFailedClaims = policyFailingClaims(loadedForPolicy, claims)
+		}
+		slotClaims := claimsForSlotSatisfaction(kind, loadedForPolicy, request, maxAge)
+		unresolved = unresolvedIntentQuestions(intent.Kind, slotClaims)
+		unresolved = addRequiredSlotQuestions(unresolved, slotClaims, request.Contract.RequiredSlots)
+		if request.Task.Mode == "act_gate" && request.Task.Autonomy == "bounded_act" && !hasScopedActionConstraint {
+			unresolved = append(unresolved, questionForSlot("policy.action.constraints", "critical", true))
+		}
+	} else {
+		intent = IntentOut{Kind: kind, Title: titleForKind(kind)}
+		unresolved = unresolvedIntentQuestions(kind, nil)
+		unresolved = addRequiredSlotQuestions(unresolved, nil, request.Contract.RequiredSlots)
+	}
+	commitments := claimCommitmentsForClaims(claims)
+	filteredClaims, policy := applyIntentPolicy(kind, claims, unresolved, request, opts.AllowAction)
+	filteredClaims = addClaimCommitments(filteredClaims, request, commitments)
+	redactedBlocking := redactedBlockingQuestions(kind, policy.Redacted, request.Contract.RequiredSlots, unresolved, request.Task.Mode)
+	if len(redactedBlocking) > 0 {
+		unresolved = append(unresolved, redactedBlocking...)
+	}
+	var policyFailedBlocking []IntentQuestion
+	if request.Task.Mode == "act_gate" {
+		policyFailedBlocking = policyFailedBlockingQuestions(kind, policyFailedClaims, request, unresolved)
+		if len(policyFailedBlocking) > 0 {
+			unresolved = append(unresolved, policyFailedBlocking...)
+		}
+	}
+	if request.Task.Mode == "act_gate" && len(claims) == 0 && len(policyFailedClaims) > 0 {
+		unresolved = append(unresolved, questionForSlot("policy.claim.review_or_freshness", "critical", true))
+	}
+	if hasCriticalUnresolved(redactedBlocking) || hasRedactedCriticalClaim(kind, policy.Redacted, request.Task.Mode) {
+		policy.NeedsUserAnswer = true
+		policy.MayAct = false
+	}
+	if request.Task.Mode == "act_gate" && len(policyFailedBlocking) > 0 {
+		policy.NeedsUserAnswer = true
+		policy.MayAct = false
+	}
+	if request.Task.Mode == "act_gate" && len(claims) == 0 && len(policyFailedClaims) > 0 {
+		policy.NeedsUserAnswer = true
+		policy.MayAct = false
+	}
+	if !foundIntent {
+		policy.NeedsUserAnswer = true
+		policy.MayAct = false
+	}
+	if request.Task.Mode == "act_gate" && request.Task.Autonomy == "suggest_then_confirm" && !policy.NeedsUserAnswer {
+		unresolved = append(unresolved, questionForSlot("policy.action.confirmation", "critical", true))
+		policy.NeedsUserAnswer = true
+		policy.MayAct = false
+		policy.CapabilityRequired = append(policy.CapabilityRequired, "user_confirmation")
+	}
+	endRevision, err := currentRevision(ctx, t.db)
+	if err != nil {
+		return IntentResponseEnvelope{}, err
+	}
+	if endRevision != startRevision {
+		unresolved = append(unresolved, questionForSlot("policy.action.snapshot", "critical", true))
+		policy.NeedsUserAnswer = true
+		policy.MayAct = false
+		policy.CapabilityRequired = append(policy.CapabilityRequired, "consistent_snapshot")
+	}
+	status := "ready"
+	if !foundIntent || policy.NeedsUserAnswer {
+		status = "partial"
+	}
+	if foundIntent && request.Task.Mode == "act_gate" && !policy.MayAct {
+		status = "partial"
+	}
+	if !foundIntent {
+		status = "missing"
+	}
+	decision := IntentDecision{
+		MayAct:          policy.MayAct,
+		Reason:          decisionReason(foundIntent, policy, request.Task.Mode, request.Task.Autonomy, opts.AllowAction),
+		Autonomy:        request.Task.Autonomy,
+		NeedsUserAnswer: policy.NeedsUserAnswer,
+	}
+	response := IntentResponseEnvelope{
+		SchemaVersion: "tideglass.intent_response.v2",
+		RequestID:     requestID,
+		URI:           "tideglass://v1/intent/" + kind + "/current",
+		ResolvedURI:   "tideglass://v1/profile/me/" + kind + "/current",
+		Resource:      IntentResource{Type: "intent", Kind: kind, Title: intent.Title, Version: "current"},
+		Intent:        intent,
+		Status:        status,
+		Decision:      decision,
+		Claims:        filteredClaims,
+		Unresolved:    unresolved,
+		Policy:        policy,
+		Links:         map[string]string{},
+	}
+	if allowCommitments(request.Disclosure) {
+		response.Commitments = IntentCommitments{
+			ClaimRoot: claimRoot(filteredClaims),
+			Algorithm: "canonical-json-sha256-v1",
+		}
+	}
+	response.ProfileHash = profileHash(response)
+	if allowCommitments(request.Disclosure) {
+		response.Commitments.ResponseHash = response.ProfileHash
+	}
+	if !opts.NoPersist {
+		if response.Decision.MayAct {
+			snapshotID, authorized, err := t.persistAuthorizedProfileSnapshot(ctx, requestID, response, startRevision, request, maxAge)
+			if err != nil {
+				return IntentResponseEnvelope{}, err
+			}
+			if authorized {
+				response.SnapshotID = snapshotID
+				if hasCommitments(response.Commitments) {
+					response.Commitments.SnapshotID = response.SnapshotID
+				}
+				return response, nil
+			}
+			response = failClosedActionSnapshot(response)
+		}
+		response.SnapshotID, err = t.persistProfileSnapshot(ctx, requestID, response)
+		if err != nil {
+			return IntentResponseEnvelope{}, err
+		}
+		if hasCommitments(response.Commitments) {
+			response.Commitments.SnapshotID = response.SnapshotID
+		}
+	}
+	return response, nil
+}
+
+func failClosedActionSnapshot(response IntentResponseEnvelope) IntentResponseEnvelope {
+	response.Unresolved = append(response.Unresolved, questionForSlot("policy.action.snapshot", "critical", true))
+	response.Policy.NeedsUserAnswer = true
+	response.Policy.MayAct = false
+	response.Policy.CapabilityRequired = append(response.Policy.CapabilityRequired, "consistent_snapshot")
+	response.Decision.MayAct = false
+	response.Decision.NeedsUserAnswer = true
+	response.Decision.Reason = "critical_slots_missing"
+	response.Status = "partial"
+	response.SnapshotID = ""
+	response.Commitments.SnapshotID = ""
+	response.ProfileHash = profileHash(response)
+	if hasCommitments(response.Commitments) {
+		response.Commitments.ResponseHash = response.ProfileHash
+	}
+	return response
+}
+
 func (t *Tideglass) EditClaim(ctx context.Context, opts EditOptions) (EditResult, error) {
-	if strings.TrimSpace(opts.ClaimID) == "" {
+	claimID := strings.TrimSpace(opts.ClaimID)
+	if claimID == "" {
 		return EditResult{}, errors.New("claim id is required")
 	}
 	value := strings.TrimSpace(opts.Value)
@@ -503,11 +929,47 @@ func (t *Tideglass) EditClaim(ctx context.Context, opts EditOptions) (EditResult
 	}
 	patch, _ := json.Marshal(map[string]string{"value": value})
 	editID := id("edt")
-	if _, err := t.db.ExecContext(ctx, `insert into edits(id,claim_id,operation,patch_json,reason,created_at) values(?,?,?,?,?,?)`,
-		editID, opts.ClaimID, "supersede", string(patch), opts.Reason, now()); err != nil {
+	tx, err := t.db.BeginTx(ctx, nil)
+	if err != nil {
 		return EditResult{}, err
 	}
-	return EditResult{EditID: editID, ClaimID: opts.ClaimID, Value: value}, nil
+	var currentRevision int64
+	if err := tx.QueryRowContext(ctx, `select revision from claims where id = ?`, claimID).Scan(&currentRevision); err != nil {
+		_ = tx.Rollback()
+		return EditResult{}, err
+	}
+	if opts.ExpectedRevision != nil && currentRevision != *opts.ExpectedRevision {
+		_ = tx.Rollback()
+		return EditResult{}, fmt.Errorf("claim revision changed: got %d, want %d", currentRevision, *opts.ExpectedRevision)
+	}
+	revision, err := nextRevision(ctx, tx)
+	if err != nil {
+		_ = tx.Rollback()
+		return EditResult{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `insert into edits(id,claim_id,operation,patch_json,reason,created_at) values(?,?,?,?,?,?)`,
+		editID, claimID, "supersede", string(patch), opts.Reason, now()); err != nil {
+		_ = tx.Rollback()
+		return EditResult{}, err
+	}
+	res, err := tx.ExecContext(ctx, `update claims set status = 'active', normalized_value = ?, updated_at = ?, revision = ? where id = ? and revision = ?`, normalizeText(value), now(), revision, claimID, currentRevision)
+	if err != nil {
+		_ = tx.Rollback()
+		return EditResult{}, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		_ = tx.Rollback()
+		return EditResult{}, err
+	}
+	if affected == 0 {
+		_ = tx.Rollback()
+		return EditResult{}, fmt.Errorf("claim revision changed: got unknown, want %d", currentRevision)
+	}
+	if err := tx.Commit(); err != nil {
+		return EditResult{}, err
+	}
+	return EditResult{EditID: editID, ClaimID: claimID, Value: value, Revision: revision}, nil
 }
 
 func (t *Tideglass) ReviewClaim(ctx context.Context, opts ReviewOptions) (ReviewResult, error) {
@@ -527,20 +989,46 @@ func (t *Tideglass) ReviewClaim(ctx context.Context, opts ReviewOptions) (Review
 	default:
 		return ReviewResult{}, fmt.Errorf("unsupported review action %q", opts.Action)
 	}
-	res, err := t.db.ExecContext(ctx, `update claims set status = ?, updated_at = ? where id = ?`, status, now(), claimID)
+	tx, err := t.db.BeginTx(ctx, nil)
 	if err != nil {
+		return ReviewResult{}, err
+	}
+	var currentStatus string
+	var currentRevision int64
+	if err := tx.QueryRowContext(ctx, `select status, revision from claims where id = ?`, claimID).Scan(&currentStatus, &currentRevision); err != nil {
+		_ = tx.Rollback()
+		return ReviewResult{}, err
+	}
+	if opts.ExpectedRevision != nil && currentRevision != *opts.ExpectedRevision {
+		_ = tx.Rollback()
+		return ReviewResult{}, fmt.Errorf("claim revision changed: got %d, want %d", currentRevision, *opts.ExpectedRevision)
+	}
+	revision, err := nextRevision(ctx, tx)
+	if err != nil {
+		_ = tx.Rollback()
+		return ReviewResult{}, err
+	}
+	res, err := tx.ExecContext(ctx, `update claims set status = ?, updated_at = ?, revision = ? where id = ? and revision = ? and status = ?`, status, now(), revision, claimID, currentRevision, currentStatus)
+	if err != nil {
+		_ = tx.Rollback()
 		return ReviewResult{}, err
 	}
 	affected, err := res.RowsAffected()
 	if err != nil {
+		_ = tx.Rollback()
 		return ReviewResult{}, err
 	}
 	if affected == 0 {
+		_ = tx.Rollback()
 		return ReviewResult{}, sql.ErrNoRows
 	}
 	patch, _ := json.Marshal(map[string]string{"status": status})
-	if _, err := t.db.ExecContext(ctx, `insert into edits(id,claim_id,operation,patch_json,reason,created_at) values(?,?,?,?,?,?)`,
+	if _, err := tx.ExecContext(ctx, `insert into edits(id,claim_id,operation,patch_json,reason,created_at) values(?,?,?,?,?,?)`,
 		id("edt"), claimID, action, string(patch), opts.Reason, now()); err != nil {
+		_ = tx.Rollback()
+		return ReviewResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
 		return ReviewResult{}, err
 	}
 	return ReviewResult{ClaimID: claimID, Action: action, Status: status}, nil
@@ -742,6 +1230,295 @@ func (t *Tideglass) Doctor(ctx context.Context) (DoctorResult, error) {
 	return DoctorResult{DBPath: t.path, Schema: schemaVersion, Sources: sources.Sources, Checks: checks, GeneratedAt: now(), OverallState: state}, nil
 }
 
+func NewServiceHandler(t *Tideglass) http.Handler {
+	return NewServiceHandlerWithToken(t, os.Getenv("TIDEGLASS_SERVICE_TOKEN"))
+}
+
+func NewServiceHandlerWithToken(t *Tideglass, token string) http.Handler {
+	token = strings.TrimSpace(token)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		if !authorizedHTTPHost(r) {
+			writeHTTPError(w, http.StatusForbidden, "forbidden host")
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, map[string]any{"status": "ok", "schema": schemaVersion})
+	})
+	mux.HandleFunc("/resolve", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		if !authorizedHTTPHost(r) {
+			writeHTTPError(w, http.StatusForbidden, "forbidden host")
+			return
+		}
+		if !authorizedServiceRequest(r, token) {
+			writeHTTPError(w, http.StatusUnauthorized, "missing or invalid service token")
+			return
+		}
+		if !authorizedHTTPWrite(r) {
+			writeHTTPError(w, http.StatusForbidden, "forbidden write")
+			return
+		}
+		defer r.Body.Close()
+		var request IntentRequestEnvelope
+		body := http.MaxBytesReader(w, r.Body, 1<<20)
+		dec := json.NewDecoder(body)
+		dec.UseNumber()
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&request); err != nil {
+			var maxBytesErr *http.MaxBytesError
+			if errors.As(err, &maxBytesErr) {
+				writeHTTPError(w, http.StatusRequestEntityTooLarge, "request body too large")
+				return
+			}
+			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		var trailing any
+		if err := dec.Decode(&trailing); err != io.EOF {
+			writeHTTPError(w, http.StatusBadRequest, "request body must contain exactly one JSON object")
+			return
+		}
+		if err := authorizeHTTPResolveRequest(request); err != nil {
+			writeHTTPError(w, http.StatusForbidden, err.Error())
+			return
+		}
+		response, err := t.ResolveIntent(r.Context(), ResolveOptions{Request: request})
+		if err != nil {
+			writeHTTPError(w, statusForResolveError(err), err.Error())
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, response)
+	})
+	mux.HandleFunc("/resource", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		if !authorizedHTTPHost(r) {
+			writeHTTPError(w, http.StatusForbidden, "forbidden host")
+			return
+		}
+		if !authorizedServiceRequest(r, token) {
+			writeHTTPError(w, http.StatusUnauthorized, "missing or invalid service token")
+			return
+		}
+		uri := r.URL.Query().Get("uri")
+		response, err := t.ResolveIntent(r.Context(), ResolveOptions{Request: IntentRequestEnvelope{URI: uri}, NoPersist: true})
+		if err != nil {
+			writeHTTPError(w, statusForResolveError(err), err.Error())
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, response)
+	})
+	return mux
+}
+
+func HandleMCPOnce(ctx context.Context, t *Tideglass, in io.Reader, out io.Writer) error {
+	var req struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      any             `json:"id,omitempty"`
+		Method  string          `json:"method"`
+		Params  json.RawMessage `json:"params,omitempty"`
+	}
+	const maxMCPInputBytes = 1 << 20
+	data, err := io.ReadAll(io.LimitReader(in, maxMCPInputBytes+1))
+	if err != nil {
+		return writeMCPError(out, nil, -32700, err.Error())
+	}
+	if len(data) > maxMCPInputBytes {
+		return writeMCPError(out, nil, -32700, "mcp input too large")
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(&req); err != nil {
+		return writeMCPError(out, nil, -32700, err.Error())
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		return writeMCPError(out, nil, -32700, "mcp input must contain exactly one JSON-RPC request")
+	}
+	if req.JSONRPC != "2.0" {
+		return writeMCPError(out, req.ID, -32600, "invalid JSON-RPC version")
+	}
+	var result any
+	switch req.Method {
+	case "resources/read":
+		var params struct {
+			URI string `json:"uri"`
+		}
+		if err := decodeJSONUseNumber(req.Params, &params); err != nil {
+			return writeMCPError(out, req.ID, -32602, err.Error())
+		}
+		response, err := t.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{URI: params.URI}, NoPersist: true})
+		if err != nil {
+			return writeMCPError(out, req.ID, -32000, err.Error())
+		}
+		text, err := json.MarshalIndent(response, "", "  ")
+		if err != nil {
+			return writeMCPError(out, req.ID, -32603, err.Error())
+		}
+		result = map[string]any{"contents": []map[string]any{{"uri": params.URI, "mimeType": "application/json", "text": string(text)}}}
+	case "tools/call":
+		var params struct {
+			Name      string                `json:"name"`
+			Arguments IntentRequestEnvelope `json:"arguments"`
+		}
+		if err := decodeJSONUseNumber(req.Params, &params); err != nil {
+			return writeMCPError(out, req.ID, -32602, err.Error())
+		}
+		if params.Name != "tideglass.resolve_intent" {
+			return writeMCPError(out, req.ID, -32601, fmt.Sprintf("unsupported mcp tool %q", params.Name))
+		}
+		if err := authorizeMCPResolveRequest(params.Arguments); err != nil {
+			return writeMCPError(out, req.ID, -32000, err.Error())
+		}
+		response, err := t.ResolveIntent(ctx, ResolveOptions{Request: params.Arguments})
+		if err != nil {
+			return writeMCPError(out, req.ID, -32000, err.Error())
+		}
+		result = map[string]any{"content": []map[string]any{{"type": "text", "text": mustJSONText(response)}}}
+	default:
+		return writeMCPError(out, req.ID, -32601, fmt.Sprintf("unsupported mcp method %q", req.Method))
+	}
+	enc := json.NewEncoder(out)
+	enc.SetIndent("", "  ")
+	return enc.Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": result})
+}
+
+func writeMCPError(out io.Writer, id any, code int, message string) error {
+	enc := json.NewEncoder(out)
+	enc.SetIndent("", "  ")
+	return enc.Encode(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"error": map[string]any{
+			"code":    code,
+			"message": message,
+		},
+	})
+}
+
+func decodeJSONUseNumber(data []byte, value any) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	dec.DisallowUnknownFields()
+	return dec.Decode(value)
+}
+
+func writeHTTPJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(value)
+}
+
+func writeHTTPError(w http.ResponseWriter, status int, message string) {
+	writeHTTPJSON(w, status, map[string]any{"error": message})
+}
+
+func authorizedHTTPHost(r *http.Request) bool {
+	host := r.Host
+	if strings.Contains(host, ":") {
+		if parsedHost, _, err := net.SplitHostPort(host); err == nil {
+			host = parsedHost
+		}
+	}
+	host = strings.Trim(strings.ToLower(host), "[]")
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func authorizedHTTPWrite(r *http.Request) bool {
+	contentType := strings.ToLower(strings.TrimSpace(strings.Split(r.Header.Get("Content-Type"), ";")[0]))
+	if contentType != "application/json" {
+		return false
+	}
+	if strings.EqualFold(r.Header.Get("Sec-Fetch-Site"), "cross-site") {
+		return false
+	}
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin != "" && !strings.HasPrefix(origin, "http://127.0.0.1") && !strings.HasPrefix(origin, "http://localhost") && !strings.HasPrefix(origin, "http://[::1]") {
+		return false
+	}
+	return true
+}
+
+func authorizedServiceRequest(r *http.Request, token string) bool {
+	if token == "" {
+		return false
+	}
+	if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Tideglass-Token")), []byte(token)) == 1 {
+		return true
+	}
+	const prefix = "Bearer "
+	auth := r.Header.Get("Authorization")
+	return strings.HasPrefix(auth, prefix) && subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(auth, prefix)), []byte(token)) == 1
+}
+
+func authorizeHTTPResolveRequest(request IntentRequestEnvelope) error {
+	if request.Disclosure.AllowSensitive {
+		return errors.New("http resolve cannot enable sensitive disclosure without a capability token")
+	}
+	if request.Freshness.RequireReviewed != nil && !*request.Freshness.RequireReviewed {
+		return errors.New("http resolve cannot disable reviewed-claim freshness")
+	}
+	return nil
+}
+
+func authorizeMCPResolveRequest(request IntentRequestEnvelope) error {
+	if request.Disclosure.AllowSensitive {
+		return errors.New("mcp resolve cannot enable sensitive disclosure without trusted server capability")
+	}
+	if request.Freshness.RequireReviewed != nil && !*request.Freshness.RequireReviewed {
+		return errors.New("mcp resolve cannot disable reviewed-claim freshness without trusted server capability")
+	}
+	return nil
+}
+
+func statusForResolveError(err error) int {
+	if isRequestError(err) {
+		return http.StatusBadRequest
+	}
+	return http.StatusInternalServerError
+}
+
+func isRequestError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return strings.Contains(message, "intent request uri is required") ||
+		strings.Contains(message, "unsupported intent uri") ||
+		strings.Contains(message, "unsupported request schema_version") ||
+		strings.Contains(message, "unsupported disclosure mode") ||
+		strings.Contains(message, "unsupported task mode") ||
+		strings.Contains(message, "unsupported autonomy") ||
+		strings.Contains(message, "unsupported proof.hash") ||
+		strings.Contains(message, "unsupported proof.commitments") ||
+		strings.Contains(message, "proof.zk_predicates are not supported") ||
+		strings.Contains(message, "purpose must match task.goal") ||
+		strings.Contains(message, "invalid freshness.max_age")
+}
+
+func mustJSONText(value any) string {
+	data, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return "{}"
+	}
+	return string(data)
+}
+
 func (t *Tideglass) ensureIntent(ctx context.Context, kind, title string) (IntentOut, error) {
 	kind = normalizeKind(kind, "")
 	var existing IntentOut
@@ -775,6 +1552,119 @@ func (t *Tideglass) findIntent(ctx context.Context, intentID, kind string) (Inte
 		return IntentOut{}, err
 	}
 	return intent, nil
+}
+
+func (t *Tideglass) findIntentForResolve(ctx context.Context, kind string) (IntentOut, bool, error) {
+	var intent IntentOut
+	err := t.db.QueryRowContext(ctx, `select id,kind,title from intents where kind = ? and status = 'active' order by updated_at desc limit 1`, kind).Scan(&intent.ID, &intent.Kind, &intent.Title)
+	if err == nil {
+		return intent, true, nil
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return IntentOut{}, false, nil
+	}
+	return IntentOut{}, false, err
+}
+
+func (t *Tideglass) persistIntentRequest(ctx context.Context, request IntentRequestEnvelope, requestID string) (string, error) {
+	actorJSON, err := json.Marshal(request.Actor)
+	if err != nil {
+		return "", err
+	}
+	freshnessJSON, err := json.Marshal(request.Freshness)
+	if err != nil {
+		return "", err
+	}
+	disclosureJSON, err := json.Marshal(request.Disclosure)
+	if err != nil {
+		return "", err
+	}
+	contextJSON, err := json.Marshal(nonNilMap(request.Context))
+	if err != nil {
+		return "", err
+	}
+	requestJSON, err := json.Marshal(request)
+	if err != nil {
+		return "", err
+	}
+	_, err = t.db.ExecContext(ctx, `
+insert into intent_requests(id,uri,actor_json,purpose,audience,freshness_json,disclosure_json,context_json,request_json,created_at)
+values(?,?,?,?,?,?,?,?,?,?)`,
+		requestID, request.URI, string(actorJSON), legacyPurpose(request), request.Audience.Label(), string(freshnessJSON), string(disclosureJSON), string(contextJSON), string(requestJSON), now())
+	return requestID, err
+}
+
+func (t *Tideglass) persistProfileSnapshot(ctx context.Context, requestID string, response IntentResponseEnvelope) (string, error) {
+	return persistProfileSnapshotWith(ctx, t.db, requestID, response)
+}
+
+func (t *Tideglass) persistAuthorizedProfileSnapshot(ctx context.Context, requestID string, response IntentResponseEnvelope, startRevision int64, request IntentRequestEnvelope, maxAge time.Duration) (string, bool, error) {
+	conn, err := t.db.Conn(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `begin immediate`); err != nil {
+		return "", false, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			_, _ = conn.ExecContext(cleanupCtx, `rollback`)
+		}
+	}()
+	endRevision, err := currentRevision(ctx, conn)
+	if err != nil {
+		return "", false, err
+	}
+	if endRevision != startRevision || !deadlineConstraintValid(request.Task.Deadline, request.Task.Deadline) || responseClaimsStale(response.Claims, maxAge) {
+		return "", false, nil
+	}
+	snapshotID, err := persistProfileSnapshotWith(ctx, conn, requestID, response)
+	if err != nil {
+		return "", false, err
+	}
+	if _, err := conn.ExecContext(ctx, `commit`); err != nil {
+		return "", false, err
+	}
+	committed = true
+	return snapshotID, true, nil
+}
+
+type snapshotExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func persistProfileSnapshotWith(ctx context.Context, execer snapshotExecer, requestID string, response IntentResponseEnvelope) (string, error) {
+	snapshotID := id("snap")
+	response.SnapshotID = snapshotID
+	if hasCommitments(response.Commitments) {
+		response.Commitments.SnapshotID = snapshotID
+	}
+	responseJSON, err := json.Marshal(response)
+	if err != nil {
+		return "", err
+	}
+	intentID := response.Intent.ID
+	_, err = execer.ExecContext(ctx, `
+insert into profile_snapshots(id,request_id,uri,resolved_uri,intent_id,response_json,profile_hash,created_at)
+values(?,?,?,?,?,?,?,?)`,
+		snapshotID, requestID, response.URI, response.ResolvedURI, intentID, string(responseJSON), response.ProfileHash, now())
+	return snapshotID, err
+}
+
+func responseClaimsStale(claims []IntentClaimEnvelope, maxAge time.Duration) bool {
+	if maxAge <= 0 {
+		return false
+	}
+	for _, claim := range claims {
+		if claim.FreshAt == "" || claimStale(ClaimOut{UpdatedAt: claim.FreshAt}, maxAge) {
+			return true
+		}
+	}
+	return false
 }
 
 func (t *Tideglass) upsertSource(ctx context.Context, source SourceStatus) error {
@@ -901,12 +1791,89 @@ func (t *Tideglass) insertClaim(ctx context.Context, intentID string, claim cand
 	if sourceMode == "" {
 		sourceMode = "inferred"
 	}
+	tx, err := t.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	revision, err := nextRevision(ctx, tx)
+	if err != nil {
+		_ = tx.Rollback()
+		return "", err
+	}
 	claimID := id("clm")
-	_, err := t.db.ExecContext(ctx, `
-insert into claims(id,intent_id,subject,kind,value,normalized_value,polarity,scope,status,source_mode,confidence,created_at,updated_at)
-values(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		claimID, intentID, "user", claim.Kind, claim.Value, normalizeText(claim.Value), "neutral", "", "active", sourceMode, claim.Confidence, now(), now())
-	return claimID, err
+	_, err = tx.ExecContext(ctx, `
+insert into claims(id,intent_id,subject,kind,value,normalized_value,polarity,scope,status,source_mode,confidence,created_at,updated_at,revision)
+values(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		claimID, intentID, "user", claim.Kind, claim.Value, normalizeText(claim.Value), "neutral", "", "active", sourceMode, claim.Confidence, now(), now(), revision)
+	if err != nil {
+		_ = tx.Rollback()
+		return "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	return claimID, nil
+}
+
+type revisionExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func nextRevision(ctx context.Context, execer revisionExecer) (int64, error) {
+	result, err := execer.ExecContext(ctx, `insert into revisions default values`)
+	if err != nil {
+		return 0, err
+	}
+	return result.LastInsertId()
+}
+
+func (t *Tideglass) linkClaimEvidence(ctx context.Context, claimID, evidenceID, role string) error {
+	tx, err := t.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `insert or ignore into claim_evidence(claim_id,evidence_id,role) values(?,?,?)`, claimID, evidenceID, role)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if affected == 0 {
+		return tx.Commit()
+	}
+	if _, err := nextRevision(ctx, tx); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+func currentRevision(ctx context.Context, queryer interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}) (int64, error) {
+	var revision int64
+	if err := queryer.QueryRowContext(ctx, `select coalesce(max(id), 0) from revisions`).Scan(&revision); err != nil {
+		return 0, err
+	}
+	return revision, nil
+}
+
+type observedRevision struct {
+	id        string
+	revision  int64
+	updatedAt string
+	ok        bool
+}
+
+func recordLatestRevision(revisions map[string]observedRevision, key string, revision int64, updatedAt, id string) {
+	current := revisions[key]
+	if !current.ok || revision > current.revision || (revision == current.revision && timestampAfter(updatedAt, current.updatedAt)) || (revision == current.revision && updatedAt == current.updatedAt && id > current.id) {
+		revisions[key] = observedRevision{id: id, revision: revision, updatedAt: updatedAt, ok: true}
+	}
 }
 
 func (t *Tideglass) loadClaims(ctx context.Context, intentID string) ([]ClaimOut, error) {
@@ -914,13 +1881,14 @@ func (t *Tideglass) loadClaims(ctx context.Context, intentID string) ([]ClaimOut
 select c.id, c.kind,
        coalesce(json_extract(e.patch_json, '$.value'), c.value) as value,
        c.confidence, c.status, c.source_mode,
-       c.created_at, c.updated_at,
-       case when e.id is null then 0 else 1 end as has_value_edit
+       c.created_at, c.updated_at, coalesce(e.created_at, ''),
+       case when e.id is null then 0 else 1 end as has_value_edit,
+       c.revision
 from claims c
 left join edits e on e.id = (
   select id from edits
   where claim_id = c.id and json_extract(patch_json, '$.value') is not null
-  order by created_at desc, rowid desc limit 1
+  order by rowid desc limit 1
 )
 where c.intent_id = ?
 order by c.created_at desc`, intentID)
@@ -939,10 +1907,15 @@ order by c.created_at desc`, intentID)
 	for rows.Next() {
 		var claim materializedClaim
 		var hasValueEdit int
-		if err := rows.Scan(&claim.ID, &claim.Kind, &claim.Value, &claim.Confidence, &claim.Status, &claim.SourceMode, &claim.CreatedAt, &claim.UpdatedAt, &hasValueEdit); err != nil {
+		var valueEditCreatedAt string
+		if err := rows.Scan(&claim.ID, &claim.Kind, &claim.Value, &claim.Confidence, &claim.Status, &claim.SourceMode, &claim.CreatedAt, &claim.UpdatedAt, &valueEditCreatedAt, &hasValueEdit, &claim.Revision); err != nil {
 			return nil, err
 		}
+		if timestampAfter(valueEditCreatedAt, claim.UpdatedAt) {
+			claim.UpdatedAt = valueEditCreatedAt
+		}
 		claim.HasValueEdit = hasValueEdit == 1
+		claim.ClaimOut.UpdatedAt = claim.UpdatedAt
 		claim.Normalized = normalizeText(claim.Value)
 		rowsOut = append(rowsOut, claim)
 	}
@@ -964,7 +1937,7 @@ order by c.created_at desc`, intentID)
 			return rank(left.Status) > rank(right.Status)
 		}
 		if left.UpdatedAt != right.UpdatedAt {
-			return left.UpdatedAt > right.UpdatedAt
+			return timestampAfter(left.UpdatedAt, right.UpdatedAt)
 		}
 		if left.HasValueEdit != right.HasValueEdit {
 			return left.HasValueEdit
@@ -1017,6 +1990,225 @@ order by c.created_at desc`, intentID)
 		claims = append(claims, claim.ClaimOut)
 	}
 	return claims, nil
+}
+
+func (t *Tideglass) loadActionGateClaims(ctx context.Context, intentID, intentKind string, requiredSlots []string) ([]ClaimOut, error) {
+	blocking := criticalClaimKinds(intentKind)
+	for _, slot := range requiredSlots {
+		if strings.TrimSpace(slot) != "" {
+			blocking[strings.TrimSpace(slot)] = true
+		}
+	}
+	rows, err := t.db.QueryContext(ctx, `
+select c.id, c.kind,
+       coalesce(json_extract(e.patch_json, '$.value'), c.value) as value,
+       c.normalized_value, c.confidence, c.status, c.source_mode,
+       c.updated_at, coalesce(e.created_at, ''), c.revision
+from claims c
+left join edits e on e.id = (
+  select id from edits
+  where claim_id = c.id and json_extract(patch_json, '$.value') is not null
+  order by rowid desc limit 1
+)
+where c.intent_id = ?
+order by c.created_at desc`, intentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var claims []ClaimOut
+	bestAcceptedSingleton := map[string]observedRevision{}
+	actionGateClaimRevisions := map[string]int64{}
+	bestAcceptedDuplicate := map[string]observedRevision{}
+	bestRejectedDuplicate := map[string]observedRevision{}
+	actionGateClaimKeys := map[string]string{}
+	for rows.Next() {
+		var claim ClaimOut
+		var normalized string
+		var valueEditCreatedAt string
+		var revision int64
+		if err := rows.Scan(&claim.ID, &claim.Kind, &claim.Value, &normalized, &claim.Confidence, &claim.Status, &claim.SourceMode, &claim.UpdatedAt, &valueEditCreatedAt, &revision); err != nil {
+			return nil, err
+		}
+		if !blocking[claim.Kind] && !strings.HasPrefix(claim.Kind, "boundary.") && !actionConstraintClaimKind(claim.Kind) {
+			continue
+		}
+		if timestampAfter(valueEditCreatedAt, claim.UpdatedAt) {
+			claim.UpdatedAt = valueEditCreatedAt
+		}
+		claim.Revision = revision
+		normalized = losslessClaimValueKey(claim.Value)
+		duplicateKey := claim.Kind + "\x00" + normalized
+		if singletonClaimKind(claim.Kind) && claim.Status == "accepted" {
+			recordLatestRevision(bestAcceptedSingleton, claim.Kind, revision, claim.UpdatedAt, claim.ID)
+		}
+		if claim.Status == "accepted" {
+			recordLatestRevision(bestAcceptedDuplicate, duplicateKey, revision, claim.UpdatedAt, claim.ID)
+		}
+		if claim.Status == "rejected" {
+			recordLatestRevision(bestRejectedDuplicate, duplicateKey, revision, claim.UpdatedAt, claim.ID)
+		}
+		claims = append(claims, claim)
+		actionGateClaimRevisions[claim.ID] = revision
+		actionGateClaimKeys[claim.ID] = duplicateKey
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	out := make([]ClaimOut, 0, len(claims))
+	for _, claim := range claims {
+		revision := actionGateClaimRevisions[claim.ID]
+		duplicateAcceptedRevision := bestAcceptedDuplicate[actionGateClaimKeys[claim.ID]]
+		if duplicateAcceptedRevision.ok && (claim.Status != "accepted" || revision < duplicateAcceptedRevision.revision) {
+			continue
+		}
+		if duplicateAcceptedRevision.ok && claim.Status == "accepted" && revision == duplicateAcceptedRevision.revision {
+			if timestampAfter(duplicateAcceptedRevision.updatedAt, claim.UpdatedAt) || (duplicateAcceptedRevision.updatedAt == claim.UpdatedAt && claim.ID != duplicateAcceptedRevision.id) {
+				continue
+			}
+		}
+		duplicateRejectedRevision := bestRejectedDuplicate[actionGateClaimKeys[claim.ID]]
+		if duplicateRejectedRevision.ok && claim.Status != "accepted" {
+			if claim.Status == "rejected" {
+				continue
+			}
+			if revision < duplicateRejectedRevision.revision || (revision == duplicateRejectedRevision.revision && !timestampAfter(claim.UpdatedAt, duplicateRejectedRevision.updatedAt)) {
+				continue
+			}
+		}
+		singletonAcceptedRevision := bestAcceptedSingleton[claim.Kind]
+		if singletonClaimKind(claim.Kind) && singletonAcceptedRevision.ok && claim.Status == "accepted" {
+			if revision < singletonAcceptedRevision.revision || (revision == singletonAcceptedRevision.revision && timestampAfter(singletonAcceptedRevision.updatedAt, claim.UpdatedAt)) {
+				continue
+			}
+			if revision == singletonAcceptedRevision.revision && singletonAcceptedRevision.updatedAt == claim.UpdatedAt && claim.ID != singletonAcceptedRevision.id {
+				claim.Status = "active"
+			}
+		}
+		if singletonClaimKind(claim.Kind) && singletonAcceptedRevision.ok && claim.Status != "accepted" {
+			if revision < singletonAcceptedRevision.revision || (revision == singletonAcceptedRevision.revision && timestampAfter(singletonAcceptedRevision.updatedAt, claim.UpdatedAt)) {
+				continue
+			}
+		}
+		out = append(out, claim)
+	}
+	return out, nil
+}
+
+func (t *Tideglass) loadReviewCandidateClaims(ctx context.Context, intentID string) ([]ClaimOut, error) {
+	rows, err := t.db.QueryContext(ctx, `
+select c.id, c.kind,
+       coalesce(json_extract(e.patch_json, '$.value'), c.value) as value,
+       c.confidence, c.status, c.source_mode,
+       c.created_at, c.updated_at, coalesce(e.created_at, ''),
+       case when e.id is null then 0 else 1 end as has_value_edit,
+       c.revision
+from claims c
+left join edits e on e.id = (
+  select id from edits
+  where claim_id = c.id and json_extract(patch_json, '$.value') is not null
+  order by rowid desc limit 1
+)
+where c.intent_id = ?
+order by c.created_at desc`, intentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	type materializedReviewClaim struct {
+		ClaimOut
+		CreatedAt    string
+		UpdatedAt    string
+		HasValueEdit bool
+		Normalized   string
+	}
+	var rowsOut []materializedReviewClaim
+	for rows.Next() {
+		var claim materializedReviewClaim
+		var valueEditCreatedAt string
+		var hasValueEdit int
+		var revision int64
+		if err := rows.Scan(&claim.ID, &claim.Kind, &claim.Value, &claim.Confidence, &claim.Status, &claim.SourceMode, &claim.CreatedAt, &claim.UpdatedAt, &valueEditCreatedAt, &hasValueEdit, &revision); err != nil {
+			return nil, err
+		}
+		if !singletonClaimKind(claim.Kind) {
+			continue
+		}
+		if timestampAfter(valueEditCreatedAt, claim.UpdatedAt) {
+			claim.UpdatedAt = valueEditCreatedAt
+		}
+		claim.Revision = revision
+		claim.HasValueEdit = hasValueEdit == 1
+		claim.ClaimOut.UpdatedAt = claim.UpdatedAt
+		claim.Normalized = losslessClaimValueKey(claim.Value)
+		rowsOut = append(rowsOut, claim)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	decisionRank := func(status string) int {
+		switch status {
+		case "accepted":
+			return 3
+		case "rejected":
+			return 2
+		default:
+			return 1
+		}
+	}
+	prefer := func(left, right materializedReviewClaim) bool {
+		if decisionRank(left.Status) != decisionRank(right.Status) {
+			return decisionRank(left.Status) > decisionRank(right.Status)
+		}
+		if left.UpdatedAt != right.UpdatedAt {
+			return timestampAfter(left.UpdatedAt, right.UpdatedAt)
+		}
+		if left.HasValueEdit != right.HasValueEdit {
+			return left.HasValueEdit
+		}
+		if left.Confidence != right.Confidence {
+			return left.Confidence > right.Confidence
+		}
+		return left.CreatedAt > right.CreatedAt
+	}
+	sort.SliceStable(rowsOut, func(leftIndex, rightIndex int) bool {
+		return prefer(rowsOut[leftIndex], rowsOut[rightIndex])
+	})
+	duplicateSeen := map[string]bool{}
+	var deduped []materializedReviewClaim
+	for _, claim := range rowsOut {
+		key := claim.Kind + "\x00" + claim.Normalized
+		if duplicateSeen[key] {
+			continue
+		}
+		duplicateSeen[key] = true
+		deduped = append(deduped, claim)
+	}
+	bestAcceptedSingleton := map[string]observedRevision{}
+	for _, claim := range deduped {
+		if claim.Status == "accepted" {
+			recordLatestRevision(bestAcceptedSingleton, claim.Kind, claim.Revision, claim.UpdatedAt, claim.ID)
+		}
+	}
+	out := make([]ClaimOut, 0, len(deduped))
+	for _, claim := range deduped {
+		acceptedRevision := bestAcceptedSingleton[claim.Kind]
+		if claim.Status == "accepted" && acceptedRevision.ok && claim.ID != acceptedRevision.id && claim.Revision == acceptedRevision.revision && claim.UpdatedAt == acceptedRevision.updatedAt {
+			claim.ReviewReason = "conflict"
+			out = append(out, claim.ClaimOut)
+			continue
+		}
+		if claim.Status != "active" {
+			continue
+		}
+		if acceptedRevision.ok {
+			if claim.Revision < acceptedRevision.revision || (claim.Revision == acceptedRevision.revision && timestampAfter(acceptedRevision.updatedAt, claim.UpdatedAt)) {
+				continue
+			}
+		}
+		out = append(out, claim.ClaimOut)
+	}
+	return out, nil
 }
 
 func (t *Tideglass) attachClaimEvidence(ctx context.Context, claims []ClaimOut) ([]ClaimOut, []EvidenceOut, error) {
@@ -1220,6 +2412,10 @@ func sqliteColumnExists(ctx context.Context, db *sql.DB, table, column string) b
 	return false
 }
 
+func sqliteDuplicateColumnError(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "duplicate column")
+}
+
 func (t *Tideglass) retrieveImported(ctx context.Context, source SourceStatus, query string, limit int) ([]retrievedEvidence, error) {
 	queryText := ftsQuery(query)
 	if queryText == "" {
@@ -1265,6 +2461,107 @@ from evidence e
 join source_artifacts sa on sa.id = e.source_artifact_id
 where e.rowid not in (select rowid from evidence_fts)`)
 	return err
+}
+
+func (t *Tideglass) ensureIntentRequestSchema(ctx context.Context) error {
+	if !sqliteColumnExists(ctx, t.db, "intent_requests", "request_json") {
+		if _, err := t.db.ExecContext(ctx, `alter table intent_requests add column request_json text not null default '{}'`); err != nil {
+			if !sqliteDuplicateColumnError(err) {
+				return err
+			}
+		}
+	}
+	if _, err := t.db.ExecContext(ctx, `create table if not exists revisions (id integer primary key autoincrement)`); err != nil {
+		return err
+	}
+	if _, err := t.db.ExecContext(ctx, `create table if not exists maintenance_tasks (name text primary key, applied_at text not null)`); err != nil {
+		return err
+	}
+	if _, err := t.db.ExecContext(ctx, `create index if not exists idx_edits_claim_id on edits(claim_id)`); err != nil {
+		return err
+	}
+	if _, err := t.db.ExecContext(ctx, `create index if not exists idx_edits_claim_operation on edits(claim_id, operation)`); err != nil {
+		return err
+	}
+	if !sqliteColumnExists(ctx, t.db, "claims", "revision") {
+		if _, err := t.db.ExecContext(ctx, `alter table claims add column revision integer not null default 0`); err != nil {
+			if !sqliteDuplicateColumnError(err) {
+				return err
+			}
+		}
+	}
+	return t.reconcileLegacyReviewedEditsOnce(ctx)
+}
+
+func (t *Tideglass) reconcileLegacyReviewedEditsOnce(ctx context.Context) error {
+	tx, err := t.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	result, err := tx.ExecContext(ctx, `insert or ignore into maintenance_tasks(name, applied_at) values(?, ?)`, "legacy_reviewed_edit_reconciliation_v1", now())
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		committed = true
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `
+update claims
+set status = 'active',
+    updated_at = coalesce((
+      select max(created_at) from edits
+      where edits.claim_id = claims.id and json_extract(patch_json, '$.value') is not null
+    ), updated_at)
+where status in ('accepted', 'rejected')
+  and exists (
+    select 1 from edits value_edits
+    where value_edits.claim_id = claims.id
+      and json_extract(value_edits.patch_json, '$.value') is not null
+      and value_edits.rowid = (
+        select latest_value.rowid from edits latest_value
+        where latest_value.claim_id = claims.id
+          and json_extract(latest_value.patch_json, '$.value') is not null
+        order by latest_value.rowid desc limit 1
+      )
+      and (
+        julianday(value_edits.created_at) > coalesce((
+          select max(julianday(review_edits.created_at)) from edits review_edits
+          where review_edits.claim_id = claims.id and review_edits.operation in ('accept', 'reject')
+        ), 0)
+        or (
+          julianday(value_edits.created_at) = coalesce((
+            select max(julianday(review_edits.created_at)) from edits review_edits
+            where review_edits.claim_id = claims.id and review_edits.operation in ('accept', 'reject')
+          ), 0)
+          and value_edits.rowid > coalesce((
+            select latest_review.rowid from edits latest_review
+            where latest_review.claim_id = claims.id and latest_review.operation in ('accept', 'reject')
+            order by latest_review.rowid desc limit 1
+          ), 0)
+        )
+      )
+  )`); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	committed = true
+	return nil
 }
 
 func discoverStaticSources() []SourceStatus {
@@ -1859,6 +3156,1084 @@ func unresolvedQuestions(kind string, claims []ClaimOut) []string {
 	return out
 }
 
+func unresolvedIntentQuestions(kind string, claims []ClaimOut) []IntentQuestion {
+	have := map[string]bool{}
+	for _, claim := range claims {
+		have[claim.Kind] = true
+	}
+	need := map[string][]struct {
+		Kind     string
+		Question string
+		Priority string
+	}{
+		"social.dinner": {
+			{"preference.food.allergy", "Any allergies or hard dietary restrictions?", "critical"},
+			{"preference.food.budget", "What dinner budget range is comfortable?", "normal"},
+			{"preference.social.group_size", "What group size feels good with strangers?", "normal"},
+			{"boundary.social.topic", "Any topics to avoid with strangers?", "normal"},
+		},
+		"social.dating": {
+			{"preference.dating.relationship_goal", "What relationship goal should be explicit?", "critical"},
+			{"boundary.dating.dealbreaker", "What dealbreakers should never be inferred?", "critical"},
+			{"boundary.dating.safety", "What safety boundaries should be explicit?", "critical"},
+		},
+		"work.new_job": {
+			{"preference.work.communication", "What communication cadence should a new team know?", "normal"},
+			{"boundary.work.focus_time", "What focus-time boundaries matter?", "normal"},
+		},
+		"work.project.start": {
+			{"boundary.project.no_go", "Any project-specific no-go areas?", "normal"},
+			{"context.project.related_repos", "Which repos are definitely in scope?", "normal"},
+		},
+	}
+	rows := need[kind]
+	if len(rows) == 0 && strings.HasPrefix(kind, "work.") {
+		rows = need["work.project.start"]
+	}
+	out := make([]IntentQuestion, 0, len(rows))
+	for _, row := range rows {
+		if !have[row.Kind] {
+			question := IntentQuestion{
+				Kind:     row.Kind,
+				Slot:     row.Kind,
+				Question: row.Question,
+				Priority: row.Priority,
+			}
+			question.BlocksAction = question.Priority == "critical"
+			question.AnswerType = "short_text"
+			out = append(out, question)
+		}
+	}
+	return out
+}
+
+func legacyPurpose(request IntentRequestEnvelope) string {
+	if strings.TrimSpace(request.Purpose) != "" {
+		return strings.TrimSpace(request.Purpose)
+	}
+	return strings.TrimSpace(request.Task.Goal)
+}
+
+func addRequiredSlotQuestions(unresolved []IntentQuestion, claims []ClaimOut, requiredSlots []string) []IntentQuestion {
+	if len(requiredSlots) == 0 {
+		return unresolved
+	}
+	haveClaims := map[string]bool{}
+	for _, claim := range claims {
+		haveClaims[claim.Kind] = true
+	}
+	out := append([]IntentQuestion{}, unresolved...)
+	for _, slot := range requiredSlots {
+		slot = strings.TrimSpace(slot)
+		if slot == "" || haveClaims[slot] {
+			continue
+		}
+		promoted := false
+		for index := range out {
+			if questionSlot(out[index]) == slot {
+				out[index].Priority = "critical"
+				out[index].BlocksAction = true
+				promoted = true
+			}
+		}
+		if promoted {
+			continue
+		}
+		out = append(out, questionForSlot(slot, "critical", true))
+	}
+	return out
+}
+
+func redactedBlockingQuestions(intentKind string, redacted []string, requiredSlots []string, existing []IntentQuestion, taskMode string) []IntentQuestion {
+	if len(redacted) == 0 {
+		return nil
+	}
+	blocking := criticalClaimKinds(intentKind)
+	for _, slot := range requiredSlots {
+		if strings.TrimSpace(slot) != "" {
+			blocking[strings.TrimSpace(slot)] = true
+		}
+	}
+	haveBlockingQuestions := map[string]bool{}
+	for _, question := range existing {
+		haveBlockingQuestions[questionSlot(question)] = question.Priority == "critical" || question.BlocksAction
+	}
+	var out []IntentQuestion
+	for _, kind := range redacted {
+		if actionConstraintClaimKind(kind) && taskMode != "act_gate" {
+			continue
+		}
+		if (blocking[kind] || strings.HasPrefix(kind, "boundary.") || actionConstraintClaimKind(kind)) && !haveBlockingQuestions[kind] {
+			out = append(out, questionForSlot(kind, "critical", true))
+			haveBlockingQuestions[kind] = true
+		}
+	}
+	return out
+}
+
+func policyFailedBlockingQuestions(intentKind string, claims []ClaimOut, request IntentRequestEnvelope, existing []IntentQuestion) []IntentQuestion {
+	if len(claims) == 0 {
+		return nil
+	}
+	blocking := criticalClaimKinds(intentKind)
+	for _, slot := range request.Contract.RequiredSlots {
+		if strings.TrimSpace(slot) != "" {
+			blocking[strings.TrimSpace(slot)] = true
+		}
+	}
+	haveBlockingQuestions := map[string]bool{}
+	for _, question := range existing {
+		haveBlockingQuestions[questionSlot(question)] = question.Priority == "critical" || question.BlocksAction
+	}
+	var out []IntentQuestion
+	for _, claim := range claims {
+		slot := claim.Kind
+		if !actionConstraintClaimKind(claim.Kind) && shouldRedactClaim(request.Disclosure, claimSensitivity(claim.Kind)) {
+			slot = "policy.sensitive_disclosure"
+		}
+		if (blocking[claim.Kind] || strings.HasPrefix(claim.Kind, "boundary.") || actionConstraintClaimKind(claim.Kind)) && !haveBlockingQuestions[slot] {
+			out = append(out, questionForSlot(slot, "critical", true))
+			haveBlockingQuestions[slot] = true
+		}
+	}
+	return out
+}
+
+func questionForSlot(slot, priority string, blocksAction bool) IntentQuestion {
+	return IntentQuestion{
+		Kind:         slot,
+		Slot:         slot,
+		Question:     defaultSlotQuestion(slot),
+		Priority:     priority,
+		BlocksAction: blocksAction,
+		AnswerType:   "short_text",
+	}
+}
+
+func defaultSlotQuestion(slot string) string {
+	switch slot {
+	case "preference.food.allergy":
+		return "Any allergies or hard dietary restrictions?"
+	case "preference.food.dietary_restriction":
+		return "Any dietary restrictions?"
+	case "preference.budget.restaurant", "preference.food.budget":
+		return "What budget range is comfortable?"
+	case "policy.action.confirmation":
+		return "Confirm this suggested action before Tideglass treats it as approved."
+	case "policy.action.snapshot":
+		return "Retry after Tideglass resolves a consistent action-policy snapshot."
+	default:
+		return "What should Tideglass know for " + slot + "?"
+	}
+}
+
+func questionSlot(question IntentQuestion) string {
+	if question.Slot != "" {
+		return question.Slot
+	}
+	return question.Kind
+}
+
+func normalizeIntentRequest(request IntentRequestEnvelope) IntentRequestEnvelope {
+	request.SchemaVersion = strings.TrimSpace(request.SchemaVersion)
+	if request.SchemaVersion == "" {
+		request.SchemaVersion = "tideglass.intent_request.v2"
+	}
+	request.URI = strings.TrimSpace(request.URI)
+	request.Purpose = strings.TrimSpace(request.Purpose)
+	request.Actor.Type = strings.TrimSpace(request.Actor.Type)
+	if request.Actor.Type == "" {
+		request.Actor.Type = "agent"
+	}
+	request.Actor.ID = strings.TrimSpace(request.Actor.ID)
+	if request.Actor.ID == "" {
+		request.Actor.ID = "local"
+	}
+	request.Actor.TrustTier = strings.TrimSpace(request.Actor.TrustTier)
+	if request.Actor.TrustTier == "" {
+		request.Actor.TrustTier = "local"
+	}
+	request.Task.Mode = strings.ToLower(strings.TrimSpace(request.Task.Mode))
+	if request.Task.Mode == "" {
+		request.Task.Mode = "context"
+	}
+	request.Task.Autonomy = strings.ToLower(strings.TrimSpace(request.Task.Autonomy))
+	if request.Task.Autonomy == "" {
+		request.Task.Autonomy = "suggest_only"
+	}
+	request.Task.Goal = strings.TrimSpace(request.Task.Goal)
+	if request.Task.Goal == "" && request.Purpose != "" {
+		request.Task.Goal = request.Purpose
+	}
+	request.Audience.Type = strings.TrimSpace(request.Audience.Type)
+	request.Audience.ID = strings.TrimSpace(request.Audience.ID)
+	if request.Audience.Type == "" && request.Audience.ID == "" {
+		request.Audience.Type = "agent"
+	}
+	request.Disclosure.Mode = strings.ToLower(strings.TrimSpace(request.Disclosure.Mode))
+	if request.Disclosure.Mode == "" {
+		request.Disclosure.Mode = "minimal"
+	}
+	if request.Disclosure.AllowValues == nil {
+		defaultAllowValues := request.Disclosure.Mode != "existence"
+		request.Disclosure.AllowValues = &defaultAllowValues
+	}
+	if request.Disclosure.AllowCommitments == nil {
+		defaultAllowCommitments := true
+		request.Disclosure.AllowCommitments = &defaultAllowCommitments
+	}
+	request.Contract.Output = strings.TrimSpace(request.Contract.Output)
+	if request.Contract.Output == "" {
+		request.Contract.Output = "decision_contract"
+	}
+	request.Proof.Hash = strings.TrimSpace(request.Proof.Hash)
+	if request.Proof.Hash == "" {
+		request.Proof.Hash = "response"
+	}
+	request.Proof.Commitments = strings.TrimSpace(request.Proof.Commitments)
+	if request.Proof.Commitments == "" {
+		request.Proof.Commitments = "per_claim"
+	}
+	sort.Strings(request.Proof.ZKPredicates)
+	if request.Context == nil {
+		request.Context = map[string]any{}
+	}
+	return request
+}
+
+func validateIntentRequest(request IntentRequestEnvelope) error {
+	switch request.SchemaVersion {
+	case "tideglass.intent_request.v2", "tideglass.intent_request.v1", "":
+	default:
+		return fmt.Errorf("unsupported request schema_version %q", request.SchemaVersion)
+	}
+	switch request.Disclosure.Mode {
+	case "full", "minimal", "existence":
+	default:
+		return fmt.Errorf("unsupported disclosure mode %q", request.Disclosure.Mode)
+	}
+	switch request.Task.Mode {
+	case "context", "slot_fill", "act_gate", "compare", "handoff":
+	default:
+		return fmt.Errorf("unsupported task mode %q", request.Task.Mode)
+	}
+	switch request.Task.Autonomy {
+	case "context_only", "suggest_only", "suggest_then_confirm", "bounded_act", "deny":
+	default:
+		return fmt.Errorf("unsupported autonomy %q", request.Task.Autonomy)
+	}
+	if len(request.Proof.ZKPredicates) > 0 {
+		return errors.New("proof.zk_predicates are not supported")
+	}
+	if request.Purpose != "" && request.Task.Goal != "" && request.Purpose != request.Task.Goal {
+		return errors.New("purpose must match task.goal")
+	}
+	if request.Proof.Hash != "response" {
+		return fmt.Errorf("unsupported proof.hash %q", request.Proof.Hash)
+	}
+	if request.Proof.Commitments != "per_claim" {
+		return fmt.Errorf("unsupported proof.commitments %q", request.Proof.Commitments)
+	}
+	return nil
+}
+
+func parseIntentURI(rawURI string) (string, string, error) {
+	uri := strings.TrimSpace(rawURI)
+	if uri == "" {
+		return "", "", errors.New("intent request uri is required")
+	}
+	if !strings.HasPrefix(uri, "tideglass://") {
+		return "", "", fmt.Errorf("unsupported intent uri %q", rawURI)
+	}
+	rest := strings.TrimPrefix(uri, "tideglass://")
+	parts := strings.Split(rest, "/")
+	if len(parts) > 0 && parts[0] == "v1" {
+		if len(parts) > 1 && parts[1] == "v1" {
+			return "", "", fmt.Errorf("unsupported intent uri %q", rawURI)
+		}
+		parts = parts[1:]
+	}
+	switch {
+	case len(parts) == 2 && parts[0] == "intent" && strings.TrimSpace(parts[1]) != "":
+		return normalizeKind(parts[1], ""), "", nil
+	case len(parts) == 3 && parts[0] == "intent" && strings.TrimSpace(parts[1]) != "" && parts[2] == "current":
+		return normalizeKind(parts[1], ""), "", nil
+	case len(parts) == 4 && parts[0] == "profile" && parts[1] == "me" && strings.TrimSpace(parts[2]) != "" && parts[3] == "current":
+		return normalizeKind(parts[2], ""), "", nil
+	case len(parts) == 2 && parts[0] == "unresolved" && strings.TrimSpace(parts[1]) != "":
+		return normalizeKind(parts[1], ""), "", nil
+	case len(parts) == 3 && parts[0] == "disclosure" && strings.TrimSpace(parts[1]) != "" && strings.TrimSpace(parts[2]) != "":
+		return normalizeKind(parts[1], ""), parts[2], nil
+	default:
+		return "", "", fmt.Errorf("unsupported intent uri %q", rawURI)
+	}
+}
+
+func eligibleClaimsForRequest(claims []ClaimOut, requireReviewed bool, maxAge time.Duration) []ClaimOut {
+	out := make([]ClaimOut, 0, len(claims))
+	for _, claim := range claims {
+		if requireReviewed && claim.Status != "accepted" {
+			continue
+		}
+		if maxAge > 0 && claim.UpdatedAt != "" {
+			updatedAt, err := time.Parse(time.RFC3339, claim.UpdatedAt)
+			if err != nil || time.Since(updatedAt) > maxAge {
+				continue
+			}
+		}
+		out = append(out, claim)
+	}
+	return out
+}
+
+func policyFailingClaims(loaded []ClaimOut, eligible []ClaimOut) []ClaimOut {
+	eligibleByID := map[string]bool{}
+	for _, claim := range eligible {
+		eligibleByID[claim.ID] = true
+	}
+	var out []ClaimOut
+	for _, claim := range loaded {
+		if actionConstraintClaimKind(claim.Kind) {
+			continue
+		}
+		if !eligibleByID[claim.ID] {
+			out = append(out, claim)
+		}
+	}
+	return out
+}
+
+func actionGatePolicyFailingClaims(intentKind string, claims []ClaimOut, request IntentRequestEnvelope, maxAge time.Duration) []ClaimOut {
+	blocking := criticalClaimKinds(intentKind)
+	for _, slot := range request.Contract.RequiredSlots {
+		if strings.TrimSpace(slot) != "" {
+			blocking[strings.TrimSpace(slot)] = true
+		}
+	}
+	var out []ClaimOut
+	if latestClaim, latestConstraint, ok := latestMatchingActionConstraint(intentKind, claims, request); ok {
+		if latestClaim.Status != "accepted" || claimStale(latestClaim, maxAge) || belowConfidenceFloor(latestClaim, request) || !latestConstraint.Allow {
+			out = append(out, latestClaim)
+		}
+		for _, claim := range claims {
+			if claim.ID == latestClaim.ID || claim.Revision != latestClaim.Revision || claim.UpdatedAt != latestClaim.UpdatedAt {
+				continue
+			}
+			constraint, ok := matchingActionConstraint(intentKind, claim, request)
+			if !ok {
+				continue
+			}
+			if claim.Status != "accepted" || claimStale(claim, maxAge) || belowConfidenceFloor(claim, request) || !constraint.Allow {
+				out = append(out, claim)
+			}
+		}
+	}
+	for _, claim := range claims {
+		if actionConstraintClaimKind(claim.Kind) {
+			if _, ok := decodeActionConstraint(claim); !ok {
+				out = append(out, claim)
+			}
+			continue
+		}
+		if !blocking[claim.Kind] && !strings.HasPrefix(claim.Kind, "boundary.") {
+			continue
+		}
+		if claim.Status != "accepted" || claimStale(claim, maxAge) || belowConfidenceFloor(claim, request) {
+			out = append(out, claim)
+		}
+	}
+	return out
+}
+
+func hasActionGateConstraint(intentKind string, claims []ClaimOut, request IntentRequestEnvelope, maxAge time.Duration) bool {
+	claim, constraint, ok := latestMatchingActionConstraint(intentKind, claims, request)
+	if !ok {
+		return false
+	}
+	return claim.Status == "accepted" && !claimStale(claim, maxAge) && !belowConfidenceFloor(claim, request) && constraint.Allow
+}
+
+type actionConstraintValue struct {
+	Allow        bool     `json:"allow"`
+	IntentKind   string   `json:"intent_kind"`
+	TaskMode     string   `json:"task_mode"`
+	Autonomy     string   `json:"autonomy"`
+	Goal         string   `json:"goal"`
+	AudienceType string   `json:"audience_type"`
+	AudienceID   string   `json:"audience_id,omitempty"`
+	ShareWith    []string `json:"share_with,omitempty"`
+	Deadline     string   `json:"deadline"`
+	ScopeHash    string   `json:"scope_hash"`
+}
+
+func latestMatchingActionConstraint(intentKind string, claims []ClaimOut, request IntentRequestEnvelope) (ClaimOut, actionConstraintValue, bool) {
+	var latestClaim ClaimOut
+	var latestConstraint actionConstraintValue
+	var found bool
+	for _, claim := range claims {
+		constraint, ok := matchingActionConstraint(intentKind, claim, request)
+		if !ok {
+			continue
+		}
+		if !found || claimNewer(claim, latestClaim) {
+			latestClaim = claim
+			latestConstraint = constraint
+			found = true
+		}
+	}
+	return latestClaim, latestConstraint, found
+}
+
+func matchingActionConstraint(intentKind string, claim ClaimOut, request IntentRequestEnvelope) (actionConstraintValue, bool) {
+	constraint, ok := decodeActionConstraint(claim)
+	if !ok {
+		return actionConstraintValue{}, false
+	}
+	return actionConstraintMatchesRequest(intentKind, constraint, request)
+}
+
+func decodeActionConstraint(claim ClaimOut) (actionConstraintValue, bool) {
+	if !actionConstraintClaimKind(claim.Kind) {
+		return actionConstraintValue{}, false
+	}
+	var constraint actionConstraintValue
+	dec := json.NewDecoder(strings.NewReader(claim.Value))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&constraint); err != nil {
+		return actionConstraintValue{}, false
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		return actionConstraintValue{}, false
+	}
+	return constraint, true
+}
+
+func actionConstraintMatchesRequest(intentKind string, constraint actionConstraintValue, request IntentRequestEnvelope) (actionConstraintValue, bool) {
+	if normalizeKind(constraint.IntentKind, "") != intentKind || strings.TrimSpace(constraint.IntentKind) == "" {
+		return actionConstraintValue{}, false
+	}
+	if !sameRequiredEnumConstraintValue(constraint.TaskMode, request.Task.Mode) {
+		return actionConstraintValue{}, false
+	}
+	if !sameRequiredEnumConstraintValue(constraint.Autonomy, request.Task.Autonomy) {
+		return actionConstraintValue{}, false
+	}
+	if !sameRequiredExactConstraintValue(constraint.Goal, request.Task.Goal) {
+		return actionConstraintValue{}, false
+	}
+	if !sameRequiredExactConstraintValue(constraint.AudienceType, request.Audience.Type) {
+		return actionConstraintValue{}, false
+	}
+	if strings.TrimSpace(constraint.AudienceID) != strings.TrimSpace(request.Audience.ID) {
+		return actionConstraintValue{}, false
+	}
+	if !sameStringSet(constraint.ShareWith, request.Audience.ShareWith) {
+		return actionConstraintValue{}, false
+	}
+	if !deadlineConstraintValid(constraint.Deadline, request.Task.Deadline) {
+		return actionConstraintValue{}, false
+	}
+	if !sameRequiredExactConstraintValue(constraint.ScopeHash, actionScopeHash(request)) {
+		return actionConstraintValue{}, false
+	}
+	return constraint, true
+}
+
+func claimNewer(left, right ClaimOut) bool {
+	if left.Revision != right.Revision {
+		return left.Revision > right.Revision
+	}
+	if timestampAfter(left.UpdatedAt, right.UpdatedAt) {
+		return true
+	}
+	if timestampAfter(right.UpdatedAt, left.UpdatedAt) {
+		return false
+	}
+	return left.ID > right.ID
+}
+
+func sameRequiredEnumConstraintValue(left, right string) bool {
+	left = strings.TrimSpace(left)
+	right = strings.TrimSpace(right)
+	return left != "" && right != "" && strings.EqualFold(left, right)
+}
+
+func sameRequiredExactConstraintValue(left, right string) bool {
+	left = strings.TrimSpace(left)
+	right = strings.TrimSpace(right)
+	return left != "" && right != "" && left == right
+}
+
+func sameStringSet(left, right []string) bool {
+	leftValues := normalizedStringSet(left)
+	rightValues := normalizedStringSet(right)
+	if len(leftValues) != len(rightValues) {
+		return false
+	}
+	for index := range leftValues {
+		if leftValues[index] != rightValues[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizedStringSet(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := map[string]bool{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func deadlineConstraintValid(left, right string) bool {
+	left = strings.TrimSpace(left)
+	right = strings.TrimSpace(right)
+	if left == "" || right == "" || left != right {
+		return false
+	}
+	deadline, err := time.Parse(time.RFC3339Nano, left)
+	if err != nil {
+		return false
+	}
+	return time.Now().Before(deadline)
+}
+
+func actionScopeHash(request IntentRequestEnvelope) string {
+	scope := map[string]any{
+		"actor": map[string]any{
+			"type":         request.Actor.Type,
+			"id":           request.Actor.ID,
+			"session":      request.Actor.Session,
+			"trust_tier":   request.Actor.TrustTier,
+			"capabilities": normalizedStringSet(request.Actor.Capabilities),
+		},
+		"task": map[string]any{
+			"goal":     request.Task.Goal,
+			"mode":     request.Task.Mode,
+			"stakes":   request.Task.Stakes,
+			"autonomy": request.Task.Autonomy,
+			"deadline": request.Task.Deadline,
+		},
+		"purpose": request.Purpose,
+		"audience": map[string]any{
+			"type":       request.Audience.Type,
+			"id":         request.Audience.ID,
+			"share_with": normalizedStringSet(request.Audience.ShareWith),
+		},
+		"contract": map[string]any{
+			"output":           request.Contract.Output,
+			"required_slots":   normalizedStringSet(request.Contract.RequiredSlots),
+			"optional_slots":   normalizedStringSet(request.Contract.OptionalSlots),
+			"confidence_floor": request.Contract.ConfidenceFloor,
+			"ask_strategy":     request.Contract.AskStrategy,
+		},
+		"freshness": map[string]any{
+			"max_age":                       request.Freshness.MaxAge,
+			"require_reviewed":              request.Freshness.RequireReviewed,
+			"accept_inferred_for_questions": request.Freshness.AcceptInferredForQuestions,
+		},
+		"disclosure": map[string]any{
+			"mode":              request.Disclosure.Mode,
+			"allow_values":      request.Disclosure.AllowValues,
+			"allow_evidence":    request.Disclosure.AllowEvidence,
+			"allow_sensitive":   request.Disclosure.AllowSensitive,
+			"allow_commitments": request.Disclosure.AllowCommitments,
+		},
+		"proof": map[string]any{
+			"hash":          request.Proof.Hash,
+			"commitments":   request.Proof.Commitments,
+			"zk_predicates": normalizedStringSet(request.Proof.ZKPredicates),
+		},
+		"context": actionScopeContext(request.Context),
+	}
+	data, _ := json.Marshal(scope)
+	return "sha256:" + hashBytes(data)
+}
+
+func actionScopeContext(contextMap map[string]any) map[string]any {
+	if len(contextMap) == 0 {
+		return map[string]any{}
+	}
+	out := make(map[string]any, len(contextMap))
+	for key, value := range contextMap {
+		if key == "server_authority" || key == "client_request_id" {
+			continue
+		}
+		out[key] = value
+	}
+	return out
+}
+
+func stringSliceContains(rows []string, value string) bool {
+	for _, row := range rows {
+		if row == value {
+			return true
+		}
+	}
+	return false
+}
+
+func mergeClaimOuts(primary []ClaimOut, extra []ClaimOut) []ClaimOut {
+	seen := map[string]int{}
+	out := make([]ClaimOut, 0, len(primary)+len(extra))
+	for _, claim := range primary {
+		seen[claim.ID] = len(out)
+		out = append(out, claim)
+	}
+	for _, claim := range extra {
+		if index, ok := seen[claim.ID]; ok {
+			if out[index].ReviewReason == "" && claim.ReviewReason != "" {
+				out[index].ReviewReason = claim.ReviewReason
+			}
+			continue
+		}
+		seen[claim.ID] = len(out)
+		out = append(out, claim)
+	}
+	return out
+}
+
+func claimsForSlotSatisfaction(intentKind string, claims []ClaimOut, request IntentRequestEnvelope, maxAge time.Duration) []ClaimOut {
+	critical := criticalClaimKinds(intentKind)
+	required := map[string]bool{}
+	for _, slot := range request.Contract.RequiredSlots {
+		if strings.TrimSpace(slot) != "" {
+			required[strings.TrimSpace(slot)] = true
+		}
+	}
+	out := make([]ClaimOut, 0, len(claims))
+	for _, claim := range claims {
+		if claimStale(claim, maxAge) {
+			continue
+		}
+		if request.Task.Mode == "act_gate" && claim.Status != "accepted" {
+			continue
+		}
+		if claim.Status != "accepted" {
+			if !request.Freshness.AcceptInferredForQuestions {
+				continue
+			}
+			if critical[claim.Kind] || required[claim.Kind] {
+				continue
+			}
+		}
+		if belowConfidenceFloor(claim, request) {
+			continue
+		}
+		out = append(out, claim)
+	}
+	return out
+}
+
+func claimStale(claim ClaimOut, maxAge time.Duration) bool {
+	if maxAge <= 0 || claim.UpdatedAt == "" {
+		return false
+	}
+	updatedAt, err := time.Parse(time.RFC3339Nano, claim.UpdatedAt)
+	return err != nil || time.Since(updatedAt) > maxAge
+}
+
+func timestampAfter(left, right string) bool {
+	if left == "" || left == right {
+		return false
+	}
+	if right == "" {
+		return true
+	}
+	leftTime, leftErr := time.Parse(time.RFC3339Nano, left)
+	rightTime, rightErr := time.Parse(time.RFC3339Nano, right)
+	if leftErr == nil && rightErr == nil {
+		return leftTime.After(rightTime)
+	}
+	return left > right
+}
+
+func belowConfidenceFloor(claim ClaimOut, request IntentRequestEnvelope) bool {
+	return request.Contract.ConfidenceFloor > 0 && claim.Confidence < request.Contract.ConfidenceFloor
+}
+
+func losslessClaimValueKey(value string) string {
+	return strings.TrimSpace(value)
+}
+
+func parseMaxAge(value string) (time.Duration, error) {
+	value = strings.TrimSpace(strings.ToLower(value))
+	if value == "" {
+		return 0, nil
+	}
+	if strings.HasSuffix(value, "d") {
+		days, err := strconv.Atoi(strings.TrimSuffix(value, "d"))
+		if err != nil || days <= 0 {
+			return 0, fmt.Errorf("invalid freshness.max_age %q", value)
+		}
+		if int64(days) > math.MaxInt64/int64(24*time.Hour) {
+			return 0, fmt.Errorf("invalid freshness.max_age %q", value)
+		}
+		return time.Duration(days) * 24 * time.Hour, nil
+	}
+	duration, err := time.ParseDuration(value)
+	if err != nil || duration <= 0 {
+		return 0, fmt.Errorf("invalid freshness.max_age %q", value)
+	}
+	return duration, nil
+}
+
+func applyIntentPolicy(intentKind string, claims []ClaimOut, unresolved []IntentQuestion, request IntentRequestEnvelope, allowAction bool) ([]IntentClaimEnvelope, IntentPolicyEnvelope) {
+	freshness := "reviewed"
+	if request.Freshness.RequireReviewed != nil && !*request.Freshness.RequireReviewed {
+		freshness = "unreviewed_allowed"
+	}
+	if request.Freshness.MaxAge != "" {
+		freshness += "_" + request.Freshness.MaxAge
+	}
+	policy := IntentPolicyEnvelope{
+		Audience:        request.Audience.Label(),
+		DisclosureMode:  request.Disclosure.Mode,
+		SafeToShare:     []string{},
+		Redacted:        []string{},
+		NeedsUserAnswer: hasCriticalUnresolved(unresolved),
+		Freshness:       freshness,
+	}
+	out := make([]IntentClaimEnvelope, 0, len(claims))
+	redacted := map[string]bool{}
+	shareable := map[string]bool{}
+	existenceSeen := map[string]bool{}
+	scopeByRelevance := request.Disclosure.Mode == "minimal" || !audienceIsLocal(request.Audience) || !audienceShareTargetsAreLocal(request)
+	addCapability := func(capability string) {
+		if !stringSliceContains(policy.CapabilityRequired, capability) {
+			policy.CapabilityRequired = append(policy.CapabilityRequired, capability)
+		}
+	}
+	for _, claim := range claims {
+		if request.Contract.ConfidenceFloor > 0 && claim.Confidence < request.Contract.ConfidenceFloor {
+			continue
+		}
+		sensitivity := claimSensitivity(claim.Kind)
+		if scopeByRelevance && !claimRelevantToRequest(claim.Kind, request) && !claimRequiredForActionGate(intentKind, claim.Kind, request) {
+			if omittedClaimBlocksReadiness(intentKind, claim.Kind, request) {
+				if shouldRedactClaim(request.Disclosure, sensitivity) {
+					policy.NeedsUserAnswer = true
+					addCapability("sensitive_disclosure")
+				} else {
+					redacted[claim.Kind] = true
+				}
+			}
+			continue
+		}
+		envelope := IntentClaimEnvelope{
+			ID:          claim.ID,
+			Kind:        claim.Kind,
+			Confidence:  claim.Confidence,
+			Status:      claim.Status,
+			SourceMode:  claim.SourceMode,
+			Sensitivity: sensitivity,
+			FreshAt:     claim.UpdatedAt,
+		}
+		if allowClaimValues(request.Disclosure) {
+			envelope.Value = claim.Value
+		}
+		if request.Disclosure.AllowEvidence {
+			envelope.Evidence = claim.Evidence
+		}
+		if shouldRedactClaim(request.Disclosure, sensitivity) {
+			policy.NeedsUserAnswer = true
+			addCapability("sensitive_disclosure")
+			continue
+		}
+		if request.Disclosure.Mode == "existence" {
+			key := claim.Kind + "\x00" + claim.Status
+			if !existenceSeen[key] {
+				out = append(out, existenceClaimEnvelope(claim))
+				existenceSeen[key] = true
+			}
+			shareable[claim.Kind] = true
+			continue
+		}
+		shareable[claim.Kind] = true
+		out = append(out, envelope)
+	}
+	for kind := range shareable {
+		policy.SafeToShare = append(policy.SafeToShare, kind)
+	}
+	for kind := range redacted {
+		policy.Redacted = append(policy.Redacted, kind)
+	}
+	sort.Strings(policy.SafeToShare)
+	sort.Strings(policy.Redacted)
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Kind != out[j].Kind {
+			return out[i].Kind < out[j].Kind
+		}
+		return out[i].ID < out[j].ID
+	})
+	policy.MayAct = !policy.NeedsUserAnswer
+	if request.Task.Mode == "act_gate" && (!allowClaimValues(request.Disclosure) || request.Disclosure.Mode == "existence") {
+		policy.NeedsUserAnswer = true
+		policy.MayAct = false
+	}
+	if !allowAction || request.Task.Mode != "act_gate" || request.Task.Autonomy == "context_only" || request.Task.Autonomy == "suggest_only" || request.Task.Autonomy == "suggest_then_confirm" || request.Task.Autonomy == "deny" {
+		policy.MayAct = false
+	}
+	if request.Task.Mode == "act_gate" && request.Task.Autonomy == "bounded_act" && allowAction && !policy.NeedsUserAnswer && allowClaimValues(request.Disclosure) && request.Disclosure.Mode != "existence" {
+		policy.MayAct = true
+	}
+	return out, policy
+}
+
+func omittedClaimBlocksReadiness(intentKind, kind string, request IntentRequestEnvelope) bool {
+	if criticalClaimKinds(intentKind)[kind] {
+		return true
+	}
+	for _, slot := range request.Contract.RequiredSlots {
+		if kind == strings.TrimSpace(slot) {
+			return true
+		}
+	}
+	return false
+}
+
+func claimRelevantToRequest(kind string, request IntentRequestEnvelope) bool {
+	for _, slot := range request.Contract.RequiredSlots {
+		if kind == strings.TrimSpace(slot) {
+			return true
+		}
+	}
+	for _, slot := range request.Contract.OptionalSlots {
+		if kind == strings.TrimSpace(slot) {
+			return true
+		}
+	}
+	if len(request.Contract.RequiredSlots) > 0 || len(request.Contract.OptionalSlots) > 0 {
+		return false
+	}
+	if !audienceShareTargetsAreLocal(request) {
+		return false
+	}
+	return audienceIsLocal(request.Audience)
+}
+
+func audienceShareTargetsAreLocal(request IntentRequestEnvelope) bool {
+	for _, target := range request.Audience.ShareWith {
+		target = strings.TrimSpace(target)
+		if target == "" || target == "agent" || target == "local" {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func audienceIsLocal(audience IntentAudience) bool {
+	audienceType := strings.TrimSpace(audience.Type)
+	if audienceType != "agent" && audienceType != "local" {
+		return false
+	}
+	audienceID := strings.TrimSpace(audience.ID)
+	return audienceID == "" || audienceID == "agent" || audienceID == "local"
+}
+
+func claimRequiredForActionGate(intentKind, kind string, request IntentRequestEnvelope) bool {
+	return request.Task.Mode == "act_gate" && (strings.HasPrefix(kind, "boundary.") || criticalClaimKinds(intentKind)[kind] || actionConstraintClaimKind(kind))
+}
+
+func actionConstraintClaimKind(kind string) bool {
+	return kind == "policy.action.constraints"
+}
+
+func addClaimCommitments(claims []IntentClaimEnvelope, request IntentRequestEnvelope, commitments map[string]string) []IntentClaimEnvelope {
+	if !allowCommitments(request.Disclosure) {
+		return claims
+	}
+	out := make([]IntentClaimEnvelope, len(claims))
+	for index, claim := range claims {
+		out[index] = claim
+		if claim.ID != "" {
+			out[index].Commitment = commitments[claim.ID]
+		}
+		if out[index].Commitment == "" {
+			out[index].Commitment = commitments[claim.Kind]
+		}
+	}
+	return out
+}
+
+func claimCommitmentsForClaims(claims []ClaimOut) map[string]string {
+	out := map[string]string{}
+	for _, claim := range claims {
+		commitment := claimCommitment(claim)
+		out[claim.ID] = commitment
+		if _, exists := out[claim.Kind]; !exists {
+			out[claim.Kind] = commitment
+		}
+	}
+	return out
+}
+
+func claimCommitment(claim ClaimOut) string {
+	data, _ := json.Marshal(map[string]string{
+		"kind":   claim.Kind,
+		"status": claim.Status,
+		"value":  claim.Value,
+	})
+	return "sha256:" + hashBytes(data)
+}
+
+func hasCommitments(commitments IntentCommitments) bool {
+	return commitments.ResponseHash != "" || commitments.ClaimRoot != "" || commitments.SnapshotID != "" || commitments.Algorithm != ""
+}
+
+func claimRoot(claims []IntentClaimEnvelope) string {
+	commitments := make([]string, 0, len(claims))
+	for _, claim := range claims {
+		if claim.Commitment != "" {
+			commitments = append(commitments, claim.Commitment)
+		}
+	}
+	sort.Strings(commitments)
+	data, _ := json.Marshal(commitments)
+	return "sha256:" + hashBytes(data)
+}
+
+func decisionReason(foundIntent bool, policy IntentPolicyEnvelope, mode, autonomy string, allowAction bool) string {
+	switch {
+	case !foundIntent:
+		return "intent_missing"
+	case policy.NeedsUserAnswer:
+		if mode == "act_gate" && autonomy == "suggest_then_confirm" && stringSliceContains(policy.CapabilityRequired, "user_confirmation") {
+			return "confirmation_required"
+		}
+		return "critical_slots_missing"
+	case !policy.MayAct:
+		if mode == "act_gate" && autonomy == "bounded_act" && !allowAction {
+			return "action_authority_required"
+		}
+		if mode == "act_gate" && autonomy == "suggest_then_confirm" {
+			return "confirmation_required"
+		}
+		return "autonomy_blocks_action"
+	default:
+		return "ready"
+	}
+}
+
+func shouldRedactClaim(disclosure IntentDisclosure, sensitivity string) bool {
+	if disclosure.AllowSensitive {
+		return false
+	}
+	switch sensitivity {
+	case "private", "restricted":
+		return true
+	default:
+		return false
+	}
+}
+
+func allowClaimValues(disclosure IntentDisclosure) bool {
+	return disclosure.AllowValues != nil && *disclosure.AllowValues
+}
+
+func allowCommitments(disclosure IntentDisclosure) bool {
+	return disclosure.AllowCommitments != nil && *disclosure.AllowCommitments && allowClaimValues(disclosure) && disclosure.Mode != "existence"
+}
+
+func existenceClaimEnvelope(claim ClaimOut) IntentClaimEnvelope {
+	return IntentClaimEnvelope{
+		Kind:   claim.Kind,
+		Status: claim.Status,
+	}
+}
+
+func claimSensitivity(kind string) string {
+	switch {
+	case kind == "preference.agent.imported_memory":
+		return "restricted"
+	case strings.HasPrefix(kind, "boundary."):
+		return "private"
+	case strings.HasPrefix(kind, "preference.dating."):
+		return "private"
+	case kind == "preference.food.allergy" || kind == "preference.food.dietary_restriction":
+		return "private"
+	case strings.HasPrefix(kind, "preference.agent."), strings.HasPrefix(kind, "preference.project."):
+		return "normal"
+	case strings.HasPrefix(kind, "preference."), strings.HasPrefix(kind, "context."):
+		return "restricted"
+	default:
+		return "restricted"
+	}
+}
+
+func hasCriticalUnresolved(rows []IntentQuestion) bool {
+	for _, row := range rows {
+		if row.Priority == "critical" {
+			return true
+		}
+	}
+	return false
+}
+
+func hasRedactedCriticalClaim(intentKind string, redacted []string, taskMode string) bool {
+	if len(redacted) == 0 {
+		return false
+	}
+	critical := criticalClaimKinds(intentKind)
+	for _, kind := range redacted {
+		if actionConstraintClaimKind(kind) && taskMode != "act_gate" {
+			continue
+		}
+		if critical[kind] || actionConstraintClaimKind(kind) {
+			return true
+		}
+	}
+	return false
+}
+
+func criticalClaimKinds(intentKind string) map[string]bool {
+	out := map[string]bool{}
+	for _, question := range unresolvedIntentQuestions(intentKind, nil) {
+		if question.Priority == "critical" {
+			out[question.Kind] = true
+		}
+	}
+	return out
+}
+
+func profileHash(response IntentResponseEnvelope) string {
+	response.RequestID = ""
+	response.ProfileHash = ""
+	response.SnapshotID = ""
+	response.Commitments.ResponseHash = ""
+	response.Commitments.SnapshotID = ""
+	data, _ := json.Marshal(response)
+	return "sha256:" + hashBytes(data)
+}
+
+func nonNilMap(value map[string]any) map[string]any {
+	if value == nil {
+		return map[string]any{}
+	}
+	return value
+}
+
+func cloneContextMap(value map[string]any) map[string]any {
+	if value == nil {
+		return nil
+	}
+	out := make(map[string]any, len(value))
+	for key, item := range value {
+		out[key] = item
+	}
+	return out
+}
+
 func singletonClaimKind(kind string) bool {
 	if kind == "preference.agent.imported_memory" {
 		return false
@@ -2103,7 +4478,7 @@ func titleForKind(kind string) string {
 }
 
 func now() string {
-	return time.Now().UTC().Format(time.RFC3339)
+	return time.Now().UTC().Format("2006-01-02T15:04:05.000000000Z")
 }
 
 func id(prefix string) string {
@@ -2625,7 +5000,8 @@ create table if not exists claims (
   valid_from text,
   valid_until text,
   created_at text not null,
-  updated_at text not null
+  updated_at text not null,
+  revision integer not null default 0
 );
 
 create table if not exists claim_evidence (
@@ -2684,8 +5060,45 @@ create table if not exists runs (
   finished_at text
 );
 
+create table if not exists revisions (
+  id integer primary key autoincrement
+);
+
+create table if not exists maintenance_tasks (
+  name text primary key,
+  applied_at text not null
+);
+
+create table if not exists intent_requests (
+  id text primary key,
+  uri text not null,
+  actor_json text not null default '{}',
+  purpose text not null default '',
+  audience text not null default 'agent',
+  freshness_json text not null default '{}',
+  disclosure_json text not null default '{}',
+  context_json text not null default '{}',
+  request_json text not null default '{}',
+  created_at text not null
+);
+
+create table if not exists profile_snapshots (
+  id text primary key,
+  request_id text references intent_requests(id),
+  uri text not null,
+  resolved_uri text not null,
+  intent_id text,
+  response_json text not null,
+  profile_hash text not null,
+  created_at text not null
+);
+
 create index if not exists idx_claims_intent_kind on claims(intent_id, kind);
 create index if not exists idx_claims_scope on claims(scope);
+create index if not exists idx_edits_claim_id on edits(claim_id);
+create index if not exists idx_edits_claim_operation on edits(claim_id, operation);
 create index if not exists idx_evidence_artifact on evidence(source_artifact_id);
 create index if not exists idx_embeddings_owner on embeddings(owner_kind, owner_id);
+create index if not exists idx_intent_requests_uri on intent_requests(uri);
+create index if not exists idx_profile_snapshots_hash on profile_snapshots(profile_hash);
 `

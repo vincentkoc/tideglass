@@ -2,13 +2,19 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/vincentkoc/tideglass/internal/app"
 )
@@ -55,6 +61,12 @@ func run(ctx context.Context, args []string) error {
 		return runDoctor(ctx, args)
 	case "context":
 		return runContext(ctx, args)
+	case "resolve":
+		return runResolve(ctx, args)
+	case "serve":
+		return runServe(ctx, args)
+	case "mcp":
+		return runMCP(ctx, args)
 	case "help", "-h", "--help":
 		usage()
 		return nil
@@ -165,7 +177,7 @@ func runReview(ctx context.Context, args []string) error {
 		return err
 	}
 	defer tg.Close()
-	profile, err := tg.Profile(ctx, app.ProfileOptions{IntentID: *intentID, Kind: *kind})
+	profile, err := tg.Profile(ctx, app.ProfileOptions{IntentID: *intentID, Kind: *kind, ReviewCandidates: true})
 	if err != nil {
 		return err
 	}
@@ -175,7 +187,7 @@ func runReview(ctx context.Context, args []string) error {
 	reader := bufio.NewReader(os.Stdin)
 	reviewed := 0
 	for _, claim := range profile.Claims {
-		if claim.Status == "accepted" && !*all {
+		if claim.Status == "accepted" && claim.ReviewReason != "conflict" && !*all {
 			continue
 		}
 		fmt.Printf("\n%s\n", strings.Repeat("─", 72))
@@ -191,7 +203,8 @@ func runReview(ctx context.Context, args []string) error {
 		}
 		switch strings.TrimSpace(strings.ToLower(answer)) {
 		case "a", "accept":
-			if _, err := tg.ReviewClaim(ctx, app.ReviewOptions{ClaimID: claim.ID, Action: "accept", Reason: "interactive review"}); err != nil {
+			expectedRevision := claim.Revision
+			if _, err := tg.ReviewClaim(ctx, app.ReviewOptions{ClaimID: claim.ID, Action: "accept", Reason: "interactive review", ExpectedRevision: &expectedRevision}); err != nil {
 				return err
 			}
 			reviewed++
@@ -207,16 +220,20 @@ func runReview(ctx context.Context, args []string) error {
 				fmt.Println("skipped empty edit")
 				continue
 			}
-			if _, err := tg.EditClaim(ctx, app.EditOptions{ClaimID: claim.ID, Value: value, Reason: "interactive review edit"}); err != nil {
+			expectedRevision := claim.Revision
+			edit, err := tg.EditClaim(ctx, app.EditOptions{ClaimID: claim.ID, Value: value, Reason: "interactive review edit", ExpectedRevision: &expectedRevision})
+			if err != nil {
 				return err
 			}
-			if _, err := tg.ReviewClaim(ctx, app.ReviewOptions{ClaimID: claim.ID, Action: "accept", Reason: "interactive review edit"}); err != nil {
+			reviewRevision := edit.Revision
+			if _, err := tg.ReviewClaim(ctx, app.ReviewOptions{ClaimID: claim.ID, Action: "accept", Reason: "interactive review edit", ExpectedRevision: &reviewRevision}); err != nil {
 				return err
 			}
 			reviewed++
 			fmt.Println("edited and accepted")
 		case "r", "reject":
-			if _, err := tg.ReviewClaim(ctx, app.ReviewOptions{ClaimID: claim.ID, Action: "reject", Reason: "interactive review"}); err != nil {
+			expectedRevision := claim.Revision
+			if _, err := tg.ReviewClaim(ctx, app.ReviewOptions{ClaimID: claim.ID, Action: "reject", Reason: "interactive review", ExpectedRevision: &expectedRevision}); err != nil {
 				return err
 			}
 			reviewed++
@@ -385,6 +402,121 @@ func runContext(ctx context.Context, args []string) error {
 	return app.Print(result, *jsonOut)
 }
 
+func runResolve(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("resolve", flag.ContinueOnError)
+	requestPath := fs.String("request", "", "request envelope JSON path")
+	jsonOut := fs.Bool("json", false, "write JSON")
+	dbPath := fs.String("db", "", "database path")
+	if err := fs.Parse(normalizeFlagArgs(args)); err != nil {
+		return err
+	}
+	request := app.IntentRequestEnvelope{}
+	if strings.TrimSpace(*requestPath) != "" {
+		data, err := os.ReadFile(expandPath(*requestPath))
+		if err != nil {
+			return err
+		}
+		dec := json.NewDecoder(bytes.NewReader(data))
+		dec.UseNumber()
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&request); err != nil {
+			return err
+		}
+		var trailing any
+		if err := dec.Decode(&trailing); err != io.EOF {
+			return errors.New("request envelope must contain exactly one JSON object")
+		}
+	} else {
+		if fs.NArg() != 1 {
+			return errors.New("resolve requires a tideglass:// URI or --request")
+		}
+		request.URI = fs.Arg(0)
+	}
+	tg, err := app.Open(ctx, *dbPath)
+	if err != nil {
+		return err
+	}
+	defer tg.Close()
+	result, err := tg.ResolveIntent(ctx, app.ResolveOptions{Request: request})
+	if err != nil {
+		return err
+	}
+	return app.Print(result, *jsonOut)
+}
+
+func runServe(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	addr := fs.String("addr", "127.0.0.1:8765", "listen address")
+	dbPath := fs.String("db", "", "database path")
+	if err := fs.Parse(normalizeFlagArgs(args)); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("serve received unexpected positional arguments: %s", strings.Join(fs.Args(), " "))
+	}
+	if err := validateServeAddr(*addr); err != nil {
+		return err
+	}
+	tg, err := app.Open(ctx, *dbPath)
+	if err != nil {
+		return err
+	}
+	defer tg.Close()
+	serviceToken := strings.TrimSpace(os.Getenv("TIDEGLASS_SERVICE_TOKEN"))
+	if serviceToken == "" {
+		return errors.New("serve requires TIDEGLASS_SERVICE_TOKEN")
+	}
+	server := &http.Server{
+		Addr:              *addr,
+		Handler:           app.NewServiceHandlerWithToken(tg, serviceToken),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	fmt.Fprintf(os.Stderr, "tideglass: serving on http://%s\n", *addr)
+	fmt.Fprintln(os.Stderr, "tideglass: requests require Authorization: Bearer <token>")
+	err = server.ListenAndServe()
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
+}
+
+func validateServeAddr(addr string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("invalid serve --addr %q: %w", addr, err)
+	}
+	host = strings.Trim(strings.ToLower(host), "[]")
+	if host == "localhost" {
+		return nil
+	}
+	ip := net.ParseIP(host)
+	if ip != nil && ip.IsLoopback() {
+		return nil
+	}
+	return errors.New("serve --addr must bind to localhost or a loopback IP")
+}
+
+func runMCP(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
+	once := fs.Bool("once", false, "handle one JSON-RPC request on stdin")
+	dbPath := fs.String("db", "", "database path")
+	if err := fs.Parse(normalizeFlagArgs(args)); err != nil {
+		return err
+	}
+	if !*once {
+		return errors.New("mcp currently requires --once")
+	}
+	tg, err := app.Open(ctx, *dbPath)
+	if err != nil {
+		return err
+	}
+	defer tg.Close()
+	return app.HandleMCPOnce(ctx, tg, os.Stdin, os.Stdout)
+}
+
 func usage() {
 	fmt.Fprint(os.Stderr, `usage: tideglass <command> [options]
 
@@ -399,6 +531,9 @@ commands:
   profile export --kind <kind>|--intent <id>
   evidence show <claim-id>
 	  context --kind <kind> --for-agent codex
+	  resolve tideglass://intent/<kind> [--json]
+	  serve [--addr 127.0.0.1:8765]
+	  mcp --once
 	  doctor
 	  version
 	`)
@@ -416,7 +551,9 @@ func normalizeFlagArgs(args []string) []string {
 		"out":       true,
 		"path":      true,
 		"reason":    true,
+		"request":   true,
 		"set":       true,
+		"addr":      true,
 	}
 	var flags []string
 	var positionals []string
