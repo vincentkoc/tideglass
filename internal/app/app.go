@@ -866,7 +866,7 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 	}
 	if !opts.NoPersist {
 		if response.Decision.MayAct {
-			snapshotID, authorized, err := t.persistAuthorizedProfileSnapshot(ctx, requestID, response, startRevision, request)
+			snapshotID, authorized, err := t.persistAuthorizedProfileSnapshot(ctx, requestID, response, startRevision, request, maxAge)
 			if err != nil {
 				return IntentResponseEnvelope{}, err
 			}
@@ -1534,7 +1534,7 @@ func (t *Tideglass) persistProfileSnapshot(ctx context.Context, requestID string
 	return persistProfileSnapshotWith(ctx, t.db, requestID, response)
 }
 
-func (t *Tideglass) persistAuthorizedProfileSnapshot(ctx context.Context, requestID string, response IntentResponseEnvelope, startRevision int64, request IntentRequestEnvelope) (string, bool, error) {
+func (t *Tideglass) persistAuthorizedProfileSnapshot(ctx context.Context, requestID string, response IntentResponseEnvelope, startRevision int64, request IntentRequestEnvelope, maxAge time.Duration) (string, bool, error) {
 	conn, err := t.db.Conn(ctx)
 	if err != nil {
 		return "", false, err
@@ -1553,7 +1553,7 @@ func (t *Tideglass) persistAuthorizedProfileSnapshot(ctx context.Context, reques
 	if err != nil {
 		return "", false, err
 	}
-	if endRevision != startRevision || !deadlineConstraintValid(request.Task.Deadline, request.Task.Deadline) {
+	if endRevision != startRevision || !deadlineConstraintValid(request.Task.Deadline, request.Task.Deadline) || responseClaimsStale(response.Claims, maxAge) {
 		return "", false, nil
 	}
 	snapshotID, err := persistProfileSnapshotWith(ctx, conn, requestID, response)
@@ -1587,6 +1587,18 @@ insert into profile_snapshots(id,request_id,uri,resolved_uri,intent_id,response_
 values(?,?,?,?,?,?,?,?)`,
 		snapshotID, requestID, response.URI, response.ResolvedURI, intentID, string(responseJSON), response.ProfileHash, now())
 	return snapshotID, err
+}
+
+func responseClaimsStale(claims []IntentClaimEnvelope, maxAge time.Duration) bool {
+	if maxAge <= 0 {
+		return false
+	}
+	for _, claim := range claims {
+		if claim.FreshAt == "" || claimStale(ClaimOut{UpdatedAt: claim.FreshAt}, maxAge) {
+			return true
+		}
+	}
+	return false
 }
 
 func (t *Tideglass) upsertSource(ctx context.Context, source SourceStatus) error {
@@ -3291,6 +3303,9 @@ func actionGatePolicyFailingClaims(intentKind string, claims []ClaimOut, request
 	}
 	for _, claim := range claims {
 		if actionConstraintClaimKind(claim.Kind) {
+			if _, ok := decodeActionConstraint(claim); !ok {
+				out = append(out, claim)
+			}
 			continue
 		}
 		if !blocking[claim.Kind] && !strings.HasPrefix(claim.Kind, "boundary.") {
@@ -3343,6 +3358,14 @@ func latestMatchingActionConstraint(intentKind string, claims []ClaimOut, reques
 }
 
 func matchingActionConstraint(intentKind string, claim ClaimOut, request IntentRequestEnvelope) (actionConstraintValue, bool) {
+	constraint, ok := decodeActionConstraint(claim)
+	if !ok {
+		return actionConstraintValue{}, false
+	}
+	return actionConstraintMatchesRequest(intentKind, constraint, request)
+}
+
+func decodeActionConstraint(claim ClaimOut) (actionConstraintValue, bool) {
 	if !actionConstraintClaimKind(claim.Kind) {
 		return actionConstraintValue{}, false
 	}
@@ -3356,6 +3379,10 @@ func matchingActionConstraint(intentKind string, claim ClaimOut, request IntentR
 	if err := dec.Decode(&trailing); err != io.EOF {
 		return actionConstraintValue{}, false
 	}
+	return constraint, true
+}
+
+func actionConstraintMatchesRequest(intentKind string, constraint actionConstraintValue, request IntentRequestEnvelope) (actionConstraintValue, bool) {
 	if normalizeKind(constraint.IntentKind, "") != intentKind || strings.TrimSpace(constraint.IntentKind) == "" {
 		return actionConstraintValue{}, false
 	}
