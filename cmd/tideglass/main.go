@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -415,6 +416,10 @@ func runResolve(ctx context.Context, args []string) error {
 		dec.DisallowUnknownFields()
 		if err := dec.Decode(&request); err != nil {
 			return err
+		}
+		var trailing any
+		if err := dec.Decode(&trailing); err != io.EOF {
+			return errors.New("request envelope must contain exactly one JSON object")
 		}
 	} else {
 		if fs.NArg() != 1 {

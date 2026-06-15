@@ -1455,6 +1455,8 @@ func isRequestError(err error) bool {
 		strings.Contains(message, "unsupported disclosure mode") ||
 		strings.Contains(message, "unsupported task mode") ||
 		strings.Contains(message, "unsupported autonomy") ||
+		strings.Contains(message, "unsupported proof.hash") ||
+		strings.Contains(message, "unsupported proof.commitments") ||
 		strings.Contains(message, "proof.zk_predicates are not supported") ||
 		strings.Contains(message, "invalid freshness.max_age")
 }
@@ -3236,6 +3238,12 @@ func validateIntentRequest(request IntentRequestEnvelope) error {
 	}
 	if len(request.Proof.ZKPredicates) > 0 {
 		return errors.New("proof.zk_predicates are not supported")
+	}
+	if request.Proof.Hash != "response" {
+		return fmt.Errorf("unsupported proof.hash %q", request.Proof.Hash)
+	}
+	if request.Proof.Commitments != "per_claim" {
+		return fmt.Errorf("unsupported proof.commitments %q", request.Proof.Commitments)
 	}
 	return nil
 }

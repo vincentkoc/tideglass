@@ -1774,6 +1774,16 @@ func TestServiceHandlerResolvesIntentResource(t *testing.T) {
 		data, _ := io.ReadAll(unsupportedProofResponse.Body)
 		t.Fatalf("unsupported proof status = %d body=%s", unsupportedProofResponse.StatusCode, data)
 	}
+	unsupportedProofHash := strings.NewReader(`{"uri":"tideglass://disclosure/social.dinner/venue","proof":{"hash":"merkle"}}`)
+	unsupportedProofHashResponse, err := authedHTTP(t, http.MethodPost, server.URL+"/resolve", "application/json", unsupportedProofHash, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unsupportedProofHashResponse.Body.Close()
+	if unsupportedProofHashResponse.StatusCode != http.StatusBadRequest {
+		data, _ := io.ReadAll(unsupportedProofHashResponse.Body)
+		t.Fatalf("unsupported proof hash status = %d body=%s", unsupportedProofHashResponse.StatusCode, data)
+	}
 	bad, err := authedHTTP(t, http.MethodGet, server.URL+"/resource?uri=tideglass://intent/", "", nil, token)
 	defer bad.Body.Close()
 	if bad.StatusCode != http.StatusBadRequest {
