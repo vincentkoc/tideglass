@@ -2031,6 +2031,9 @@ order by c.created_at desc`, intentID)
 			if revision < singletonAcceptedRevision.revision || (revision == singletonAcceptedRevision.revision && timestampAfter(singletonAcceptedRevision.updatedAt, claim.UpdatedAt)) {
 				continue
 			}
+			if revision == singletonAcceptedRevision.revision && singletonAcceptedRevision.updatedAt == claim.UpdatedAt && claim.ID != singletonAcceptedRevision.id {
+				claim.Status = "active"
+			}
 		}
 		if singletonClaimKind(claim.Kind) && singletonAcceptedRevision.ok && claim.Status != "accepted" {
 			if revision < singletonAcceptedRevision.revision || (revision == singletonAcceptedRevision.revision && timestampAfter(singletonAcceptedRevision.updatedAt, claim.UpdatedAt)) {

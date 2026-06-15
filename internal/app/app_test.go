@@ -1615,6 +1615,84 @@ func TestLoadActionGateClaimsDropsTiedAcceptedDuplicates(t *testing.T) {
 	}
 }
 
+func TestResolveIntentActionGateBlocksTiedAcceptedSingletonConflict(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	intent, err := tg.ensureIntent(ctx, "work.project.start", "Project start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "boundary.project.no_go",
+		Value:      "Do not touch production.",
+		Confidence: 0.9,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: firstID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	secondID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "boundary.project.no_go",
+		Value:      "Do not touch billing.",
+		Confidence: 0.95,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: secondID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.db.ExecContext(ctx, `update claims set revision = 0, updated_at = ? where id in (?, ?)`, "2024-01-01T00:00:00Z", firstID, secondID); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano)
+	request := normalizeIntentRequest(IntentRequestEnvelope{
+		URI:        "tideglass://v1/intent/work.project.start/current",
+		Task:       IntentTask{Mode: "act_gate", Autonomy: "bounded_act", Goal: "start project", Deadline: deadline},
+		Disclosure: IntentDisclosure{AllowSensitive: true},
+	})
+	constraintJSON, err := json.Marshal(map[string]any{
+		"allow":         true,
+		"intent_kind":   "work.project.start",
+		"task_mode":     "act_gate",
+		"autonomy":      "bounded_act",
+		"goal":          "start project",
+		"audience_type": "agent",
+		"deadline":      deadline,
+		"scope_hash":    actionScopeHash(request),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	constraintID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "policy.action.constraints",
+		Value:      string(constraintJSON),
+		Confidence: 0.99,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: constraintID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	response, err := tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, Request: request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Decision.MayAct || !response.Decision.NeedsUserAnswer || !hasBlockingQuestionSlot(response.Unresolved, "boundary.project.no_go") {
+		t.Fatalf("tied accepted singleton conflict authorized action: %#v", response)
+	}
+}
+
 func TestLoadReviewCandidateClaimsPreservesDuplicateDecisions(t *testing.T) {
 	ctx := context.Background()
 	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
