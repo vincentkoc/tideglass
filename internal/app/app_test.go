@@ -1025,13 +1025,27 @@ func TestHandleMCPOnceReadsIntentResource(t *testing.T) {
 	}
 	input = strings.NewReader(`{"jsonrpc":"2.0","id":"tool-2","method":"tools/call","params":{"name":"tideglass.resolve_intent","arguments":{"uri":"tideglass://v1/intent/work.project.start/current","disclosure":{"allow_sensitive":true}}}}`)
 	output.Reset()
-	if err := HandleMCPOnce(ctx, tg, input, &output); err == nil {
-		t.Fatal("expected MCP sensitive disclosure without capability to fail")
+	if err := HandleMCPOnce(ctx, tg, input, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), `"error"`) || !strings.Contains(output.String(), `trusted server capability`) {
+		t.Fatalf("expected MCP sensitive disclosure error response: %s", output.String())
 	}
 	input = strings.NewReader(`{"jsonrpc":"2.0","id":"tool-3","method":"tools/call","params":{"name":"tideglass.resolve_intent","arguments":{"uri":"tideglass://v1/intent/work.project.start/current","actor":{"capabilities":["read_sensitive"]},"disclosure":{"allow_sensitive":true}}}}`)
 	output.Reset()
-	if err := HandleMCPOnce(ctx, tg, input, &output); err == nil {
-		t.Fatal("expected self-declared MCP capability to fail")
+	if err := HandleMCPOnce(ctx, tg, input, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), `"error"`) || !strings.Contains(output.String(), `trusted server capability`) {
+		t.Fatalf("expected self-declared MCP capability error response: %s", output.String())
+	}
+	input = strings.NewReader(`{"jsonrpc":"2.0","id":"bad-uri","method":"resources/read","params":{"uri":"tideglass://intent/"}}`)
+	output.Reset()
+	if err := HandleMCPOnce(ctx, tg, input, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), `"id": "bad-uri"`) || !strings.Contains(output.String(), `"error"`) {
+		t.Fatalf("expected correlated MCP resource error response: %s", output.String())
 	}
 }
 

@@ -1171,15 +1171,15 @@ func HandleMCPOnce(ctx context.Context, t *Tideglass, in io.Reader, out io.Write
 			URI string `json:"uri"`
 		}
 		if err := json.Unmarshal(req.Params, &params); err != nil {
-			return err
+			return writeMCPError(out, req.ID, -32602, err.Error())
 		}
 		response, err := t.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{URI: params.URI}, NoPersist: true})
 		if err != nil {
-			return err
+			return writeMCPError(out, req.ID, -32000, err.Error())
 		}
 		text, err := json.MarshalIndent(response, "", "  ")
 		if err != nil {
-			return err
+			return writeMCPError(out, req.ID, -32603, err.Error())
 		}
 		result = map[string]any{"contents": []map[string]any{{"uri": params.URI, "mimeType": "application/json", "text": string(text)}}}
 	case "tools/call":
@@ -1188,25 +1188,38 @@ func HandleMCPOnce(ctx context.Context, t *Tideglass, in io.Reader, out io.Write
 			Arguments IntentRequestEnvelope `json:"arguments"`
 		}
 		if err := json.Unmarshal(req.Params, &params); err != nil {
-			return err
+			return writeMCPError(out, req.ID, -32602, err.Error())
 		}
 		if params.Name != "tideglass.resolve_intent" {
-			return fmt.Errorf("unsupported mcp tool %q", params.Name)
+			return writeMCPError(out, req.ID, -32601, fmt.Sprintf("unsupported mcp tool %q", params.Name))
 		}
 		if err := authorizeMCPResolveRequest(params.Arguments); err != nil {
-			return err
+			return writeMCPError(out, req.ID, -32000, err.Error())
 		}
 		response, err := t.ResolveIntent(ctx, ResolveOptions{Request: params.Arguments})
 		if err != nil {
-			return err
+			return writeMCPError(out, req.ID, -32000, err.Error())
 		}
 		result = map[string]any{"content": []map[string]any{{"type": "text", "text": mustJSONText(response)}}}
 	default:
-		return fmt.Errorf("unsupported mcp method %q", req.Method)
+		return writeMCPError(out, req.ID, -32601, fmt.Sprintf("unsupported mcp method %q", req.Method))
 	}
 	enc := json.NewEncoder(out)
 	enc.SetIndent("", "  ")
 	return enc.Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "result": result})
+}
+
+func writeMCPError(out io.Writer, id any, code int, message string) error {
+	enc := json.NewEncoder(out)
+	enc.SetIndent("", "  ")
+	return enc.Encode(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"error": map[string]any{
+			"code":    code,
+			"message": message,
+		},
+	})
 }
 
 func writeHTTPJSON(w http.ResponseWriter, status int, value any) {

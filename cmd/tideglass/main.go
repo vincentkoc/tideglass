@@ -79,9 +79,6 @@ func runInit(ctx context.Context, args []string) error {
 	if err := fs.Parse(normalizeFlagArgs(args)); err != nil {
 		return err
 	}
-	if fs.NArg() != 0 {
-		return fmt.Errorf("serve received unexpected positional arguments: %s", strings.Join(fs.Args(), " "))
-	}
 	tg, err := app.Open(ctx, *dbPath)
 	if err != nil {
 		return err
@@ -439,6 +436,9 @@ func runServe(ctx context.Context, args []string) error {
 	dbPath := fs.String("db", "", "database path")
 	if err := fs.Parse(normalizeFlagArgs(args)); err != nil {
 		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("serve received unexpected positional arguments: %s", strings.Join(fs.Args(), " "))
 	}
 	if err := validateServeAddr(*addr); err != nil {
 		return err
