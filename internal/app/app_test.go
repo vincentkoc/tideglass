@@ -526,6 +526,17 @@ func TestResolveIntentAppliesPolicyAndPersistsSnapshot(t *testing.T) {
 	if !strings.Contains(requestJSON, "required_slots") || !strings.Contains(requestJSON, "bounded_act") {
 		t.Fatalf("request_json did not preserve v2 envelope: %s", requestJSON)
 	}
+	var snapshotJSON string
+	if err := tg.db.QueryRowContext(ctx, `select response_json from profile_snapshots where id = ?`, first.SnapshotID).Scan(&snapshotJSON); err != nil {
+		t.Fatal(err)
+	}
+	var stored IntentResponseEnvelope
+	if err := json.Unmarshal([]byte(snapshotJSON), &stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.SnapshotID != first.SnapshotID || stored.Commitments.SnapshotID != first.SnapshotID {
+		t.Fatalf("stored snapshot differs from returned envelope: stored=%#v returned=%#v", stored.Commitments, first.Commitments)
+	}
 }
 
 func TestResolveIntentSupportsDisclosureAndMissingIntent(t *testing.T) {
@@ -579,6 +590,18 @@ func TestResolveIntentUnreviewedAndStaleClaimsDoNotSatisfyCriticalSlots(t *testi
 	}
 	if len(response.Claims) != 0 {
 		t.Fatalf("unreviewed claim leaked into default response: %#v", response.Claims)
+	}
+	requireReviewed := false
+	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
+		URI:       "tideglass://intent/social.dinner",
+		Task:      IntentTask{Mode: "act_gate", Autonomy: "bounded_act"},
+		Freshness: IntentFreshness{RequireReviewed: &requireReviewed},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !response.Policy.NeedsUserAnswer || response.Policy.MayAct || !hasQuestionSlot(response.Unresolved, "preference.food.allergy") {
+		t.Fatalf("unreviewed critical claim satisfied action slot: %#v", response)
 	}
 	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: unreviewedID, Action: "accept", Reason: "test"}); err != nil {
 		t.Fatal(err)
@@ -678,6 +701,17 @@ func TestResolveIntentV2ActionAndDisclosureContracts(t *testing.T) {
 		t.Fatalf("required slot did not gate action: %#v", response)
 	}
 	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
+		URI:      "tideglass://v1/intent/work.project.start/current",
+		Task:     IntentTask{Mode: "act_gate", Autonomy: "bounded_act"},
+		Contract: IntentContract{RequiredSlots: []string{"preference.agent.communication"}, ConfidenceFloor: 0.95},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Decision.MayAct || !hasQuestionSlot(response.Unresolved, "preference.agent.communication") {
+		t.Fatalf("low-confidence claim satisfied required slot: %#v", response)
+	}
+	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
 		URI:  "tideglass://v1/intent/work.project.start/current",
 		Task: IntentTask{Mode: "act_gate", Autonomy: "suggest_then_confirm"},
 	}})
@@ -687,17 +721,31 @@ func TestResolveIntentV2ActionAndDisclosureContracts(t *testing.T) {
 	if response.Decision.MayAct || response.Decision.Reason != "confirmation_required" {
 		t.Fatalf("suggest_then_confirm authorized action: %#v", response.Decision)
 	}
+	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
+		URI:  "tideglass://v1/intent/work.project.start/current",
+		Task: IntentTask{Mode: "context", Autonomy: "bounded_act"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Decision.MayAct {
+		t.Fatalf("non-act_gate mode authorized action: %#v", response.Decision)
+	}
 	allowValues := false
+	allowCommitments := false
 	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
 		URI:        "tideglass://v1/intent/work.project.start/current",
 		Task:       IntentTask{Mode: "context", Autonomy: "context_only"},
-		Disclosure: IntentDisclosure{AllowValues: &allowValues},
+		Disclosure: IntentDisclosure{AllowValues: &allowValues, AllowCommitments: &allowCommitments},
 	}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(response.Claims) != 1 || response.Claims[0].Value != "" {
 		t.Fatalf("allow_values=false leaked values: %#v", response.Claims)
+	}
+	if response.Claims[0].Commitment != "" || response.Commitments.ResponseHash != "" || response.Commitments.ClaimRoot != "" {
+		t.Fatalf("allow_commitments=false emitted commitments: claims=%#v commitments=%#v", response.Claims, response.Commitments)
 	}
 }
 
@@ -896,8 +944,8 @@ func TestHandleMCPOnceReadsIntentResource(t *testing.T) {
 	}
 	input = strings.NewReader(`{"jsonrpc":"2.0","id":"tool-3","method":"tools/call","params":{"name":"tideglass.resolve_intent","arguments":{"uri":"tideglass://v1/intent/work.project.start/current","actor":{"capabilities":["read_sensitive"]},"disclosure":{"allow_sensitive":true}}}}`)
 	output.Reset()
-	if err := HandleMCPOnce(ctx, tg, input, &output); err != nil {
-		t.Fatal(err)
+	if err := HandleMCPOnce(ctx, tg, input, &output); err == nil {
+		t.Fatal("expected self-declared MCP capability to fail")
 	}
 }
 

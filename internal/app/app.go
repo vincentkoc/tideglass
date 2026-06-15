@@ -161,7 +161,7 @@ type IntentDisclosure struct {
 	AllowValues      *bool  `json:"allow_values,omitempty"`
 	AllowEvidence    bool   `json:"allow_evidence,omitempty"`
 	AllowSensitive   bool   `json:"allow_sensitive,omitempty"`
-	AllowCommitments bool   `json:"allow_commitments,omitempty"`
+	AllowCommitments *bool  `json:"allow_commitments,omitempty"`
 }
 
 type IntentRequestEnvelope struct {
@@ -711,12 +711,14 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 			return IntentResponseEnvelope{}, err
 		}
 		claims = eligibleClaimsForRequest(loaded, requireReviewed, maxAge)
-		unresolved = unresolvedIntentQuestions(intent.Kind, claims)
+		slotClaims := claimsForSlotSatisfaction(claims, request)
+		unresolved = unresolvedIntentQuestions(intent.Kind, slotClaims)
+		unresolved = addRequiredSlotQuestions(unresolved, slotClaims, request.Contract.RequiredSlots)
 	} else {
 		intent = IntentOut{Kind: kind, Title: titleForKind(kind)}
 		unresolved = unresolvedIntentQuestions(kind, nil)
+		unresolved = addRequiredSlotQuestions(unresolved, nil, request.Contract.RequiredSlots)
 	}
-	unresolved = addRequiredSlotQuestions(unresolved, claims, request.Contract.RequiredSlots)
 	filteredClaims, policy := applyIntentPolicy(claims, unresolved, request)
 	filteredClaims = addClaimCommitments(filteredClaims, request)
 	redactedBlocking := redactedBlockingQuestions(kind, policy.Redacted, request.Contract.RequiredSlots, unresolved)
@@ -756,10 +758,6 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 		Claims:        filteredClaims,
 		Unresolved:    unresolved,
 		Policy:        policy,
-		Commitments: IntentCommitments{
-			ClaimRoot: claimRoot(filteredClaims),
-			Algorithm: "canonical-json-sha256-v1",
-		},
 		Links: map[string]string{
 			"profile":    "tideglass://v1/profile/me/" + kind + "/current",
 			"slots":      "tideglass://v1/intent/" + kind + "/slots",
@@ -768,8 +766,16 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 			"disclosure": "tideglass://disclosure/" + kind + "/" + request.Audience.Label(),
 		},
 	}
+	if allowCommitments(request.Disclosure) {
+		response.Commitments = IntentCommitments{
+			ClaimRoot: claimRoot(filteredClaims),
+			Algorithm: "canonical-json-sha256-v1",
+		}
+	}
 	response.ProfileHash = profileHash(response)
-	response.Commitments.ResponseHash = response.ProfileHash
+	if allowCommitments(request.Disclosure) {
+		response.Commitments.ResponseHash = response.ProfileHash
+	}
 	response.SnapshotID, err = t.persistProfileSnapshot(ctx, requestID, response)
 	if err != nil {
 		return IntentResponseEnvelope{}, err
@@ -1175,26 +1181,13 @@ func authorizeHTTPResolveRequest(request IntentRequestEnvelope) error {
 }
 
 func authorizeMCPResolveRequest(request IntentRequestEnvelope) error {
-	if request.Disclosure.AllowSensitive && !actorHasCapability(request.Actor, "read_sensitive", "sensitive_disclosure") {
-		return errors.New("mcp resolve cannot enable sensitive disclosure without read_sensitive capability")
+	if request.Disclosure.AllowSensitive {
+		return errors.New("mcp resolve cannot enable sensitive disclosure without trusted server capability")
 	}
-	if request.Freshness.RequireReviewed != nil && !*request.Freshness.RequireReviewed && !actorHasCapability(request.Actor, "read_unreviewed") {
-		return errors.New("mcp resolve cannot disable reviewed-claim freshness without read_unreviewed capability")
+	if request.Freshness.RequireReviewed != nil && !*request.Freshness.RequireReviewed {
+		return errors.New("mcp resolve cannot disable reviewed-claim freshness without trusted server capability")
 	}
 	return nil
-}
-
-func actorHasCapability(actor IntentActor, accepted ...string) bool {
-	have := map[string]bool{}
-	for _, capability := range actor.Capabilities {
-		have[strings.ToLower(strings.TrimSpace(capability))] = true
-	}
-	for _, capability := range accepted {
-		if have[strings.ToLower(capability)] {
-			return true
-		}
-	}
-	return false
 }
 
 func statusForResolveError(err error) int {
@@ -1302,6 +1295,7 @@ values(?,?,?,?,?,?,?,?,?,?)`,
 func (t *Tideglass) persistProfileSnapshot(ctx context.Context, requestID string, response IntentResponseEnvelope) (string, error) {
 	snapshotID := id("snap")
 	response.SnapshotID = snapshotID
+	response.Commitments.SnapshotID = snapshotID
 	responseJSON, err := json.Marshal(response)
 	if err != nil {
 		return "", err
@@ -2586,8 +2580,9 @@ func normalizeIntentRequest(request IntentRequestEnvelope) IntentRequestEnvelope
 		defaultAllowValues := request.Disclosure.Mode != "existence"
 		request.Disclosure.AllowValues = &defaultAllowValues
 	}
-	if !request.Disclosure.AllowCommitments {
-		request.Disclosure.AllowCommitments = true
+	if request.Disclosure.AllowCommitments == nil {
+		defaultAllowCommitments := true
+		request.Disclosure.AllowCommitments = &defaultAllowCommitments
 	}
 	request.Contract.Output = strings.TrimSpace(request.Contract.Output)
 	if request.Contract.Output == "" {
@@ -2676,6 +2671,20 @@ func eligibleClaimsForRequest(claims []ClaimOut, requireReviewed bool, maxAge ti
 	return out
 }
 
+func claimsForSlotSatisfaction(claims []ClaimOut, request IntentRequestEnvelope) []ClaimOut {
+	out := make([]ClaimOut, 0, len(claims))
+	for _, claim := range claims {
+		if request.Task.Mode == "act_gate" && claim.Status != "accepted" {
+			continue
+		}
+		if request.Contract.ConfidenceFloor > 0 && claim.Confidence < request.Contract.ConfidenceFloor {
+			continue
+		}
+		out = append(out, claim)
+	}
+	return out
+}
+
 func parseMaxAge(value string) (time.Duration, error) {
 	value = strings.TrimSpace(strings.ToLower(value))
 	if value == "" {
@@ -2758,14 +2767,14 @@ func applyIntentPolicy(claims []ClaimOut, unresolved []IntentQuestion, request I
 		return out[i].ID < out[j].ID
 	})
 	policy.MayAct = !policy.NeedsUserAnswer
-	if request.Task.Autonomy == "context_only" || request.Task.Autonomy == "suggest_only" || request.Task.Autonomy == "suggest_then_confirm" || request.Task.Autonomy == "deny" {
+	if request.Task.Mode != "act_gate" || request.Task.Autonomy == "context_only" || request.Task.Autonomy == "suggest_only" || request.Task.Autonomy == "suggest_then_confirm" || request.Task.Autonomy == "deny" {
 		policy.MayAct = false
 	}
 	return out, policy
 }
 
 func addClaimCommitments(claims []IntentClaimEnvelope, request IntentRequestEnvelope) []IntentClaimEnvelope {
-	if !request.Disclosure.AllowCommitments {
+	if !allowCommitments(request.Disclosure) {
 		return claims
 	}
 	out := make([]IntentClaimEnvelope, len(claims))
@@ -2827,6 +2836,10 @@ func shouldRedactClaim(disclosure IntentDisclosure, sensitivity string) bool {
 
 func allowClaimValues(disclosure IntentDisclosure) bool {
 	return disclosure.AllowValues != nil && *disclosure.AllowValues
+}
+
+func allowCommitments(disclosure IntentDisclosure) bool {
+	return disclosure.AllowCommitments != nil && *disclosure.AllowCommitments
 }
 
 func existenceClaimEnvelope(claim ClaimOut) IntentClaimEnvelope {
