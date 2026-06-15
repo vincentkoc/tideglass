@@ -578,6 +578,9 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 		request.Audience = audienceFromURI
 	}
 	request = normalizeIntentRequest(request)
+	if err := validateIntentRequest(request); err != nil {
+		return IntentResponseEnvelope{}, err
+	}
 	requestID, err := t.persistIntentRequest(ctx, request)
 	if err != nil {
 		return IntentResponseEnvelope{}, err
@@ -612,6 +615,10 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 		unresolved = unresolvedIntentQuestions(kind, nil)
 	}
 	filteredClaims, policy := applyIntentPolicy(claims, unresolved, request)
+	if hasRedactedCriticalClaim(kind, policy.Redacted) {
+		policy.NeedsUserAnswer = true
+		policy.MayAct = false
+	}
 	if !foundIntent {
 		policy.NeedsUserAnswer = true
 		policy.MayAct = false
@@ -914,7 +921,7 @@ func NewServiceHandler(t *Tideglass) http.Handler {
 		}
 		response, err := t.ResolveIntent(r.Context(), ResolveOptions{Request: request})
 		if err != nil {
-			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			writeHTTPError(w, statusForResolveError(err), err.Error())
 			return
 		}
 		writeHTTPJSON(w, http.StatusOK, response)
@@ -927,7 +934,7 @@ func NewServiceHandler(t *Tideglass) http.Handler {
 		uri := r.URL.Query().Get("uri")
 		response, err := t.ResolveIntent(r.Context(), ResolveOptions{Request: IntentRequestEnvelope{URI: uri}})
 		if err != nil {
-			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			writeHTTPError(w, statusForResolveError(err), err.Error())
 			return
 		}
 		writeHTTPJSON(w, http.StatusOK, response)
@@ -997,6 +1004,24 @@ func writeHTTPJSON(w http.ResponseWriter, status int, value any) {
 
 func writeHTTPError(w http.ResponseWriter, status int, message string) {
 	writeHTTPJSON(w, status, map[string]any{"error": message})
+}
+
+func statusForResolveError(err error) int {
+	if isRequestError(err) {
+		return http.StatusBadRequest
+	}
+	return http.StatusInternalServerError
+}
+
+func isRequestError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return strings.Contains(message, "intent request uri is required") ||
+		strings.Contains(message, "unsupported intent uri") ||
+		strings.Contains(message, "unsupported disclosure mode") ||
+		strings.Contains(message, "invalid freshness.max_age")
 }
 
 func mustJSONText(value any) string {
@@ -1231,7 +1256,7 @@ func (t *Tideglass) loadClaims(ctx context.Context, intentID string) ([]ClaimOut
 select c.id, c.kind,
        coalesce(json_extract(e.patch_json, '$.value'), c.value) as value,
        c.confidence, c.status, c.source_mode,
-       c.created_at, c.updated_at,
+       c.created_at, c.updated_at, coalesce(e.created_at, ''),
        case when e.id is null then 0 else 1 end as has_value_edit
 from claims c
 left join edits e on e.id = (
@@ -1256,8 +1281,12 @@ order by c.created_at desc`, intentID)
 	for rows.Next() {
 		var claim materializedClaim
 		var hasValueEdit int
-		if err := rows.Scan(&claim.ID, &claim.Kind, &claim.Value, &claim.Confidence, &claim.Status, &claim.SourceMode, &claim.CreatedAt, &claim.UpdatedAt, &hasValueEdit); err != nil {
+		var valueEditCreatedAt string
+		if err := rows.Scan(&claim.ID, &claim.Kind, &claim.Value, &claim.Confidence, &claim.Status, &claim.SourceMode, &claim.CreatedAt, &claim.UpdatedAt, &valueEditCreatedAt, &hasValueEdit); err != nil {
 			return nil, err
+		}
+		if valueEditCreatedAt > claim.UpdatedAt {
+			claim.UpdatedAt = valueEditCreatedAt
 		}
 		claim.HasValueEdit = hasValueEdit == 1
 		claim.ClaimOut.UpdatedAt = claim.UpdatedAt
@@ -2234,7 +2263,7 @@ func normalizeIntentRequest(request IntentRequestEnvelope) IntentRequestEnvelope
 	if request.Audience == "" {
 		request.Audience = "agent"
 	}
-	request.Disclosure.Mode = strings.TrimSpace(request.Disclosure.Mode)
+	request.Disclosure.Mode = strings.ToLower(strings.TrimSpace(request.Disclosure.Mode))
 	if request.Disclosure.Mode == "" {
 		request.Disclosure.Mode = "minimal"
 	}
@@ -2242,6 +2271,15 @@ func normalizeIntentRequest(request IntentRequestEnvelope) IntentRequestEnvelope
 		request.Context = map[string]any{}
 	}
 	return request
+}
+
+func validateIntentRequest(request IntentRequestEnvelope) error {
+	switch request.Disclosure.Mode {
+	case "full", "minimal", "existence":
+		return nil
+	default:
+		return fmt.Errorf("unsupported disclosure mode %q", request.Disclosure.Mode)
+	}
 }
 
 func parseIntentURI(rawURI string) (string, string, error) {
@@ -2255,13 +2293,13 @@ func parseIntentURI(rawURI string) (string, string, error) {
 	rest := strings.TrimPrefix(uri, "tideglass://")
 	parts := strings.Split(rest, "/")
 	switch {
-	case len(parts) == 2 && parts[0] == "intent":
+	case len(parts) == 2 && parts[0] == "intent" && strings.TrimSpace(parts[1]) != "":
 		return normalizeKind(parts[1], ""), "", nil
-	case len(parts) == 4 && parts[0] == "profile" && parts[1] == "me" && parts[3] == "current":
+	case len(parts) == 4 && parts[0] == "profile" && parts[1] == "me" && strings.TrimSpace(parts[2]) != "" && parts[3] == "current":
 		return normalizeKind(parts[2], ""), "", nil
-	case len(parts) == 2 && parts[0] == "unresolved":
+	case len(parts) == 2 && parts[0] == "unresolved" && strings.TrimSpace(parts[1]) != "":
 		return normalizeKind(parts[1], ""), "", nil
-	case len(parts) == 3 && parts[0] == "disclosure":
+	case len(parts) == 3 && parts[0] == "disclosure" && strings.TrimSpace(parts[1]) != "" && strings.TrimSpace(parts[2]) != "":
 		return normalizeKind(parts[1], ""), parts[2], nil
 	default:
 		return "", "", fmt.Errorf("unsupported intent uri %q", rawURI)
@@ -2352,6 +2390,12 @@ func applyIntentPolicy(claims []ClaimOut, unresolved []IntentQuestion, request I
 	}
 	sort.Strings(policy.SafeToShare)
 	sort.Strings(policy.Redacted)
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Kind != out[j].Kind {
+			return out[i].Kind < out[j].Kind
+		}
+		return out[i].ID < out[j].ID
+	})
 	policy.MayAct = !policy.NeedsUserAnswer
 	return out, policy
 }
@@ -2397,6 +2441,29 @@ func hasCriticalUnresolved(rows []IntentQuestion) bool {
 		}
 	}
 	return false
+}
+
+func hasRedactedCriticalClaim(intentKind string, redacted []string) bool {
+	if len(redacted) == 0 {
+		return false
+	}
+	critical := criticalClaimKinds(intentKind)
+	for _, kind := range redacted {
+		if critical[kind] {
+			return true
+		}
+	}
+	return false
+}
+
+func criticalClaimKinds(intentKind string) map[string]bool {
+	out := map[string]bool{}
+	for _, question := range unresolvedIntentQuestions(intentKind, nil) {
+		if question.Priority == "critical" {
+			out[question.Kind] = true
+		}
+	}
+	return out
 }
 
 func profileHash(response IntentResponseEnvelope) string {

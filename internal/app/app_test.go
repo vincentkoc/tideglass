@@ -539,19 +539,58 @@ func TestResolveIntentUnreviewedAndStaleClaimsDoNotSatisfyCriticalSlots(t *testi
 	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: unreviewedID, Action: "accept", Reason: "test"}); err != nil {
 		t.Fatal(err)
 	}
+	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{URI: "tideglass://intent/social.dinner"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !response.Policy.NeedsUserAnswer || response.Policy.MayAct || !containsString(response.Policy.Redacted, "preference.food.allergy") {
+		t.Fatalf("redacted critical claim authorized action: %#v", response.Policy)
+	}
 	old := "2020-01-01T00:00:00Z"
 	if _, err := tg.db.ExecContext(ctx, `update claims set updated_at = ? where id = ?`, old, unreviewedID); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := tg.EditClaim(ctx, EditOptions{ClaimID: unreviewedID, Value: "No shellfish or peanuts.", Reason: "fresh edit"}); err != nil {
+		t.Fatal(err)
+	}
 	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
-		URI:       "tideglass://intent/social.dinner",
-		Freshness: IntentFreshness{MaxAge: "1h"},
+		URI:        "tideglass://intent/social.dinner",
+		Freshness:  IntentFreshness{MaxAge: "1h"},
+		Disclosure: IntentDisclosure{AllowSensitive: true},
 	}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !response.Policy.NeedsUserAnswer || response.Policy.MayAct {
-		t.Fatalf("stale critical claim satisfied policy: %#v", response.Policy)
+	if response.Policy.NeedsUserAnswer || !response.Policy.MayAct || len(response.Claims) != 1 || response.Claims[0].Value != "No shellfish or peanuts." {
+		t.Fatalf("fresh edit was treated as stale: response=%#v", response)
+	}
+	staleOnlyID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "preference.food.dietary_restriction",
+		Value:      "Vegetarian.",
+		Confidence: 0.8,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: staleOnlyID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.db.ExecContext(ctx, `update claims set updated_at = ? where id = ?`, old, staleOnlyID); err != nil {
+		t.Fatal(err)
+	}
+	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
+		URI:        "tideglass://intent/social.dinner",
+		Freshness:  IntentFreshness{MaxAge: "1h"},
+		Disclosure: IntentDisclosure{AllowSensitive: true},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, claim := range response.Claims {
+		if claim.ID == staleOnlyID {
+			t.Fatalf("stale claim leaked through max_age: %#v", response.Claims)
+		}
 	}
 }
 
@@ -594,7 +633,7 @@ func TestResolveIntentCanonicalLinksAndExistenceDisclosure(t *testing.T) {
 	}
 	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
 		URI:        "tideglass://intent/work.project.start",
-		Disclosure: IntentDisclosure{Mode: "existence"},
+		Disclosure: IntentDisclosure{Mode: "EXISTENCE"},
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -608,6 +647,17 @@ func TestResolveIntentCanonicalLinksAndExistenceDisclosure(t *testing.T) {
 	}
 	if claim.ID != "" || claim.Value != "" || claim.Confidence != 0 || claim.SourceMode != "" || claim.Sensitivity != "" || len(claim.Evidence) != 0 {
 		t.Fatalf("existence claim leaked metadata: %#v", claim)
+	}
+	if _, err := tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
+		URI:        "tideglass://intent/work.project.start",
+		Disclosure: IntentDisclosure{Mode: "verbose"},
+	}}); err == nil {
+		t.Fatal("expected unsupported disclosure mode to fail closed")
+	}
+	for _, uri := range []string{"tideglass://intent/", "tideglass://unresolved/", "tideglass://profile/me//current"} {
+		if _, err := tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{URI: uri}}); err == nil {
+			t.Fatalf("expected empty kind URI to fail: %s", uri)
+		}
 	}
 }
 
@@ -660,6 +710,15 @@ func TestServiceHandlerResolvesIntentResource(t *testing.T) {
 	}
 	if response.Policy.Audience != "venue" || response.ResolvedURI != "tideglass://profile/me/social.dinner/current" {
 		t.Fatalf("resolve response = %#v", response)
+	}
+	bad, err := http.Get(server.URL + "/resource?uri=tideglass://intent/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bad.Body.Close()
+	if bad.StatusCode != http.StatusBadRequest {
+		data, _ := io.ReadAll(bad.Body)
+		t.Fatalf("bad resource status = %d body=%s", bad.StatusCode, data)
 	}
 }
 
