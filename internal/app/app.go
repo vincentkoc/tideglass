@@ -67,9 +67,10 @@ type ProfileOptions struct {
 }
 
 type EditOptions struct {
-	ClaimID string
-	Value   string
-	Reason  string
+	ClaimID          string
+	Value            string
+	Reason           string
+	ExpectedRevision *int64
 }
 
 type ReviewOptions struct {
@@ -908,7 +909,8 @@ func failClosedActionSnapshot(response IntentResponseEnvelope) IntentResponseEnv
 }
 
 func (t *Tideglass) EditClaim(ctx context.Context, opts EditOptions) (EditResult, error) {
-	if strings.TrimSpace(opts.ClaimID) == "" {
+	claimID := strings.TrimSpace(opts.ClaimID)
+	if claimID == "" {
 		return EditResult{}, errors.New("claim id is required")
 	}
 	value := strings.TrimSpace(opts.Value)
@@ -921,24 +923,43 @@ func (t *Tideglass) EditClaim(ctx context.Context, opts EditOptions) (EditResult
 	if err != nil {
 		return EditResult{}, err
 	}
+	var currentRevision int64
+	if err := tx.QueryRowContext(ctx, `select revision from claims where id = ?`, claimID).Scan(&currentRevision); err != nil {
+		_ = tx.Rollback()
+		return EditResult{}, err
+	}
+	if opts.ExpectedRevision != nil && currentRevision != *opts.ExpectedRevision {
+		_ = tx.Rollback()
+		return EditResult{}, fmt.Errorf("claim revision changed: got %d, want %d", currentRevision, *opts.ExpectedRevision)
+	}
 	revision, err := nextRevision(ctx, tx)
 	if err != nil {
 		_ = tx.Rollback()
 		return EditResult{}, err
 	}
 	if _, err := tx.ExecContext(ctx, `insert into edits(id,claim_id,operation,patch_json,reason,created_at) values(?,?,?,?,?,?)`,
-		editID, opts.ClaimID, "supersede", string(patch), opts.Reason, now()); err != nil {
+		editID, claimID, "supersede", string(patch), opts.Reason, now()); err != nil {
 		_ = tx.Rollback()
 		return EditResult{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `update claims set status = 'active', normalized_value = ?, updated_at = ?, revision = ? where id = ?`, normalizeText(value), now(), revision, opts.ClaimID); err != nil {
+	res, err := tx.ExecContext(ctx, `update claims set status = 'active', normalized_value = ?, updated_at = ?, revision = ? where id = ? and revision = ?`, normalizeText(value), now(), revision, claimID, currentRevision)
+	if err != nil {
 		_ = tx.Rollback()
 		return EditResult{}, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		_ = tx.Rollback()
+		return EditResult{}, err
+	}
+	if affected == 0 {
+		_ = tx.Rollback()
+		return EditResult{}, fmt.Errorf("claim revision changed: got unknown, want %d", currentRevision)
 	}
 	if err := tx.Commit(); err != nil {
 		return EditResult{}, err
 	}
-	return EditResult{EditID: editID, ClaimID: opts.ClaimID, Value: value, Revision: revision}, nil
+	return EditResult{EditID: editID, ClaimID: claimID, Value: value, Revision: revision}, nil
 }
 
 func (t *Tideglass) ReviewClaim(ctx context.Context, opts ReviewOptions) (ReviewResult, error) {
@@ -1795,6 +1816,18 @@ func currentRevision(ctx context.Context, queryer interface {
 	return revision, nil
 }
 
+type observedRevision struct {
+	revision int64
+	ok       bool
+}
+
+func recordLatestRevision(revisions map[string]observedRevision, key string, revision int64) {
+	current := revisions[key]
+	if !current.ok || revision > current.revision {
+		revisions[key] = observedRevision{revision: revision, ok: true}
+	}
+}
+
 func (t *Tideglass) loadClaims(ctx context.Context, intentID string) ([]ClaimOut, error) {
 	rows, err := t.db.QueryContext(ctx, `
 select c.id, c.kind,
@@ -1936,9 +1969,9 @@ order by c.created_at desc`, intentID)
 	}
 	defer rows.Close()
 	var claims []ClaimOut
-	bestAcceptedSingleton := map[string]int64{}
+	bestAcceptedSingleton := map[string]observedRevision{}
 	actionGateClaimRevisions := map[string]int64{}
-	bestAcceptedDuplicate := map[string]int64{}
+	bestAcceptedDuplicate := map[string]observedRevision{}
 	actionGateClaimKeys := map[string]string{}
 	for rows.Next() {
 		var claim ClaimOut
@@ -1957,11 +1990,11 @@ order by c.created_at desc`, intentID)
 		claim.Revision = revision
 		normalized = losslessClaimValueKey(claim.Value)
 		duplicateKey := claim.Kind + "\x00" + normalized
-		if singletonClaimKind(claim.Kind) && claim.Status == "accepted" && revision > bestAcceptedSingleton[claim.Kind] {
-			bestAcceptedSingleton[claim.Kind] = revision
+		if singletonClaimKind(claim.Kind) && claim.Status == "accepted" {
+			recordLatestRevision(bestAcceptedSingleton, claim.Kind, revision)
 		}
-		if claim.Status == "accepted" && revision > bestAcceptedDuplicate[duplicateKey] {
-			bestAcceptedDuplicate[duplicateKey] = revision
+		if claim.Status == "accepted" {
+			recordLatestRevision(bestAcceptedDuplicate, duplicateKey, revision)
 		}
 		claims = append(claims, claim)
 		actionGateClaimRevisions[claim.ID] = revision
@@ -1974,10 +2007,11 @@ order by c.created_at desc`, intentID)
 	for _, claim := range claims {
 		revision := actionGateClaimRevisions[claim.ID]
 		duplicateAcceptedRevision := bestAcceptedDuplicate[actionGateClaimKeys[claim.ID]]
-		if duplicateAcceptedRevision > 0 && (claim.Status != "accepted" || revision < duplicateAcceptedRevision) {
+		if duplicateAcceptedRevision.ok && (claim.Status != "accepted" || revision < duplicateAcceptedRevision.revision) {
 			continue
 		}
-		if singletonClaimKind(claim.Kind) && bestAcceptedSingleton[claim.Kind] > 0 && revision < bestAcceptedSingleton[claim.Kind] {
+		singletonAcceptedRevision := bestAcceptedSingleton[claim.Kind]
+		if singletonClaimKind(claim.Kind) && singletonAcceptedRevision.ok && claim.Status != "accepted" && revision <= singletonAcceptedRevision.revision {
 			continue
 		}
 		out = append(out, claim)
@@ -1990,27 +2024,35 @@ func (t *Tideglass) loadReviewCandidateClaims(ctx context.Context, intentID stri
 select c.id, c.kind,
        coalesce(json_extract(e.patch_json, '$.value'), c.value) as value,
        c.confidence, c.status, c.source_mode,
-       c.updated_at, coalesce(e.created_at, ''), c.revision
+       c.created_at, c.updated_at, coalesce(e.created_at, ''),
+       case when e.id is null then 0 else 1 end as has_value_edit,
+       c.revision
 from claims c
 left join edits e on e.id = (
   select id from edits
   where claim_id = c.id and json_extract(patch_json, '$.value') is not null
   order by rowid desc limit 1
 )
-where c.intent_id = ? and c.status != 'rejected'
+where c.intent_id = ?
 order by c.created_at desc`, intentID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var claims []ClaimOut
-	revisions := map[string]int64{}
-	bestAcceptedSingleton := map[string]int64{}
+	type materializedReviewClaim struct {
+		ClaimOut
+		CreatedAt    string
+		UpdatedAt    string
+		HasValueEdit bool
+		Normalized   string
+	}
+	var rowsOut []materializedReviewClaim
 	for rows.Next() {
-		var claim ClaimOut
+		var claim materializedReviewClaim
 		var valueEditCreatedAt string
+		var hasValueEdit int
 		var revision int64
-		if err := rows.Scan(&claim.ID, &claim.Kind, &claim.Value, &claim.Confidence, &claim.Status, &claim.SourceMode, &claim.UpdatedAt, &valueEditCreatedAt, &revision); err != nil {
+		if err := rows.Scan(&claim.ID, &claim.Kind, &claim.Value, &claim.Confidence, &claim.Status, &claim.SourceMode, &claim.CreatedAt, &claim.UpdatedAt, &valueEditCreatedAt, &hasValueEdit, &revision); err != nil {
 			return nil, err
 		}
 		if !singletonClaimKind(claim.Kind) {
@@ -2020,24 +2062,68 @@ order by c.created_at desc`, intentID)
 			claim.UpdatedAt = valueEditCreatedAt
 		}
 		claim.Revision = revision
-		if claim.Status == "accepted" && revision > bestAcceptedSingleton[claim.Kind] {
-			bestAcceptedSingleton[claim.Kind] = revision
-		}
-		claims = append(claims, claim)
-		revisions[claim.ID] = revision
+		claim.HasValueEdit = hasValueEdit == 1
+		claim.ClaimOut.UpdatedAt = claim.UpdatedAt
+		claim.Normalized = normalizeText(claim.Value)
+		rowsOut = append(rowsOut, claim)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	out := make([]ClaimOut, 0, len(claims))
-	for _, claim := range claims {
-		revision := revisions[claim.ID]
-		if bestAcceptedSingleton[claim.Kind] > 0 && revision < bestAcceptedSingleton[claim.Kind] {
+	decisionRank := func(status string) int {
+		switch status {
+		case "accepted":
+			return 3
+		case "rejected":
+			return 2
+		default:
+			return 1
+		}
+	}
+	prefer := func(left, right materializedReviewClaim) bool {
+		if decisionRank(left.Status) != decisionRank(right.Status) {
+			return decisionRank(left.Status) > decisionRank(right.Status)
+		}
+		if left.UpdatedAt != right.UpdatedAt {
+			return timestampAfter(left.UpdatedAt, right.UpdatedAt)
+		}
+		if left.HasValueEdit != right.HasValueEdit {
+			return left.HasValueEdit
+		}
+		if left.Confidence != right.Confidence {
+			return left.Confidence > right.Confidence
+		}
+		return left.CreatedAt > right.CreatedAt
+	}
+	sort.SliceStable(rowsOut, func(leftIndex, rightIndex int) bool {
+		return prefer(rowsOut[leftIndex], rowsOut[rightIndex])
+	})
+	duplicateSeen := map[string]bool{}
+	var deduped []materializedReviewClaim
+	for _, claim := range rowsOut {
+		key := claim.Kind + "\x00" + claim.Normalized
+		if duplicateSeen[key] {
 			continue
 		}
-		if claim.Status != "accepted" {
-			out = append(out, claim)
+		duplicateSeen[key] = true
+		deduped = append(deduped, claim)
+	}
+	bestAcceptedSingleton := map[string]observedRevision{}
+	for _, claim := range deduped {
+		if claim.Status == "accepted" {
+			recordLatestRevision(bestAcceptedSingleton, claim.Kind, claim.Revision)
 		}
+	}
+	out := make([]ClaimOut, 0, len(deduped))
+	for _, claim := range deduped {
+		if claim.Status != "active" {
+			continue
+		}
+		acceptedRevision := bestAcceptedSingleton[claim.Kind]
+		if acceptedRevision.ok && claim.Revision <= acceptedRevision.revision {
+			continue
+		}
+		out = append(out, claim.ClaimOut)
 	}
 	return out, nil
 }

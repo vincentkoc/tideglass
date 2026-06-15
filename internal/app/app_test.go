@@ -329,6 +329,49 @@ func TestReviewClaimChecksExpectedRevisionZero(t *testing.T) {
 	}
 }
 
+func TestEditClaimChecksExpectedRevision(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	intent, err := tg.ensureIntent(ctx, "work.project.start", "Project start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "preference.project.validation",
+		Value:      "run tests",
+		Confidence: 0.8,
+		SourceMode: "inferred",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var expectedRevision int64
+	if err := tg.db.QueryRowContext(ctx, `select revision from claims where id = ?`, claimID).Scan(&expectedRevision); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.EditClaim(ctx, EditOptions{ClaimID: claimID, Value: "run newer tests", Reason: "concurrent edit"}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := tg.EditClaim(ctx, EditOptions{ClaimID: claimID, Value: "stale overwrite", Reason: "stale edit", ExpectedRevision: &expectedRevision})
+	if err == nil {
+		t.Fatalf("stale edit succeeded: %#v", result)
+	}
+	if !strings.Contains(err.Error(), "claim revision changed") {
+		t.Fatalf("edit error = %v", err)
+	}
+	claims, err := tg.loadClaims(ctx, intent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claims) != 1 || claims[0].Value != "run newer tests" {
+		t.Fatalf("stale edit overwrote claims: %#v", claims)
+	}
+}
+
 func TestReviewAcceptKeepsEditedOverlay(t *testing.T) {
 	ctx := context.Background()
 	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
@@ -1157,6 +1200,142 @@ func TestResolveIntentActionGateIgnoresSupersededSingletonBoundaries(t *testing.
 	}
 	if response.Decision.MayAct || !response.Decision.NeedsUserAnswer || !hasBlockingQuestionSlot(response.Unresolved, "boundary.project.no_go") {
 		t.Fatalf("fresh edited singleton boundary did not block action: %#v", response)
+	}
+}
+
+func TestLoadActionGateClaimsTreatsRevisionZeroAcceptedSingletonAsAuthoritative(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	intent, err := tg.ensureIntent(ctx, "work.project.start", "Project start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	acceptedID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "boundary.project.no_go",
+		Value:      "Ask before touching production.",
+		Confidence: 0.9,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: acceptedID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	activeID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "boundary.project.no_go",
+		Value:      "Old pending boundary.",
+		Confidence: 0.7,
+		SourceMode: "inferred",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.db.ExecContext(ctx, `update claims set revision = 0 where id in (?, ?)`, acceptedID, activeID); err != nil {
+		t.Fatal(err)
+	}
+	claims, err := tg.loadActionGateClaims(ctx, intent.ID, "work.project.start", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasClaimID(claims, activeID) {
+		t.Fatalf("revision-zero accepted singleton did not suppress active claim: %#v", claims)
+	}
+	if !hasClaimID(claims, acceptedID) {
+		t.Fatalf("revision-zero accepted singleton missing from action gate claims: %#v", claims)
+	}
+}
+
+func TestLoadReviewCandidateClaimsPreservesDuplicateDecisions(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	intent, err := tg.ensureIntent(ctx, "work.project.start", "Project start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	acceptedDuplicateID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "preference.agent.communication",
+		Value:      "Use terse updates.",
+		Confidence: 0.9,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: acceptedDuplicateID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	activeDuplicateID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "preference.agent.communication",
+		Value:      "Use terse updates.",
+		Confidence: 0.95,
+		SourceMode: "inferred",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rejectedSuppressedID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "boundary.project.no_go",
+		Value:      "Never deploy on Fridays.",
+		Confidence: 0.7,
+		SourceMode: "inferred",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rejectedDuplicateID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "boundary.project.no_go",
+		Value:      "Never deploy on Fridays.",
+		Confidence: 0.9,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: rejectedDuplicateID, Action: "reject", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	acceptedSingletonID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "preference.project.validation",
+		Value:      "Run the full suite.",
+		Confidence: 0.9,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: acceptedSingletonID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	freshCandidateID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "preference.project.validation",
+		Value:      "Run focused tests first.",
+		Confidence: 0.8,
+		SourceMode: "inferred",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidates, err := tg.loadReviewCandidateClaims(ctx, intent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasClaimID(candidates, activeDuplicateID) {
+		t.Fatalf("accepted duplicate was shown for review: %#v", candidates)
+	}
+	if hasClaimID(candidates, rejectedSuppressedID) {
+		t.Fatalf("rejected duplicate resurrected active claim: %#v", candidates)
+	}
+	if !hasClaimID(candidates, freshCandidateID) {
+		t.Fatalf("fresh singleton candidate was hidden: %#v", candidates)
 	}
 }
 

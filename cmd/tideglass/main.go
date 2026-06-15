@@ -220,12 +220,13 @@ func runReview(ctx context.Context, args []string) error {
 				fmt.Println("skipped empty edit")
 				continue
 			}
-			edit, err := tg.EditClaim(ctx, app.EditOptions{ClaimID: claim.ID, Value: value, Reason: "interactive review edit"})
+			expectedRevision := claim.Revision
+			edit, err := tg.EditClaim(ctx, app.EditOptions{ClaimID: claim.ID, Value: value, Reason: "interactive review edit", ExpectedRevision: &expectedRevision})
 			if err != nil {
 				return err
 			}
-			expectedRevision := edit.Revision
-			if _, err := tg.ReviewClaim(ctx, app.ReviewOptions{ClaimID: claim.ID, Action: "accept", Reason: "interactive review edit", ExpectedRevision: &expectedRevision}); err != nil {
+			reviewRevision := edit.Revision
+			if _, err := tg.ReviewClaim(ctx, app.ReviewOptions{ClaimID: claim.ID, Action: "accept", Reason: "interactive review edit", ExpectedRevision: &reviewRevision}); err != nil {
 				return err
 			}
 			reviewed++
