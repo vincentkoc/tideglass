@@ -453,6 +453,19 @@ func TestResolveIntentAppliesPolicyAndPersistsSnapshot(t *testing.T) {
 	if first.ProfileHash == "" || !strings.HasPrefix(first.ProfileHash, "sha256:") || first.SnapshotID == "" {
 		t.Fatalf("missing hash/snapshot: %#v", first)
 	}
+	hashView := first
+	hashView.ProfileHash = ""
+	hashView.SnapshotID = ""
+	hashJSON, err := json.Marshal(hashView)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(hashJSON), "profile_hash") || strings.Contains(string(hashJSON), "snapshot_id") {
+		t.Fatalf("hash view includes mutable metadata: %s", hashJSON)
+	}
+	if got := "sha256:" + hashBytes(hashJSON); got != first.ProfileHash {
+		t.Fatalf("recomputed profile hash = %s, want %s", got, first.ProfileHash)
+	}
 	if len(first.Claims) != 1 || first.Claims[0].ID != normalID {
 		t.Fatalf("policy-filtered claims = %#v", first.Claims)
 	}
@@ -654,6 +667,12 @@ func TestResolveIntentCanonicalLinksAndExistenceDisclosure(t *testing.T) {
 	}}); err == nil {
 		t.Fatal("expected unsupported disclosure mode to fail closed")
 	}
+	if _, err := tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
+		URI:       "tideglass://intent/work.project.start",
+		Freshness: IntentFreshness{MaxAge: "-1h"},
+	}}); err == nil {
+		t.Fatal("expected negative freshness to fail closed")
+	}
 	for _, uri := range []string{"tideglass://intent/", "tideglass://unresolved/", "tideglass://profile/me//current"} {
 		if _, err := tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{URI: uri}}); err == nil {
 			t.Fatalf("expected empty kind URI to fail: %s", uri)
@@ -719,6 +738,30 @@ func TestServiceHandlerResolvesIntentResource(t *testing.T) {
 	if bad.StatusCode != http.StatusBadRequest {
 		data, _ := io.ReadAll(bad.Body)
 		t.Fatalf("bad resource status = %d body=%s", bad.StatusCode, data)
+	}
+	sensitive := strings.NewReader(`{"uri":"tideglass://intent/work.project.start","disclosure":{"allow_sensitive":true}}`)
+	forbidden, err := http.Post(server.URL+"/resolve", "application/json", sensitive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer forbidden.Body.Close()
+	if forbidden.StatusCode != http.StatusForbidden {
+		data, _ := io.ReadAll(forbidden.Body)
+		t.Fatalf("sensitive resolve status = %d body=%s", forbidden.StatusCode, data)
+	}
+	req, err := http.NewRequest(http.MethodGet, server.URL+"/healthz", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = "evil.example"
+	hostResponse, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hostResponse.Body.Close()
+	if hostResponse.StatusCode != http.StatusForbidden {
+		data, _ := io.ReadAll(hostResponse.Body)
+		t.Fatalf("evil host status = %d body=%s", hostResponse.StatusCode, data)
 	}
 }
 

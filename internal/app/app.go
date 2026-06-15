@@ -17,6 +17,7 @@ import (
 	"io"
 	"io/fs"
 	"math"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -119,8 +120,8 @@ type IntentResponseEnvelope struct {
 	ResolvedURI   string                `json:"resolved_uri"`
 	Intent        IntentOut             `json:"intent"`
 	Status        string                `json:"status"`
-	ProfileHash   string                `json:"profile_hash"`
-	SnapshotID    string                `json:"snapshot_id"`
+	ProfileHash   string                `json:"profile_hash,omitempty"`
+	SnapshotID    string                `json:"snapshot_id,omitempty"`
 	Claims        []IntentClaimEnvelope `json:"claims"`
 	Unresolved    []IntentQuestion      `json:"unresolved"`
 	Policy        IntentPolicyEnvelope  `json:"policy"`
@@ -906,6 +907,10 @@ func NewServiceHandler(t *Tideglass) http.Handler {
 			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
+		if !authorizedHTTPHost(r) {
+			writeHTTPError(w, http.StatusForbidden, "forbidden host")
+			return
+		}
 		writeHTTPJSON(w, http.StatusOK, map[string]any{"status": "ok", "schema": schemaVersion})
 	})
 	mux.HandleFunc("/resolve", func(w http.ResponseWriter, r *http.Request) {
@@ -913,10 +918,18 @@ func NewServiceHandler(t *Tideglass) http.Handler {
 			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
+		if !authorizedHTTPHost(r) {
+			writeHTTPError(w, http.StatusForbidden, "forbidden host")
+			return
+		}
 		defer r.Body.Close()
 		var request IntentRequestEnvelope
 		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&request); err != nil {
 			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := authorizeHTTPResolveRequest(request); err != nil {
+			writeHTTPError(w, http.StatusForbidden, err.Error())
 			return
 		}
 		response, err := t.ResolveIntent(r.Context(), ResolveOptions{Request: request})
@@ -929,6 +942,10 @@ func NewServiceHandler(t *Tideglass) http.Handler {
 	mux.HandleFunc("/resource", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		if !authorizedHTTPHost(r) {
+			writeHTTPError(w, http.StatusForbidden, "forbidden host")
 			return
 		}
 		uri := r.URL.Query().Get("uri")
@@ -1004,6 +1021,27 @@ func writeHTTPJSON(w http.ResponseWriter, status int, value any) {
 
 func writeHTTPError(w http.ResponseWriter, status int, message string) {
 	writeHTTPJSON(w, status, map[string]any{"error": message})
+}
+
+func authorizedHTTPHost(r *http.Request) bool {
+	host := r.Host
+	if strings.Contains(host, ":") {
+		if parsedHost, _, err := net.SplitHostPort(host); err == nil {
+			host = parsedHost
+		}
+	}
+	host = strings.Trim(strings.ToLower(host), "[]")
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
+func authorizeHTTPResolveRequest(request IntentRequestEnvelope) error {
+	if request.Disclosure.AllowSensitive {
+		return errors.New("http resolve cannot enable sensitive disclosure without a capability token")
+	}
+	if request.Freshness.RequireReviewed != nil && !*request.Freshness.RequireReviewed {
+		return errors.New("http resolve cannot disable reviewed-claim freshness")
+	}
+	return nil
 }
 
 func statusForResolveError(err error) int {
@@ -2330,13 +2368,13 @@ func parseMaxAge(value string) (time.Duration, error) {
 	}
 	if strings.HasSuffix(value, "d") {
 		days, err := strconv.Atoi(strings.TrimSuffix(value, "d"))
-		if err != nil {
+		if err != nil || days <= 0 {
 			return 0, fmt.Errorf("invalid freshness.max_age %q", value)
 		}
 		return time.Duration(days) * 24 * time.Hour, nil
 	}
 	duration, err := time.ParseDuration(value)
-	if err != nil {
+	if err != nil || duration <= 0 {
 		return 0, fmt.Errorf("invalid freshness.max_age %q", value)
 	}
 	return duration, nil
