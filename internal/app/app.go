@@ -76,7 +76,7 @@ type ReviewOptions struct {
 	ClaimID          string
 	Action           string
 	Reason           string
-	ExpectedRevision int64
+	ExpectedRevision *int64
 }
 
 type ExportOptions struct {
@@ -968,9 +968,9 @@ func (t *Tideglass) ReviewClaim(ctx context.Context, opts ReviewOptions) (Review
 		_ = tx.Rollback()
 		return ReviewResult{}, err
 	}
-	if opts.ExpectedRevision > 0 && currentRevision != opts.ExpectedRevision {
+	if opts.ExpectedRevision != nil && currentRevision != *opts.ExpectedRevision {
 		_ = tx.Rollback()
-		return ReviewResult{}, fmt.Errorf("claim revision changed: got %d, want %d", currentRevision, opts.ExpectedRevision)
+		return ReviewResult{}, fmt.Errorf("claim revision changed: got %d, want %d", currentRevision, *opts.ExpectedRevision)
 	}
 	revision, err := nextRevision(ctx, tx)
 	if err != nil {

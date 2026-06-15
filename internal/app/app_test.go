@@ -286,6 +286,49 @@ func TestReviewClaimAcceptsAndRejects(t *testing.T) {
 	}
 }
 
+func TestReviewClaimChecksExpectedRevisionZero(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	intent, err := tg.ensureIntent(ctx, "work.project.start", "Project start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "preference.project.validation",
+		Value:      "run tests",
+		Confidence: 0.8,
+		SourceMode: "inferred",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.db.ExecContext(ctx, `update claims set revision = 0 where id = ?`, claimID); err != nil {
+		t.Fatal(err)
+	}
+	expectedRevision := int64(0)
+	if _, err := tg.EditClaim(ctx, EditOptions{ClaimID: claimID, Value: "run focused tests", Reason: "concurrent edit"}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: claimID, Action: "accept", Reason: "stale review", ExpectedRevision: &expectedRevision})
+	if err == nil {
+		t.Fatalf("stale revision-zero review succeeded: %#v", result)
+	}
+	if !strings.Contains(err.Error(), "claim revision changed") {
+		t.Fatalf("review error = %v", err)
+	}
+	var status string
+	if err := tg.db.QueryRowContext(ctx, `select status from claims where id = ?`, claimID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "active" {
+		t.Fatalf("stale review changed status to %s", status)
+	}
+}
+
 func TestReviewAcceptKeepsEditedOverlay(t *testing.T) {
 	ctx := context.Background()
 	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
