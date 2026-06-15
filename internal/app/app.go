@@ -307,15 +307,16 @@ type ExpansionOut struct {
 }
 
 type ClaimOut struct {
-	ID         string   `json:"id"`
-	Kind       string   `json:"kind"`
-	Value      string   `json:"value"`
-	Confidence float64  `json:"confidence"`
-	Status     string   `json:"status"`
-	SourceMode string   `json:"source_mode"`
-	UpdatedAt  string   `json:"updated_at,omitempty"`
-	Evidence   []string `json:"evidence,omitempty"`
-	Revision   int64    `json:"-"`
+	ID           string   `json:"id"`
+	Kind         string   `json:"kind"`
+	Value        string   `json:"value"`
+	Confidence   float64  `json:"confidence"`
+	Status       string   `json:"status"`
+	SourceMode   string   `json:"source_mode"`
+	UpdatedAt    string   `json:"updated_at,omitempty"`
+	Evidence     []string `json:"evidence,omitempty"`
+	ReviewReason string   `json:"review_reason,omitempty"`
+	Revision     int64    `json:"-"`
 }
 
 type EvidenceOut struct {
@@ -823,17 +824,15 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 		policy.MayAct = false
 		policy.CapabilityRequired = append(policy.CapabilityRequired, "user_confirmation")
 	}
-	if policy.MayAct {
-		endRevision, err := currentRevision(ctx, t.db)
-		if err != nil {
-			return IntentResponseEnvelope{}, err
-		}
-		if endRevision != startRevision {
-			unresolved = append(unresolved, questionForSlot("policy.action.snapshot", "critical", true))
-			policy.NeedsUserAnswer = true
-			policy.MayAct = false
-			policy.CapabilityRequired = append(policy.CapabilityRequired, "consistent_snapshot")
-		}
+	endRevision, err := currentRevision(ctx, t.db)
+	if err != nil {
+		return IntentResponseEnvelope{}, err
+	}
+	if endRevision != startRevision {
+		unresolved = append(unresolved, questionForSlot("policy.action.snapshot", "critical", true))
+		policy.NeedsUserAnswer = true
+		policy.MayAct = false
+		policy.CapabilityRequired = append(policy.CapabilityRequired, "consistent_snapshot")
 	}
 	status := "ready"
 	if !foundIntent || policy.NeedsUserAnswer {
@@ -2008,7 +2007,7 @@ left join edits e on e.id = (
   where claim_id = c.id and json_extract(patch_json, '$.value') is not null
   order by rowid desc limit 1
 )
-where c.intent_id = ? and c.status != 'rejected'
+where c.intent_id = ?
 order by c.created_at desc`, intentID)
 	if err != nil {
 		return nil, err
@@ -2018,6 +2017,7 @@ order by c.created_at desc`, intentID)
 	bestAcceptedSingleton := map[string]observedRevision{}
 	actionGateClaimRevisions := map[string]int64{}
 	bestAcceptedDuplicate := map[string]observedRevision{}
+	bestRejectedDuplicate := map[string]observedRevision{}
 	actionGateClaimKeys := map[string]string{}
 	for rows.Next() {
 		var claim ClaimOut
@@ -2042,6 +2042,9 @@ order by c.created_at desc`, intentID)
 		if claim.Status == "accepted" {
 			recordLatestRevision(bestAcceptedDuplicate, duplicateKey, revision, claim.UpdatedAt, claim.ID)
 		}
+		if claim.Status == "rejected" {
+			recordLatestRevision(bestRejectedDuplicate, duplicateKey, revision, claim.UpdatedAt, claim.ID)
+		}
 		claims = append(claims, claim)
 		actionGateClaimRevisions[claim.ID] = revision
 		actionGateClaimKeys[claim.ID] = duplicateKey
@@ -2058,6 +2061,15 @@ order by c.created_at desc`, intentID)
 		}
 		if duplicateAcceptedRevision.ok && claim.Status == "accepted" && revision == duplicateAcceptedRevision.revision {
 			if timestampAfter(duplicateAcceptedRevision.updatedAt, claim.UpdatedAt) || (duplicateAcceptedRevision.updatedAt == claim.UpdatedAt && claim.ID != duplicateAcceptedRevision.id) {
+				continue
+			}
+		}
+		duplicateRejectedRevision := bestRejectedDuplicate[actionGateClaimKeys[claim.ID]]
+		if duplicateRejectedRevision.ok && claim.Status != "accepted" {
+			if claim.Status == "rejected" {
+				continue
+			}
+			if revision < duplicateRejectedRevision.revision || (revision == duplicateRejectedRevision.revision && !timestampAfter(claim.UpdatedAt, duplicateRejectedRevision.updatedAt)) {
 				continue
 			}
 		}
@@ -2179,6 +2191,7 @@ order by c.created_at desc`, intentID)
 	for _, claim := range deduped {
 		acceptedRevision := bestAcceptedSingleton[claim.Kind]
 		if claim.Status == "accepted" && acceptedRevision.ok && claim.ID != acceptedRevision.id && claim.Revision == acceptedRevision.revision && claim.UpdatedAt == acceptedRevision.updatedAt {
+			claim.ReviewReason = "conflict"
 			out = append(out, claim.ClaimOut)
 			continue
 		}

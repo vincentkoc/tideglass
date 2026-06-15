@@ -187,7 +187,7 @@ func runReview(ctx context.Context, args []string) error {
 	reader := bufio.NewReader(os.Stdin)
 	reviewed := 0
 	for _, claim := range profile.Claims {
-		if claim.Status == "accepted" && !*all {
+		if claim.Status == "accepted" && claim.ReviewReason != "conflict" && !*all {
 			continue
 		}
 		fmt.Printf("\n%s\n", strings.Repeat("─", 72))

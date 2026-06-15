@@ -1711,6 +1711,47 @@ func TestLoadActionGateClaimsDropsTiedAcceptedDuplicates(t *testing.T) {
 	}
 }
 
+func TestLoadActionGateClaimsHonorsRejectedDuplicateTombstones(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	intent, err := tg.ensureIntent(ctx, "work.project.start", "Project start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	activeID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "boundary.project.no_go",
+		Value:      "Never deploy on Fridays.",
+		Confidence: 0.7,
+		SourceMode: "inferred",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rejectedID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "boundary.project.no_go",
+		Value:      "Never deploy on Fridays.",
+		Confidence: 0.9,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: rejectedID, Action: "reject", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	claims, err := tg.loadActionGateClaims(ctx, intent.ID, "work.project.start", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasClaimID(claims, activeID) || hasClaimID(claims, rejectedID) {
+		t.Fatalf("rejected duplicate tombstone did not suppress action-gate claim: %#v", claims)
+	}
+}
+
 func TestResolveIntentActionGateBlocksTiedAcceptedSingletonConflict(t *testing.T) {
 	ctx := context.Background()
 	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
@@ -1831,7 +1872,13 @@ func TestLoadReviewCandidateClaimsShowsTiedAcceptedSingletonConflict(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !hasClaimID(candidates, firstID) && !hasClaimID(candidates, secondID) {
+	foundConflict := false
+	for _, candidate := range candidates {
+		if (candidate.ID == firstID || candidate.ID == secondID) && candidate.Status == "accepted" && candidate.ReviewReason == "conflict" {
+			foundConflict = true
+		}
+	}
+	if !foundConflict {
 		t.Fatalf("tied accepted singleton conflict was hidden from review candidates: %#v", candidates)
 	}
 }
