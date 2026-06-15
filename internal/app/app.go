@@ -687,13 +687,15 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 		return IntentResponseEnvelope{}, errors.New("action authorization requires persisted audit")
 	}
 	request := opts.Request
+	request.Context = cloneContextMap(request.Context)
 	request.URI = strings.TrimSpace(request.URI)
 	kind, audienceFromURI, err := parseIntentURI(request.URI)
 	if err != nil {
 		return IntentResponseEnvelope{}, err
 	}
 	if request.Audience.Label() == "agent" && audienceFromURI != "" {
-		request.Audience = IntentAudience{Type: audienceFromURI}
+		request.Audience.Type = audienceFromURI
+		request.Audience.ID = ""
 	}
 	request = normalizeIntentRequest(request)
 	if err := validateIntentRequest(request); err != nil {
@@ -2161,10 +2163,29 @@ where status = 'accepted'
     select 1 from edits value_edits
     where value_edits.claim_id = claims.id
       and json_extract(value_edits.patch_json, '$.value') is not null
-      and julianday(value_edits.created_at) > coalesce((
-        select max(julianday(review_edits.created_at)) from edits review_edits
-        where review_edits.claim_id = claims.id and review_edits.operation = 'accept'
-      ), 0)
+      and value_edits.rowid = (
+        select latest_value.rowid from edits latest_value
+        where latest_value.claim_id = claims.id
+          and json_extract(latest_value.patch_json, '$.value') is not null
+        order by julianday(latest_value.created_at) desc, latest_value.rowid desc limit 1
+      )
+      and (
+        julianday(value_edits.created_at) > coalesce((
+          select max(julianday(review_edits.created_at)) from edits review_edits
+          where review_edits.claim_id = claims.id and review_edits.operation = 'accept'
+        ), 0)
+        or (
+          julianday(value_edits.created_at) = coalesce((
+            select max(julianday(review_edits.created_at)) from edits review_edits
+            where review_edits.claim_id = claims.id and review_edits.operation = 'accept'
+          ), 0)
+          and value_edits.rowid > coalesce((
+            select latest_review.rowid from edits latest_review
+            where latest_review.claim_id = claims.id and latest_review.operation = 'accept'
+            order by julianday(latest_review.created_at) desc, latest_review.rowid desc limit 1
+          ), 0)
+        )
+      )
   )`); err != nil {
 		return err
 	}
@@ -3500,6 +3521,17 @@ func nonNilMap(value map[string]any) map[string]any {
 		return map[string]any{}
 	}
 	return value
+}
+
+func cloneContextMap(value map[string]any) map[string]any {
+	if value == nil {
+		return nil
+	}
+	out := make(map[string]any, len(value))
+	for key, item := range value {
+		out[key] = item
+	}
+	return out
 }
 
 func singletonClaimKind(kind string) bool {

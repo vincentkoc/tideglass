@@ -684,8 +684,12 @@ func TestResolveIntentMigratesLegacyEditedAcceptedClaims(t *testing.T) {
 	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: claimID, Action: "accept", Reason: "test"}); err != nil {
 		t.Fatal(err)
 	}
+	var reviewCreatedAt string
+	if err := tg.db.QueryRowContext(ctx, `select created_at from edits where claim_id = ? and operation = 'accept' order by rowid desc limit 1`, claimID).Scan(&reviewCreatedAt); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := tg.db.ExecContext(ctx, `insert into edits(id,claim_id,operation,patch_json,reason,created_at) values(?,?,?,?,?,?)`,
-		id("edt"), claimID, "supersede", `{"value":"Shellfish allergy."}`, "legacy edit", "2030-01-01T00:00:00.000000000Z"); err != nil {
+		id("edt"), claimID, "supersede", `{"value":"Shellfish allergy."}`, "legacy edit", reviewCreatedAt); err != nil {
 		t.Fatal(err)
 	}
 	if err := tg.ensureIntentRequestSchema(ctx); err != nil {
@@ -1194,6 +1198,26 @@ func TestResolveIntentV2ActionAndDisclosureContracts(t *testing.T) {
 	}
 	if len(response.Claims) != 0 || len(response.Policy.SafeToShare) != 0 {
 		t.Fatalf("share_with external target leaked unrelated claims: claims=%#v policy=%#v", response.Claims, response.Policy)
+	}
+	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
+		URI:      "tideglass://disclosure/work.project.start/agent",
+		Audience: IntentAudience{ShareWith: []string{"venue"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Claims) != 0 || len(response.Policy.SafeToShare) != 0 {
+		t.Fatalf("disclosure URI dropped external share target: claims=%#v policy=%#v", response.Claims, response.Policy)
+	}
+	requestContext := map[string]any{"trace": "original"}
+	if _, err := tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
+		URI:     "tideglass://v1/intent/work.project.start/current",
+		Context: requestContext,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := requestContext["server_authority"]; ok {
+		t.Fatalf("resolve mutated caller context: %#v", requestContext)
 	}
 	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
 		URI:      "tideglass://v1/intent/work.project.start/current",
