@@ -686,13 +686,21 @@ func TestResolveIntentActionGateScansPendingSingletonBoundaries(t *testing.T) {
 	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: oldBoundaryID, Action: "accept", Reason: "test"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+	pendingBoundaryID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
 		Kind:       "boundary.project.no_go",
 		Value:      "New pending boundary.",
 		Confidence: 0.95,
 		SourceMode: "explicit",
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatal(err)
+	}
+	profile, err := tg.Profile(ctx, ProfileOptions{Kind: "work.project.start"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasClaimID(profile.Claims, pendingBoundaryID) {
+		t.Fatalf("pending action boundary was hidden from review profile: %#v", profile.Claims)
 	}
 	response, err := tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, Request: IntentRequestEnvelope{
 		URI:        "tideglass://v1/intent/work.project.start/current",
@@ -2230,6 +2238,15 @@ func hasQuestionSlot(rows []IntentQuestion, value string) bool {
 			slot = row.Kind
 		}
 		if slot == value {
+			return true
+		}
+	}
+	return false
+}
+
+func hasClaimID(rows []ClaimOut, id string) bool {
+	for _, row := range rows {
+		if row.ID == id {
 			return true
 		}
 	}

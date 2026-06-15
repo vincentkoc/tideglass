@@ -659,6 +659,11 @@ func (t *Tideglass) Profile(ctx context.Context, opts ProfileOptions) (ProfileRe
 	if err != nil {
 		return ProfileResult{}, err
 	}
+	actionGateClaims, err := t.loadActionGateClaims(ctx, intent.ID, intent.Kind, nil)
+	if err != nil {
+		return ProfileResult{}, err
+	}
+	claims = mergeClaimOuts(claims, actionGateClaims)
 	evidence := []EvidenceOut(nil)
 	claims, evidence, err = t.attachClaimEvidence(ctx, claims)
 	if err != nil {
@@ -1798,7 +1803,7 @@ order by c.created_at desc`, intentID)
 	out := make([]ClaimOut, 0, len(claims))
 	for _, claim := range claims {
 		revision := actionGateClaimRevisions[claim.ID]
-		if singletonClaimKind(claim.Kind) && claim.Status != "accepted" && bestAcceptedSingleton[claim.Kind] > 0 && revision > 0 && revision < bestAcceptedSingleton[claim.Kind] {
+		if singletonClaimKind(claim.Kind) && bestAcceptedSingleton[claim.Kind] > 0 && revision > 0 && revision < bestAcceptedSingleton[claim.Kind] {
 			continue
 		}
 		out = append(out, claim)
