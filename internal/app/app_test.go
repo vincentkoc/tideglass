@@ -443,24 +443,42 @@ func TestResolveIntentAppliesPolicyAndPersistsSnapshot(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	first, err := tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{URI: "tideglass://intent/work.project.start"}})
+	first, err := tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
+		URI: "tideglass://v1/intent/work.project.start/current",
+		Task: IntentTask{
+			Mode:     "act_gate",
+			Autonomy: "bounded_act",
+			Goal:     "start a project",
+		},
+		Contract: IntentContract{RequiredSlots: []string{"preference.project.validation"}},
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.SchemaVersion != "tideglass.intent_response.v1" || first.ResolvedURI != "tideglass://profile/me/work.project.start/current" {
+	if first.SchemaVersion != "tideglass.intent_response.v2" || first.ResolvedURI != "tideglass://v1/profile/me/work.project.start/current" {
 		t.Fatalf("bad envelope metadata: %#v", first)
+	}
+	if first.RequestID == "" || first.Resource.Kind != "work.project.start" || first.Decision.Autonomy != "bounded_act" {
+		t.Fatalf("missing v2 response contract: %#v", first)
 	}
 	if first.ProfileHash == "" || !strings.HasPrefix(first.ProfileHash, "sha256:") || first.SnapshotID == "" {
 		t.Fatalf("missing hash/snapshot: %#v", first)
 	}
+	if first.Commitments.ResponseHash != first.ProfileHash || first.Commitments.ClaimRoot == "" || first.Commitments.SnapshotID != first.SnapshotID {
+		t.Fatalf("bad commitments: %#v", first.Commitments)
+	}
 	hashView := first
+	hashView.RequestID = ""
 	hashView.ProfileHash = ""
 	hashView.SnapshotID = ""
+	hashView.Commitments.ResponseHash = ""
+	hashView.Commitments.SnapshotID = ""
+	delete(hashView.Links, "self")
 	hashJSON, err := json.Marshal(hashView)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(hashJSON), "profile_hash") || strings.Contains(string(hashJSON), "snapshot_id") {
+	if strings.Contains(string(hashJSON), "profile_hash") || strings.Contains(string(hashJSON), "snapshot_id") || strings.Contains(string(hashJSON), "response_hash") {
 		t.Fatalf("hash view includes mutable metadata: %s", hashJSON)
 	}
 	if got := "sha256:" + hashBytes(hashJSON); got != first.ProfileHash {
@@ -475,7 +493,10 @@ func TestResolveIntentAppliesPolicyAndPersistsSnapshot(t *testing.T) {
 	if !containsString(first.Policy.Redacted, "boundary.project.no_go") {
 		t.Fatalf("redactions = %#v", first.Policy.Redacted)
 	}
-	second, err := tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{URI: "tideglass://intent/work.project.start"}})
+	second, err := tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
+		URI:  "tideglass://intent/work.project.start",
+		Task: IntentTask{Mode: "act_gate", Autonomy: "bounded_act"},
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -511,7 +532,7 @@ func TestResolveIntentSupportsDisclosureAndMissingIntent(t *testing.T) {
 	if response.Intent.Kind != "social.dinner" || response.Policy.Audience != "venue" {
 		t.Fatalf("response = %#v", response)
 	}
-	if response.Status != "partial" || !response.Policy.NeedsUserAnswer || response.Policy.MayAct {
+	if response.Status != "missing" || !response.Policy.NeedsUserAnswer || response.Policy.MayAct {
 		t.Fatalf("missing intent policy = %#v", response.Policy)
 	}
 	if len(response.Unresolved) == 0 || response.Unresolved[0].Kind != "preference.food.allergy" {
@@ -568,6 +589,7 @@ func TestResolveIntentUnreviewedAndStaleClaimsDoNotSatisfyCriticalSlots(t *testi
 	}
 	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
 		URI:        "tideglass://intent/social.dinner",
+		Task:       IntentTask{Mode: "act_gate", Autonomy: "bounded_act"},
 		Freshness:  IntentFreshness{MaxAge: "1h"},
 		Disclosure: IntentDisclosure{AllowSensitive: true},
 	}})
@@ -594,6 +616,7 @@ func TestResolveIntentUnreviewedAndStaleClaimsDoNotSatisfyCriticalSlots(t *testi
 	}
 	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
 		URI:        "tideglass://intent/social.dinner",
+		Task:       IntentTask{Mode: "act_gate", Autonomy: "bounded_act"},
 		Freshness:  IntentFreshness{MaxAge: "1h"},
 		Disclosure: IntentDisclosure{AllowSensitive: true},
 	}})
@@ -636,6 +659,13 @@ func TestResolveIntentCanonicalLinksAndExistenceDisclosure(t *testing.T) {
 	}
 	if response.Intent.Kind != "work.project.start" {
 		t.Fatalf("profile uri response = %#v", response)
+	}
+	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{URI: "tideglass://v1/intent/work.project.start/slots"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Intent.Kind != "work.project.start" || response.Resource.Version != "current" {
+		t.Fatalf("v1 intent slots uri response = %#v", response)
 	}
 	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{URI: response.Links["unresolved"]}})
 	if err != nil {
@@ -727,7 +757,7 @@ func TestServiceHandlerResolvesIntentResource(t *testing.T) {
 	if err := json.NewDecoder(resolve.Body).Decode(&response); err != nil {
 		t.Fatal(err)
 	}
-	if response.Policy.Audience != "venue" || response.ResolvedURI != "tideglass://profile/me/social.dinner/current" {
+	if response.Policy.Audience != "venue" || response.ResolvedURI != "tideglass://v1/profile/me/social.dinner/current" {
 		t.Fatalf("resolve response = %#v", response)
 	}
 	bad, err := http.Get(server.URL + "/resource?uri=tideglass://intent/")
@@ -777,15 +807,15 @@ func TestHandleMCPOnceReadsIntentResource(t *testing.T) {
 	if err := HandleMCPOnce(ctx, tg, input, &output); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(output.String(), `"jsonrpc": "2.0"`) || !strings.Contains(output.String(), `tideglass.intent_response.v1`) {
+	if !strings.Contains(output.String(), `"jsonrpc": "2.0"`) || !strings.Contains(output.String(), `tideglass.intent_response.v2`) {
 		t.Fatalf("mcp output = %s", output.String())
 	}
-	input = strings.NewReader(`{"jsonrpc":"2.0","id":"tool-1","method":"tools/call","params":{"name":"tideglass.resolve_intent","arguments":{"uri":"tideglass://intent/work.project.start"}}}`)
+	input = strings.NewReader(`{"jsonrpc":"2.0","id":"tool-1","method":"tools/call","params":{"name":"tideglass.resolve_intent","arguments":{"schema_version":"tideglass.intent_request.v2","uri":"tideglass://v1/intent/work.project.start/current","audience":{"type":"agent","id":"codex"},"task":{"mode":"context","autonomy":"suggest_only"}}}}`)
 	output.Reset()
 	if err := HandleMCPOnce(ctx, tg, input, &output); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(output.String(), `"id": "tool-1"`) || !strings.Contains(output.String(), `tideglass.intent_response.v1`) {
+	if !strings.Contains(output.String(), `"id": "tool-1"`) || !strings.Contains(output.String(), `tideglass.intent_response.v2`) || !strings.Contains(output.String(), `codex`) {
 		t.Fatalf("mcp tool output = %s", output.String())
 	}
 }

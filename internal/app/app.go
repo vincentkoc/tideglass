@@ -88,44 +88,134 @@ type ResolveOptions struct {
 }
 
 type IntentActor struct {
-	Type    string `json:"type,omitempty"`
-	ID      string `json:"id,omitempty"`
-	Session string `json:"session,omitempty"`
+	Type         string   `json:"type,omitempty"`
+	ID           string   `json:"id,omitempty"`
+	Session      string   `json:"session,omitempty"`
+	TrustTier    string   `json:"trust_tier,omitempty"`
+	Capabilities []string `json:"capabilities,omitempty"`
+}
+
+type IntentTask struct {
+	Goal     string `json:"goal,omitempty"`
+	Mode     string `json:"mode,omitempty"`
+	Stakes   string `json:"stakes,omitempty"`
+	Autonomy string `json:"autonomy,omitempty"`
+	Deadline string `json:"deadline,omitempty"`
+}
+
+type IntentAudience struct {
+	Type      string   `json:"type,omitempty"`
+	ID        string   `json:"id,omitempty"`
+	ShareWith []string `json:"share_with,omitempty"`
+}
+
+func (audience *IntentAudience) UnmarshalJSON(data []byte) error {
+	var label string
+	if err := json.Unmarshal(data, &label); err == nil {
+		audience.Type = strings.TrimSpace(label)
+		audience.ID = ""
+		audience.ShareWith = nil
+		return nil
+	}
+	type audienceAlias IntentAudience
+	var decoded audienceAlias
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*audience = IntentAudience(decoded)
+	return nil
+}
+
+func (audience IntentAudience) Label() string {
+	if strings.TrimSpace(audience.ID) != "" {
+		return strings.TrimSpace(audience.ID)
+	}
+	if strings.TrimSpace(audience.Type) != "" {
+		return strings.TrimSpace(audience.Type)
+	}
+	return "agent"
+}
+
+type IntentContract struct {
+	Output          string   `json:"output,omitempty"`
+	RequiredSlots   []string `json:"required_slots,omitempty"`
+	OptionalSlots   []string `json:"optional_slots,omitempty"`
+	ConfidenceFloor float64  `json:"confidence_floor,omitempty"`
+	AskStrategy     string   `json:"ask_strategy,omitempty"`
+}
+
+type IntentProof struct {
+	Hash         string   `json:"hash,omitempty"`
+	Commitments  string   `json:"commitments,omitempty"`
+	ZKPredicates []string `json:"zk_predicates,omitempty"`
 }
 
 type IntentFreshness struct {
-	MaxAge          string `json:"max_age,omitempty"`
-	RequireReviewed *bool  `json:"require_reviewed,omitempty"`
+	MaxAge                     string `json:"max_age,omitempty"`
+	RequireReviewed            *bool  `json:"require_reviewed,omitempty"`
+	AcceptInferredForQuestions bool   `json:"accept_inferred_for_questions,omitempty"`
 }
 
 type IntentDisclosure struct {
-	Mode           string `json:"mode,omitempty"`
-	AllowEvidence  bool   `json:"allow_evidence,omitempty"`
-	AllowSensitive bool   `json:"allow_sensitive,omitempty"`
+	Mode             string `json:"mode,omitempty"`
+	AllowValues      bool   `json:"allow_values,omitempty"`
+	AllowEvidence    bool   `json:"allow_evidence,omitempty"`
+	AllowSensitive   bool   `json:"allow_sensitive,omitempty"`
+	AllowCommitments bool   `json:"allow_commitments,omitempty"`
 }
 
 type IntentRequestEnvelope struct {
-	URI        string           `json:"uri"`
-	Actor      IntentActor      `json:"actor,omitempty"`
-	Purpose    string           `json:"purpose,omitempty"`
-	Audience   string           `json:"audience,omitempty"`
-	Freshness  IntentFreshness  `json:"freshness,omitempty"`
-	Disclosure IntentDisclosure `json:"disclosure,omitempty"`
-	Context    map[string]any   `json:"context,omitempty"`
+	SchemaVersion string           `json:"schema_version,omitempty"`
+	RequestID     string           `json:"request_id,omitempty"`
+	URI           string           `json:"uri"`
+	Actor         IntentActor      `json:"actor,omitempty"`
+	Task          IntentTask       `json:"task,omitempty"`
+	Purpose       string           `json:"purpose,omitempty"`
+	Audience      IntentAudience   `json:"audience,omitempty"`
+	Freshness     IntentFreshness  `json:"freshness,omitempty"`
+	Disclosure    IntentDisclosure `json:"disclosure,omitempty"`
+	Contract      IntentContract   `json:"contract,omitempty"`
+	Context       map[string]any   `json:"context,omitempty"`
+	Proof         IntentProof      `json:"proof,omitempty"`
 }
 
 type IntentResponseEnvelope struct {
 	SchemaVersion string                `json:"schema_version"`
+	RequestID     string                `json:"request_id,omitempty"`
 	URI           string                `json:"uri"`
 	ResolvedURI   string                `json:"resolved_uri"`
+	Resource      IntentResource        `json:"resource,omitempty"`
 	Intent        IntentOut             `json:"intent"`
 	Status        string                `json:"status"`
+	Decision      IntentDecision        `json:"decision,omitempty"`
 	ProfileHash   string                `json:"profile_hash,omitempty"`
 	SnapshotID    string                `json:"snapshot_id,omitempty"`
 	Claims        []IntentClaimEnvelope `json:"claims"`
 	Unresolved    []IntentQuestion      `json:"unresolved"`
 	Policy        IntentPolicyEnvelope  `json:"policy"`
+	Commitments   IntentCommitments     `json:"commitments,omitempty"`
 	Links         map[string]string     `json:"links"`
+}
+
+type IntentResource struct {
+	Type    string `json:"type,omitempty"`
+	Kind    string `json:"kind,omitempty"`
+	Title   string `json:"title,omitempty"`
+	Version string `json:"version,omitempty"`
+}
+
+type IntentDecision struct {
+	MayAct          bool   `json:"may_act"`
+	Reason          string `json:"reason,omitempty"`
+	Autonomy        string `json:"autonomy,omitempty"`
+	NeedsUserAnswer bool   `json:"needs_user_answer"`
+}
+
+type IntentCommitments struct {
+	ResponseHash string `json:"response_hash,omitempty"`
+	ClaimRoot    string `json:"claim_root,omitempty"`
+	SnapshotID   string `json:"snapshot_id,omitempty"`
+	Algorithm    string `json:"algorithm,omitempty"`
 }
 
 type IntentClaimEnvelope struct {
@@ -136,22 +226,29 @@ type IntentClaimEnvelope struct {
 	Status      string   `json:"status"`
 	SourceMode  string   `json:"source_mode,omitempty"`
 	Sensitivity string   `json:"sensitivity,omitempty"`
+	FreshAt     string   `json:"fresh_at,omitempty"`
+	Commitment  string   `json:"commitment,omitempty"`
 	Evidence    []string `json:"evidence,omitempty"`
 }
 
 type IntentQuestion struct {
-	Kind     string `json:"kind"`
-	Question string `json:"question"`
-	Priority string `json:"priority"`
+	Kind         string `json:"kind"`
+	Slot         string `json:"slot,omitempty"`
+	Question     string `json:"question"`
+	Priority     string `json:"priority"`
+	BlocksAction bool   `json:"blocks_action,omitempty"`
+	AnswerType   string `json:"answer_type,omitempty"`
 }
 
 type IntentPolicyEnvelope struct {
-	Audience        string   `json:"audience"`
-	DisclosureMode  string   `json:"disclosure_mode"`
-	MayAct          bool     `json:"may_act"`
-	NeedsUserAnswer bool     `json:"needs_user_answer"`
-	SafeToShare     []string `json:"safe_to_share"`
-	Redacted        []string `json:"redacted"`
+	Audience           string   `json:"audience"`
+	DisclosureMode     string   `json:"disclosure_mode"`
+	MayAct             bool     `json:"may_act"`
+	NeedsUserAnswer    bool     `json:"needs_user_answer"`
+	SafeToShare        []string `json:"safe_to_share"`
+	Redacted           []string `json:"redacted"`
+	Freshness          string   `json:"freshness,omitempty"`
+	CapabilityRequired []string `json:"capability_required,omitempty"`
 }
 
 type SourceStatus struct {
@@ -575,8 +672,8 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 	if err != nil {
 		return IntentResponseEnvelope{}, err
 	}
-	if request.Audience == "" && audienceFromURI != "" {
-		request.Audience = audienceFromURI
+	if request.Audience.Label() == "agent" && audienceFromURI != "" {
+		request.Audience = IntentAudience{Type: audienceFromURI}
 	}
 	request = normalizeIntentRequest(request)
 	if err := validateIntentRequest(request); err != nil {
@@ -616,6 +713,7 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 		unresolved = unresolvedIntentQuestions(kind, nil)
 	}
 	filteredClaims, policy := applyIntentPolicy(claims, unresolved, request)
+	filteredClaims = addClaimCommitments(filteredClaims, request)
 	if hasRedactedCriticalClaim(kind, policy.Redacted) {
 		policy.NeedsUserAnswer = true
 		policy.MayAct = false
@@ -628,26 +726,47 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 	if !foundIntent || policy.NeedsUserAnswer {
 		status = "partial"
 	}
+	if !foundIntent {
+		status = "missing"
+	}
+	decision := IntentDecision{
+		MayAct:          policy.MayAct,
+		Reason:          decisionReason(foundIntent, policy),
+		Autonomy:        request.Task.Autonomy,
+		NeedsUserAnswer: policy.NeedsUserAnswer,
+	}
 	response := IntentResponseEnvelope{
-		SchemaVersion: "tideglass.intent_response.v1",
-		URI:           request.URI,
-		ResolvedURI:   "tideglass://profile/me/" + kind + "/current",
+		SchemaVersion: "tideglass.intent_response.v2",
+		RequestID:     requestID,
+		URI:           "tideglass://v1/intent/" + kind + "/current",
+		ResolvedURI:   "tideglass://v1/profile/me/" + kind + "/current",
+		Resource:      IntentResource{Type: "intent", Kind: kind, Title: intent.Title, Version: "current"},
 		Intent:        intent,
 		Status:        status,
+		Decision:      decision,
 		Claims:        filteredClaims,
 		Unresolved:    unresolved,
 		Policy:        policy,
+		Commitments: IntentCommitments{
+			ClaimRoot: claimRoot(filteredClaims),
+			Algorithm: "canonical-json-sha256-v1",
+		},
 		Links: map[string]string{
-			"profile":    "tideglass://profile/me/" + kind + "/current",
-			"unresolved": "tideglass://unresolved/" + kind,
-			"disclosure": "tideglass://disclosure/" + kind + "/" + request.Audience,
+			"profile":    "tideglass://v1/profile/me/" + kind + "/current",
+			"slots":      "tideglass://v1/intent/" + kind + "/slots",
+			"unresolved": "tideglass://v1/intent/" + kind + "/unresolved",
+			"schema":     "tideglass://v1/schema/response-envelope/v2",
+			"disclosure": "tideglass://disclosure/" + kind + "/" + request.Audience.Label(),
 		},
 	}
 	response.ProfileHash = profileHash(response)
+	response.Commitments.ResponseHash = response.ProfileHash
 	response.SnapshotID, err = t.persistProfileSnapshot(ctx, requestID, response)
 	if err != nil {
 		return IntentResponseEnvelope{}, err
 	}
+	response.Commitments.SnapshotID = response.SnapshotID
+	response.Links["self"] = "tideglass://v1/snapshot/" + response.SnapshotID
 	return response, nil
 }
 
@@ -1138,7 +1257,7 @@ func (t *Tideglass) persistIntentRequest(ctx context.Context, request IntentRequ
 	_, err = t.db.ExecContext(ctx, `
 insert into intent_requests(id,uri,actor_json,purpose,audience,freshness_json,disclosure_json,context_json,created_at)
 values(?,?,?,?,?,?,?,?,?)`,
-		requestID, request.URI, string(actorJSON), request.Purpose, request.Audience, string(freshnessJSON), string(disclosureJSON), string(contextJSON), now())
+		requestID, request.URI, string(actorJSON), legacyPurpose(request), request.Audience.Label(), string(freshnessJSON), string(disclosureJSON), string(contextJSON), now())
 	return requestID, err
 }
 
@@ -2281,13 +2400,32 @@ func unresolvedIntentQuestions(kind string, claims []ClaimOut) []IntentQuestion 
 	out := make([]IntentQuestion, 0, len(rows))
 	for _, row := range rows {
 		if !have[row.Kind] {
-			out = append(out, IntentQuestion(row))
+			question := IntentQuestion{
+				Kind:     row.Kind,
+				Slot:     row.Kind,
+				Question: row.Question,
+				Priority: row.Priority,
+			}
+			question.BlocksAction = question.Priority == "critical"
+			question.AnswerType = "short_text"
+			out = append(out, question)
 		}
 	}
 	return out
 }
 
+func legacyPurpose(request IntentRequestEnvelope) string {
+	if strings.TrimSpace(request.Purpose) != "" {
+		return strings.TrimSpace(request.Purpose)
+	}
+	return strings.TrimSpace(request.Task.Goal)
+}
+
 func normalizeIntentRequest(request IntentRequestEnvelope) IntentRequestEnvelope {
+	request.SchemaVersion = strings.TrimSpace(request.SchemaVersion)
+	if request.SchemaVersion == "" {
+		request.SchemaVersion = "tideglass.intent_request.v2"
+	}
 	request.URI = strings.TrimSpace(request.URI)
 	request.Actor.Type = strings.TrimSpace(request.Actor.Type)
 	if request.Actor.Type == "" {
@@ -2297,13 +2435,47 @@ func normalizeIntentRequest(request IntentRequestEnvelope) IntentRequestEnvelope
 	if request.Actor.ID == "" {
 		request.Actor.ID = "local"
 	}
-	request.Audience = strings.TrimSpace(request.Audience)
-	if request.Audience == "" {
-		request.Audience = "agent"
+	request.Actor.TrustTier = strings.TrimSpace(request.Actor.TrustTier)
+	if request.Actor.TrustTier == "" {
+		request.Actor.TrustTier = "local"
+	}
+	request.Task.Mode = strings.ToLower(strings.TrimSpace(request.Task.Mode))
+	if request.Task.Mode == "" {
+		request.Task.Mode = "context"
+	}
+	request.Task.Autonomy = strings.ToLower(strings.TrimSpace(request.Task.Autonomy))
+	if request.Task.Autonomy == "" {
+		request.Task.Autonomy = "suggest_only"
+	}
+	if request.Task.Goal == "" && strings.TrimSpace(request.Purpose) != "" {
+		request.Task.Goal = strings.TrimSpace(request.Purpose)
+	}
+	request.Audience.Type = strings.TrimSpace(request.Audience.Type)
+	request.Audience.ID = strings.TrimSpace(request.Audience.ID)
+	if request.Audience.Type == "" && request.Audience.ID == "" {
+		request.Audience.Type = "agent"
 	}
 	request.Disclosure.Mode = strings.ToLower(strings.TrimSpace(request.Disclosure.Mode))
 	if request.Disclosure.Mode == "" {
 		request.Disclosure.Mode = "minimal"
+	}
+	if !request.Disclosure.AllowValues && request.Disclosure.Mode != "existence" {
+		request.Disclosure.AllowValues = true
+	}
+	if !request.Disclosure.AllowCommitments {
+		request.Disclosure.AllowCommitments = true
+	}
+	request.Contract.Output = strings.TrimSpace(request.Contract.Output)
+	if request.Contract.Output == "" {
+		request.Contract.Output = "decision_contract"
+	}
+	request.Proof.Hash = strings.TrimSpace(request.Proof.Hash)
+	if request.Proof.Hash == "" {
+		request.Proof.Hash = "response"
+	}
+	request.Proof.Commitments = strings.TrimSpace(request.Proof.Commitments)
+	if request.Proof.Commitments == "" {
+		request.Proof.Commitments = "per_claim"
 	}
 	if request.Context == nil {
 		request.Context = map[string]any{}
@@ -2312,12 +2484,27 @@ func normalizeIntentRequest(request IntentRequestEnvelope) IntentRequestEnvelope
 }
 
 func validateIntentRequest(request IntentRequestEnvelope) error {
+	switch request.SchemaVersion {
+	case "tideglass.intent_request.v2", "tideglass.intent_request.v1", "":
+	default:
+		return fmt.Errorf("unsupported request schema_version %q", request.SchemaVersion)
+	}
 	switch request.Disclosure.Mode {
 	case "full", "minimal", "existence":
-		return nil
 	default:
 		return fmt.Errorf("unsupported disclosure mode %q", request.Disclosure.Mode)
 	}
+	switch request.Task.Mode {
+	case "context", "slot_fill", "act_gate", "compare", "handoff", "review":
+	default:
+		return fmt.Errorf("unsupported task mode %q", request.Task.Mode)
+	}
+	switch request.Task.Autonomy {
+	case "context_only", "suggest_only", "suggest_then_confirm", "bounded_act", "deny":
+	default:
+		return fmt.Errorf("unsupported autonomy %q", request.Task.Autonomy)
+	}
+	return nil
 }
 
 func parseIntentURI(rawURI string) (string, string, error) {
@@ -2331,7 +2518,11 @@ func parseIntentURI(rawURI string) (string, string, error) {
 	rest := strings.TrimPrefix(uri, "tideglass://")
 	parts := strings.Split(rest, "/")
 	switch {
+	case len(parts) >= 2 && parts[0] == "v1":
+		return parseIntentURI("tideglass://" + strings.Join(parts[1:], "/"))
 	case len(parts) == 2 && parts[0] == "intent" && strings.TrimSpace(parts[1]) != "":
+		return normalizeKind(parts[1], ""), "", nil
+	case len(parts) == 3 && parts[0] == "intent" && strings.TrimSpace(parts[1]) != "" && (parts[2] == "current" || parts[2] == "slots" || parts[2] == "unresolved"):
 		return normalizeKind(parts[1], ""), "", nil
 	case len(parts) == 4 && parts[0] == "profile" && parts[1] == "me" && strings.TrimSpace(parts[2]) != "" && parts[3] == "current":
 		return normalizeKind(parts[2], ""), "", nil
@@ -2381,12 +2572,17 @@ func parseMaxAge(value string) (time.Duration, error) {
 }
 
 func applyIntentPolicy(claims []ClaimOut, unresolved []IntentQuestion, request IntentRequestEnvelope) ([]IntentClaimEnvelope, IntentPolicyEnvelope) {
+	freshness := "reviewed"
+	if request.Freshness.MaxAge != "" {
+		freshness += "_" + request.Freshness.MaxAge
+	}
 	policy := IntentPolicyEnvelope{
-		Audience:        request.Audience,
+		Audience:        request.Audience.Label(),
 		DisclosureMode:  request.Disclosure.Mode,
 		SafeToShare:     []string{},
 		Redacted:        []string{},
 		NeedsUserAnswer: hasCriticalUnresolved(unresolved),
+		Freshness:       freshness,
 	}
 	out := make([]IntentClaimEnvelope, 0, len(claims))
 	redacted := map[string]bool{}
@@ -2401,6 +2597,7 @@ func applyIntentPolicy(claims []ClaimOut, unresolved []IntentQuestion, request I
 			Status:      claim.Status,
 			SourceMode:  claim.SourceMode,
 			Sensitivity: sensitivity,
+			FreshAt:     claim.UpdatedAt,
 		}
 		if request.Disclosure.AllowEvidence {
 			envelope.Evidence = claim.Evidence
@@ -2435,7 +2632,56 @@ func applyIntentPolicy(claims []ClaimOut, unresolved []IntentQuestion, request I
 		return out[i].ID < out[j].ID
 	})
 	policy.MayAct = !policy.NeedsUserAnswer
+	if request.Task.Autonomy == "context_only" || request.Task.Autonomy == "suggest_only" || request.Task.Autonomy == "deny" {
+		policy.MayAct = false
+	}
 	return out, policy
+}
+
+func addClaimCommitments(claims []IntentClaimEnvelope, request IntentRequestEnvelope) []IntentClaimEnvelope {
+	if !request.Disclosure.AllowCommitments {
+		return claims
+	}
+	out := make([]IntentClaimEnvelope, len(claims))
+	for index, claim := range claims {
+		out[index] = claim
+		out[index].Commitment = claimCommitment(claim)
+	}
+	return out
+}
+
+func claimCommitment(claim IntentClaimEnvelope) string {
+	data, _ := json.Marshal(map[string]string{
+		"kind":   claim.Kind,
+		"status": claim.Status,
+		"value":  claim.Value,
+	})
+	return "sha256:" + hashBytes(data)
+}
+
+func claimRoot(claims []IntentClaimEnvelope) string {
+	commitments := make([]string, 0, len(claims))
+	for _, claim := range claims {
+		if claim.Commitment != "" {
+			commitments = append(commitments, claim.Commitment)
+		}
+	}
+	sort.Strings(commitments)
+	data, _ := json.Marshal(commitments)
+	return "sha256:" + hashBytes(data)
+}
+
+func decisionReason(foundIntent bool, policy IntentPolicyEnvelope) string {
+	switch {
+	case !foundIntent:
+		return "intent_missing"
+	case policy.NeedsUserAnswer:
+		return "critical_slots_missing"
+	case !policy.MayAct:
+		return "autonomy_blocks_action"
+	default:
+		return "ready"
+	}
 }
 
 func shouldRedactClaim(disclosure IntentDisclosure, sensitivity string) bool {
@@ -2505,8 +2751,11 @@ func criticalClaimKinds(intentKind string) map[string]bool {
 }
 
 func profileHash(response IntentResponseEnvelope) string {
+	response.RequestID = ""
 	response.ProfileHash = ""
 	response.SnapshotID = ""
+	response.Commitments.ResponseHash = ""
+	response.Commitments.SnapshotID = ""
 	data, _ := json.Marshal(response)
 	return "sha256:" + hashBytes(data)
 }
