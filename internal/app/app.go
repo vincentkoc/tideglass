@@ -927,30 +927,22 @@ func (t *Tideglass) ReviewClaim(ctx context.Context, opts ReviewOptions) (Review
 	default:
 		return ReviewResult{}, fmt.Errorf("unsupported review action %q", opts.Action)
 	}
-	var currentStatus string
-	if err := t.db.QueryRowContext(ctx, `select status from claims where id = ?`, claimID).Scan(&currentStatus); err != nil {
-		return ReviewResult{}, err
-	}
-	sameStatus := currentStatus == status
 	tx, err := t.db.BeginTx(ctx, nil)
 	if err != nil {
 		return ReviewResult{}, err
 	}
-	revision := int64(0)
-	if !sameStatus {
-		revision, err = nextRevision(ctx, tx)
-		if err != nil {
-			_ = tx.Rollback()
-			return ReviewResult{}, err
-		}
+	var currentStatus string
+	var currentRevision int64
+	if err := tx.QueryRowContext(ctx, `select status, revision from claims where id = ?`, claimID).Scan(&currentStatus, &currentRevision); err != nil {
+		_ = tx.Rollback()
+		return ReviewResult{}, err
 	}
-	updateSQL := `update claims set status = ?, updated_at = ? where id = ?`
-	updateArgs := []any{status, now(), claimID}
-	if !sameStatus {
-		updateSQL = `update claims set status = ?, updated_at = ?, revision = ? where id = ?`
-		updateArgs = []any{status, now(), revision, claimID}
+	revision, err := nextRevision(ctx, tx)
+	if err != nil {
+		_ = tx.Rollback()
+		return ReviewResult{}, err
 	}
-	res, err := tx.ExecContext(ctx, updateSQL, updateArgs...)
+	res, err := tx.ExecContext(ctx, `update claims set status = ?, updated_at = ?, revision = ? where id = ? and revision = ? and status = ?`, status, now(), revision, claimID, currentRevision, currentStatus)
 	if err != nil {
 		_ = tx.Rollback()
 		return ReviewResult{}, err
@@ -3409,6 +3401,25 @@ func actionScopeHash(request IntentRequestEnvelope) string {
 			"id":         request.Audience.ID,
 			"share_with": normalizedStringSet(request.Audience.ShareWith),
 		},
+		"contract": map[string]any{
+			"output":           request.Contract.Output,
+			"required_slots":   normalizedStringSet(request.Contract.RequiredSlots),
+			"optional_slots":   normalizedStringSet(request.Contract.OptionalSlots),
+			"confidence_floor": request.Contract.ConfidenceFloor,
+			"ask_strategy":     request.Contract.AskStrategy,
+		},
+		"freshness": map[string]any{
+			"max_age":                       request.Freshness.MaxAge,
+			"require_reviewed":              request.Freshness.RequireReviewed,
+			"accept_inferred_for_questions": request.Freshness.AcceptInferredForQuestions,
+		},
+		"disclosure": map[string]any{
+			"mode":              request.Disclosure.Mode,
+			"allow_values":      request.Disclosure.AllowValues,
+			"allow_evidence":    request.Disclosure.AllowEvidence,
+			"allow_sensitive":   request.Disclosure.AllowSensitive,
+			"allow_commitments": request.Disclosure.AllowCommitments,
+		},
 		"context": actionScopeContext(request.Context),
 	}
 	data, _ := json.Marshal(scope)
@@ -3421,7 +3432,6 @@ func actionScopeContext(contextMap map[string]any) map[string]any {
 	}
 	out := make(map[string]any, len(contextMap))
 	for key, value := range contextMap {
-		key = strings.TrimSpace(key)
 		if key == "" || key == "server_authority" || key == "client_request_id" {
 			continue
 		}
@@ -3516,7 +3526,7 @@ func belowConfidenceFloor(claim ClaimOut, request IntentRequestEnvelope) bool {
 }
 
 func losslessClaimValueKey(value string) string {
-	return strings.Join(strings.Fields(strings.TrimSpace(value)), " ")
+	return strings.TrimSpace(value)
 }
 
 func parseMaxAge(value string) (time.Duration, error) {
