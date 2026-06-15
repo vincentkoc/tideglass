@@ -743,7 +743,7 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 		slotClaims := claimsForSlotSatisfaction(kind, loaded, request, maxAge)
 		unresolved = unresolvedIntentQuestions(intent.Kind, slotClaims)
 		unresolved = addRequiredSlotQuestions(unresolved, slotClaims, request.Contract.RequiredSlots)
-		if request.Task.Mode == "act_gate" && !hasActionGateConstraint(kind, claims, request, maxAge) && len(policyFailedClaims) == 0 {
+		if request.Task.Mode == "act_gate" && !hasActionGateConstraint(kind, claims, request, maxAge) {
 			unresolved = append(unresolved, questionForSlot("policy.action.constraints", "critical", true))
 		}
 	} else {
@@ -1137,7 +1137,9 @@ func NewServiceHandlerWithToken(t *Tideglass, token string) http.Handler {
 		}
 		defer r.Body.Close()
 		var request IntentRequestEnvelope
-		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&request); err != nil {
+		dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+		dec.UseNumber()
+		if err := dec.Decode(&request); err != nil {
 			writeHTTPError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -1194,7 +1196,7 @@ func HandleMCPOnce(ctx context.Context, t *Tideglass, in io.Reader, out io.Write
 		var params struct {
 			URI string `json:"uri"`
 		}
-		if err := json.Unmarshal(req.Params, &params); err != nil {
+		if err := decodeJSONUseNumber(req.Params, &params); err != nil {
 			return writeMCPError(out, req.ID, -32602, err.Error())
 		}
 		response, err := t.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{URI: params.URI}, NoPersist: true})
@@ -1211,7 +1213,7 @@ func HandleMCPOnce(ctx context.Context, t *Tideglass, in io.Reader, out io.Write
 			Name      string                `json:"name"`
 			Arguments IntentRequestEnvelope `json:"arguments"`
 		}
-		if err := json.Unmarshal(req.Params, &params); err != nil {
+		if err := decodeJSONUseNumber(req.Params, &params); err != nil {
 			return writeMCPError(out, req.ID, -32602, err.Error())
 		}
 		if params.Name != "tideglass.resolve_intent" {
@@ -1244,6 +1246,12 @@ func writeMCPError(out io.Writer, id any, code int, message string) error {
 			"message": message,
 		},
 	})
+}
+
+func decodeJSONUseNumber(data []byte, value any) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	return dec.Decode(value)
 }
 
 func writeHTTPJSON(w http.ResponseWriter, status int, value any) {
@@ -1700,7 +1708,7 @@ func (t *Tideglass) loadActionGateClaims(ctx context.Context, intentID, intentKi
 select c.id, c.kind,
        coalesce(json_extract(e.patch_json, '$.value'), c.value) as value,
        c.confidence, c.status, c.source_mode,
-       c.updated_at, coalesce(e.created_at, '')
+       c.updated_at, coalesce(e.created_at, ''), c.rowid
 from claims c
 left join edits e on e.id = (
   select id from edits
@@ -1713,12 +1721,20 @@ order by c.created_at desc`, intentID)
 		return nil, err
 	}
 	defer rows.Close()
-	var claims []ClaimOut
-	bestAcceptedSingleton := map[string]string{}
+	type actionGateClaim struct {
+		ClaimOut
+		RowID int64
+	}
+	var claims []actionGateClaim
+	type singletonVersion struct {
+		UpdatedAt string
+		RowID     int64
+	}
+	bestAcceptedSingleton := map[string]singletonVersion{}
 	for rows.Next() {
-		var claim ClaimOut
+		var claim actionGateClaim
 		var valueEditCreatedAt string
-		if err := rows.Scan(&claim.ID, &claim.Kind, &claim.Value, &claim.Confidence, &claim.Status, &claim.SourceMode, &claim.UpdatedAt, &valueEditCreatedAt); err != nil {
+		if err := rows.Scan(&claim.ID, &claim.Kind, &claim.Value, &claim.Confidence, &claim.Status, &claim.SourceMode, &claim.UpdatedAt, &valueEditCreatedAt, &claim.RowID); err != nil {
 			return nil, err
 		}
 		if !blocking[claim.Kind] && !strings.HasPrefix(claim.Kind, "boundary.") {
@@ -1727,22 +1743,39 @@ order by c.created_at desc`, intentID)
 		if valueEditCreatedAt > claim.UpdatedAt {
 			claim.UpdatedAt = valueEditCreatedAt
 		}
-		if singletonClaimKind(claim.Kind) && claim.Status == "accepted" && claim.UpdatedAt > bestAcceptedSingleton[claim.Kind] {
-			bestAcceptedSingleton[claim.Kind] = claim.UpdatedAt
+		if singletonClaimKind(claim.Kind) && claim.Status == "accepted" && newerSingletonVersion(claim.UpdatedAt, claim.RowID, bestAcceptedSingleton[claim.Kind]) {
+			bestAcceptedSingleton[claim.Kind] = singletonVersion{UpdatedAt: claim.UpdatedAt, RowID: claim.RowID}
 		}
 		claims = append(claims, claim)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	out := claims[:0]
+	out := make([]ClaimOut, 0, len(claims))
 	for _, claim := range claims {
-		if singletonClaimKind(claim.Kind) && claim.Status != "accepted" && bestAcceptedSingleton[claim.Kind] != "" && claim.UpdatedAt < bestAcceptedSingleton[claim.Kind] {
+		if singletonClaimKind(claim.Kind) && claim.Status != "accepted" && singletonSuperseded(claim.UpdatedAt, claim.RowID, bestAcceptedSingleton[claim.Kind]) {
 			continue
 		}
-		out = append(out, claim)
+		out = append(out, claim.ClaimOut)
 	}
 	return out, nil
+}
+
+func newerSingletonVersion(updatedAt string, rowID int64, previous struct {
+	UpdatedAt string
+	RowID     int64
+}) bool {
+	return updatedAt > previous.UpdatedAt || (updatedAt == previous.UpdatedAt && rowID > previous.RowID)
+}
+
+func singletonSuperseded(updatedAt string, rowID int64, accepted struct {
+	UpdatedAt string
+	RowID     int64
+}) bool {
+	if accepted.UpdatedAt == "" {
+		return false
+	}
+	return updatedAt < accepted.UpdatedAt || (updatedAt == accepted.UpdatedAt && rowID < accepted.RowID)
 }
 
 func (t *Tideglass) attachClaimEvidence(ctx context.Context, claims []ClaimOut) ([]ClaimOut, []EvidenceOut, error) {
@@ -2921,7 +2954,7 @@ func actionGatePolicyFailingClaims(intentKind string, claims []ClaimOut, request
 		if !blocking[claim.Kind] && !strings.HasPrefix(claim.Kind, "boundary.") {
 			continue
 		}
-		if claim.Status != "accepted" || claimStale(claim, maxAge) {
+		if claim.Status != "accepted" || claimStale(claim, maxAge) || belowConfidenceFloor(claim, request) {
 			out = append(out, claim)
 		}
 	}
@@ -2936,7 +2969,7 @@ func hasActionGateConstraint(intentKind string, claims []ClaimOut, request Inten
 		}
 	}
 	for _, claim := range claims {
-		if claim.Status != "accepted" || claimStale(claim, maxAge) {
+		if claim.Status != "accepted" || claimStale(claim, maxAge) || belowConfidenceFloor(claim, request) {
 			continue
 		}
 		if blocking[claim.Kind] || strings.HasPrefix(claim.Kind, "boundary.") {
@@ -2987,7 +3020,7 @@ func claimsForSlotSatisfaction(intentKind string, claims []ClaimOut, request Int
 				continue
 			}
 		}
-		if request.Contract.ConfidenceFloor > 0 && claim.Confidence < request.Contract.ConfidenceFloor {
+		if belowConfidenceFloor(claim, request) {
 			continue
 		}
 		out = append(out, claim)
@@ -3001,6 +3034,10 @@ func claimStale(claim ClaimOut, maxAge time.Duration) bool {
 	}
 	updatedAt, err := time.Parse(time.RFC3339, claim.UpdatedAt)
 	return err != nil || time.Since(updatedAt) > maxAge
+}
+
+func belowConfidenceFloor(claim ClaimOut, request IntentRequestEnvelope) bool {
+	return request.Contract.ConfidenceFloor > 0 && claim.Confidence < request.Contract.ConfidenceFloor
 }
 
 func parseMaxAge(value string) (time.Duration, error) {

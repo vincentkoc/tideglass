@@ -755,6 +755,9 @@ func TestResolveIntentActionGateIgnoresSupersededSingletonBoundaries(t *testing.
 	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: newBoundaryID, Action: "accept", Reason: "test"}); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := tg.db.ExecContext(ctx, `update claims set updated_at = ? where id in (?, ?)`, "2026-01-01T00:00:00Z", oldBoundaryID, newBoundaryID); err != nil {
+		t.Fatal(err)
+	}
 	response, err := tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, Request: IntentRequestEnvelope{
 		URI:        "tideglass://v1/intent/work.project.start/current",
 		Task:       IntentTask{Mode: "act_gate", Autonomy: "bounded_act"},
@@ -1296,6 +1299,27 @@ func TestServiceHandlerResolvesIntentResource(t *testing.T) {
 	if response.Policy.Audience != "venue" || response.ResolvedURI != "tideglass://v1/profile/me/social.dinner/current" {
 		t.Fatalf("resolve response = %#v", response)
 	}
+	bigNumberBody := strings.NewReader(`{"uri":"tideglass://disclosure/social.dinner/venue","context":{"trace":9007199254740993}}`)
+	bigNumberResolve, err := authedHTTP(t, http.MethodPost, server.URL+"/resolve", "application/json", bigNumberBody, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bigNumberResolve.Body.Close()
+	if bigNumberResolve.StatusCode != http.StatusOK {
+		data, _ := io.ReadAll(bigNumberResolve.Body)
+		t.Fatalf("big-number resolve status = %d body=%s", bigNumberResolve.StatusCode, data)
+	}
+	response = IntentResponseEnvelope{}
+	if err := json.NewDecoder(bigNumberResolve.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	var requestJSON string
+	if err := tg.db.QueryRowContext(ctx, `select request_json from intent_requests where id = ?`, response.RequestID).Scan(&requestJSON); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(requestJSON, "9007199254740993") || strings.Contains(requestJSON, "9007199254740992") {
+		t.Fatalf("large HTTP context number was not preserved: %s", requestJSON)
+	}
 	bad, err := authedHTTP(t, http.MethodGet, server.URL+"/resource?uri=tideglass://intent/", "", nil, token)
 	defer bad.Body.Close()
 	if bad.StatusCode != http.StatusBadRequest {
@@ -1370,6 +1394,18 @@ func TestHandleMCPOnceReadsIntentResource(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), `"error"`) || !strings.Contains(output.String(), `trusted server capability`) {
 		t.Fatalf("expected self-declared MCP capability error response: %s", output.String())
+	}
+	input = strings.NewReader(`{"jsonrpc":"2.0","id":"tool-big","method":"tools/call","params":{"name":"tideglass.resolve_intent","arguments":{"uri":"tideglass://v1/intent/work.project.start/current","context":{"trace":9007199254740993}}}}`)
+	output.Reset()
+	if err := HandleMCPOnce(ctx, tg, input, &output); err != nil {
+		t.Fatal(err)
+	}
+	var requestJSON string
+	if err := tg.db.QueryRowContext(ctx, `select request_json from intent_requests order by rowid desc limit 1`).Scan(&requestJSON); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(requestJSON, "9007199254740993") || strings.Contains(requestJSON, "9007199254740992") {
+		t.Fatalf("large MCP context number was not preserved: %s", requestJSON)
 	}
 	input = strings.NewReader(`{"jsonrpc":"2.0","id":"bad-uri","method":"resources/read","params":{"uri":"tideglass://intent/"}}`)
 	output.Reset()

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -409,7 +410,9 @@ func runResolve(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		if err := json.Unmarshal(data, &request); err != nil {
+		dec := json.NewDecoder(bytes.NewReader(data))
+		dec.UseNumber()
+		if err := dec.Decode(&request); err != nil {
 			return err
 		}
 	} else {
