@@ -1326,7 +1326,15 @@ func HandleMCPOnce(ctx context.Context, t *Tideglass, in io.Reader, out io.Write
 		Method  string          `json:"method"`
 		Params  json.RawMessage `json:"params,omitempty"`
 	}
-	dec := json.NewDecoder(io.LimitReader(in, 1<<20))
+	const maxMCPInputBytes = 1 << 20
+	data, err := io.ReadAll(io.LimitReader(in, maxMCPInputBytes+1))
+	if err != nil {
+		return writeMCPError(out, nil, -32700, err.Error())
+	}
+	if len(data) > maxMCPInputBytes {
+		return writeMCPError(out, nil, -32700, "mcp input too large")
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
 	if err := dec.Decode(&req); err != nil {
 		return writeMCPError(out, nil, -32700, err.Error())

@@ -2641,6 +2641,15 @@ func TestHandleMCPOnceReadsIntentResource(t *testing.T) {
 	if !strings.Contains(output.String(), `"id": null`) || !strings.Contains(output.String(), `"code": -32700`) {
 		t.Fatalf("expected MCP trailing input parse error envelope: %s", output.String())
 	}
+	oversizedPrefix := `{"jsonrpc":"2.0","id":"too-large","method":"resources/read","params":{"uri":"tideglass://intent/work.project.start"}}`
+	input = strings.NewReader(oversizedPrefix + strings.Repeat(" ", (1<<20)-len(oversizedPrefix)+1) + `{}`)
+	output.Reset()
+	if err := HandleMCPOnce(ctx, tg, input, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), `"id": null`) || !strings.Contains(output.String(), `"code": -32700`) || !strings.Contains(output.String(), `mcp input too large`) {
+		t.Fatalf("expected MCP oversized input parse error envelope: %s", output.String())
+	}
 }
 
 func TestProbeSQLiteMarksMissingExpectedTablesPartial(t *testing.T) {
