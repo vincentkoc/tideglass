@@ -1471,6 +1471,50 @@ func TestLoadActionGateClaimsKeepsNewerRevisionZeroPendingSingleton(t *testing.T
 	}
 }
 
+func TestLoadActionGateClaimsKeepsTiedRevisionZeroPendingSingleton(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	intent, err := tg.ensureIntent(ctx, "work.project.start", "Project start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	acceptedID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "boundary.project.no_go",
+		Value:      "Accepted boundary.",
+		Confidence: 0.9,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: acceptedID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	pendingID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "boundary.project.no_go",
+		Value:      "Ambiguous pending boundary.",
+		Confidence: 0.95,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.db.ExecContext(ctx, `update claims set revision = 0, updated_at = ? where id in (?, ?)`, "2024-01-01T00:00:00Z", acceptedID, pendingID); err != nil {
+		t.Fatal(err)
+	}
+	claims, err := tg.loadActionGateClaims(ctx, intent.ID, "work.project.start", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasClaimID(claims, pendingID) {
+		t.Fatalf("tied revision-zero pending singleton was hidden: %#v", claims)
+	}
+}
+
 func TestLoadActionGateClaimsDropsSupersededAcceptedSingletons(t *testing.T) {
 	ctx := context.Background()
 	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
@@ -1515,6 +1559,59 @@ func TestLoadActionGateClaimsDropsSupersededAcceptedSingletons(t *testing.T) {
 	}
 	if !hasClaimID(claims, newID) {
 		t.Fatalf("new accepted singleton missing from action gate claims: %#v", claims)
+	}
+}
+
+func TestLoadActionGateClaimsDropsTiedAcceptedDuplicates(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	intent, err := tg.ensureIntent(ctx, "social.dinner", "Dinner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "boundary.social.topic",
+		Value:      "No external publishing.",
+		Confidence: 0.9,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: firstID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	secondID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "boundary.social.topic",
+		Value:      "No external publishing.",
+		Confidence: 0.95,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: secondID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.db.ExecContext(ctx, `update claims set revision = 0, updated_at = ? where id in (?, ?)`, "2024-01-01T00:00:00Z", firstID, secondID); err != nil {
+		t.Fatal(err)
+	}
+	claims, err := tg.loadActionGateClaims(ctx, intent.ID, "social.dinner", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicateCount := 0
+	for _, claim := range claims {
+		if claim.Kind == "boundary.social.topic" && claim.Value == "No external publishing." {
+			duplicateCount++
+		}
+	}
+	if duplicateCount != 1 {
+		t.Fatalf("accepted duplicate count = %d, claims = %#v", duplicateCount, claims)
 	}
 }
 
@@ -1590,6 +1687,9 @@ func TestLoadReviewCandidateClaimsPreservesDuplicateDecisions(t *testing.T) {
 		SourceMode: "inferred",
 	})
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.db.ExecContext(ctx, `update claims set revision = 0, updated_at = ? where id in (?, ?)`, "2024-01-01T00:00:00Z", acceptedBoundaryID, losslessCandidateID); err != nil {
 		t.Fatal(err)
 	}
 	acceptedSingletonID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{

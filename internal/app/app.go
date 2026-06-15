@@ -1826,15 +1826,16 @@ func currentRevision(ctx context.Context, queryer interface {
 }
 
 type observedRevision struct {
+	id        string
 	revision  int64
 	updatedAt string
 	ok        bool
 }
 
-func recordLatestRevision(revisions map[string]observedRevision, key string, revision int64, updatedAt string) {
+func recordLatestRevision(revisions map[string]observedRevision, key string, revision int64, updatedAt, id string) {
 	current := revisions[key]
-	if !current.ok || revision > current.revision || (revision == current.revision && timestampAfter(updatedAt, current.updatedAt)) {
-		revisions[key] = observedRevision{revision: revision, updatedAt: updatedAt, ok: true}
+	if !current.ok || revision > current.revision || (revision == current.revision && timestampAfter(updatedAt, current.updatedAt)) || (revision == current.revision && updatedAt == current.updatedAt && id > current.id) {
+		revisions[key] = observedRevision{id: id, revision: revision, updatedAt: updatedAt, ok: true}
 	}
 }
 
@@ -2001,10 +2002,10 @@ order by c.created_at desc`, intentID)
 		normalized = losslessClaimValueKey(claim.Value)
 		duplicateKey := claim.Kind + "\x00" + normalized
 		if singletonClaimKind(claim.Kind) && claim.Status == "accepted" {
-			recordLatestRevision(bestAcceptedSingleton, claim.Kind, revision, claim.UpdatedAt)
+			recordLatestRevision(bestAcceptedSingleton, claim.Kind, revision, claim.UpdatedAt, claim.ID)
 		}
 		if claim.Status == "accepted" {
-			recordLatestRevision(bestAcceptedDuplicate, duplicateKey, revision, claim.UpdatedAt)
+			recordLatestRevision(bestAcceptedDuplicate, duplicateKey, revision, claim.UpdatedAt, claim.ID)
 		}
 		claims = append(claims, claim)
 		actionGateClaimRevisions[claim.ID] = revision
@@ -2020,6 +2021,11 @@ order by c.created_at desc`, intentID)
 		if duplicateAcceptedRevision.ok && (claim.Status != "accepted" || revision < duplicateAcceptedRevision.revision) {
 			continue
 		}
+		if duplicateAcceptedRevision.ok && claim.Status == "accepted" && revision == duplicateAcceptedRevision.revision {
+			if timestampAfter(duplicateAcceptedRevision.updatedAt, claim.UpdatedAt) || (duplicateAcceptedRevision.updatedAt == claim.UpdatedAt && claim.ID != duplicateAcceptedRevision.id) {
+				continue
+			}
+		}
 		singletonAcceptedRevision := bestAcceptedSingleton[claim.Kind]
 		if singletonClaimKind(claim.Kind) && singletonAcceptedRevision.ok && claim.Status == "accepted" {
 			if revision < singletonAcceptedRevision.revision || (revision == singletonAcceptedRevision.revision && timestampAfter(singletonAcceptedRevision.updatedAt, claim.UpdatedAt)) {
@@ -2027,7 +2033,7 @@ order by c.created_at desc`, intentID)
 			}
 		}
 		if singletonClaimKind(claim.Kind) && singletonAcceptedRevision.ok && claim.Status != "accepted" {
-			if revision < singletonAcceptedRevision.revision || (revision == singletonAcceptedRevision.revision && !timestampAfter(claim.UpdatedAt, singletonAcceptedRevision.updatedAt)) {
+			if revision < singletonAcceptedRevision.revision || (revision == singletonAcceptedRevision.revision && timestampAfter(singletonAcceptedRevision.updatedAt, claim.UpdatedAt)) {
 				continue
 			}
 		}
@@ -2128,7 +2134,7 @@ order by c.created_at desc`, intentID)
 	bestAcceptedSingleton := map[string]observedRevision{}
 	for _, claim := range deduped {
 		if claim.Status == "accepted" {
-			recordLatestRevision(bestAcceptedSingleton, claim.Kind, claim.Revision, claim.UpdatedAt)
+			recordLatestRevision(bestAcceptedSingleton, claim.Kind, claim.Revision, claim.UpdatedAt, claim.ID)
 		}
 	}
 	out := make([]ClaimOut, 0, len(deduped))
@@ -2138,7 +2144,7 @@ order by c.created_at desc`, intentID)
 		}
 		acceptedRevision := bestAcceptedSingleton[claim.Kind]
 		if acceptedRevision.ok {
-			if claim.Revision < acceptedRevision.revision || (claim.Revision == acceptedRevision.revision && !timestampAfter(claim.UpdatedAt, acceptedRevision.updatedAt)) {
+			if claim.Revision < acceptedRevision.revision || (claim.Revision == acceptedRevision.revision && timestampAfter(acceptedRevision.updatedAt, claim.UpdatedAt)) {
 				continue
 			}
 		}
