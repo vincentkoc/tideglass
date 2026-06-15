@@ -1455,6 +1455,7 @@ func isRequestError(err error) bool {
 		strings.Contains(message, "unsupported disclosure mode") ||
 		strings.Contains(message, "unsupported task mode") ||
 		strings.Contains(message, "unsupported autonomy") ||
+		strings.Contains(message, "proof.zk_predicates are not supported") ||
 		strings.Contains(message, "invalid freshness.max_age")
 }
 
