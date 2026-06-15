@@ -450,7 +450,7 @@ func TestResolveIntentAppliesPolicyAndPersistsSnapshot(t *testing.T) {
 			Autonomy: "bounded_act",
 			Goal:     "start a project",
 		},
-		Contract: IntentContract{RequiredSlots: []string{"preference.project.validation"}},
+		Contract: IntentContract{RequiredSlots: []string{"preference.agent.communication"}},
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -466,6 +466,9 @@ func TestResolveIntentAppliesPolicyAndPersistsSnapshot(t *testing.T) {
 	}
 	if first.Commitments.ResponseHash != first.ProfileHash || first.Commitments.ClaimRoot == "" || first.Commitments.SnapshotID != first.SnapshotID {
 		t.Fatalf("bad commitments: %#v", first.Commitments)
+	}
+	if _, ok := first.Links["self"]; ok {
+		t.Fatalf("advertised unresolved self link: %#v", first.Links)
 	}
 	hashView := first
 	hashView.RequestID = ""
@@ -515,6 +518,13 @@ func TestResolveIntentAppliesPolicyAndPersistsSnapshot(t *testing.T) {
 	}
 	if requests != 2 || snapshots != 2 {
 		t.Fatalf("requests=%d snapshots=%d", requests, snapshots)
+	}
+	var requestJSON string
+	if err := tg.db.QueryRowContext(ctx, `select request_json from intent_requests where id = ?`, first.RequestID).Scan(&requestJSON); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(requestJSON, "required_slots") || !strings.Contains(requestJSON, "bounded_act") {
+		t.Fatalf("request_json did not preserve v2 envelope: %s", requestJSON)
 	}
 }
 
@@ -580,6 +590,9 @@ func TestResolveIntentUnreviewedAndStaleClaimsDoNotSatisfyCriticalSlots(t *testi
 	if !response.Policy.NeedsUserAnswer || response.Policy.MayAct || !containsString(response.Policy.Redacted, "preference.food.allergy") {
 		t.Fatalf("redacted critical claim authorized action: %#v", response.Policy)
 	}
+	if !hasQuestionSlot(response.Unresolved, "preference.food.allergy") {
+		t.Fatalf("redacted critical claim did not produce an unresolved slot: %#v", response.Unresolved)
+	}
 	old := "2020-01-01T00:00:00Z"
 	if _, err := tg.db.ExecContext(ctx, `update claims set updated_at = ? where id = ?`, old, unreviewedID); err != nil {
 		t.Fatal(err)
@@ -627,6 +640,64 @@ func TestResolveIntentUnreviewedAndStaleClaimsDoNotSatisfyCriticalSlots(t *testi
 		if claim.ID == staleOnlyID {
 			t.Fatalf("stale claim leaked through max_age: %#v", response.Claims)
 		}
+	}
+}
+
+func TestResolveIntentV2ActionAndDisclosureContracts(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	intent, err := tg.ensureIntent(ctx, "work.project.start", "Project start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "preference.agent.communication",
+		Value:      "Use terse updates.",
+		Confidence: 0.9,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: claimID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	response, err := tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
+		URI:      "tideglass://v1/intent/work.project.start/current",
+		Task:     IntentTask{Mode: "act_gate", Autonomy: "bounded_act"},
+		Contract: IntentContract{RequiredSlots: []string{"preference.project.validation"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Decision.MayAct || !response.Decision.NeedsUserAnswer || !hasQuestionSlot(response.Unresolved, "preference.project.validation") {
+		t.Fatalf("required slot did not gate action: %#v", response)
+	}
+	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
+		URI:  "tideglass://v1/intent/work.project.start/current",
+		Task: IntentTask{Mode: "act_gate", Autonomy: "suggest_then_confirm"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Decision.MayAct || response.Decision.Reason != "confirmation_required" {
+		t.Fatalf("suggest_then_confirm authorized action: %#v", response.Decision)
+	}
+	allowValues := false
+	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
+		URI:        "tideglass://v1/intent/work.project.start/current",
+		Task:       IntentTask{Mode: "context", Autonomy: "context_only"},
+		Disclosure: IntentDisclosure{AllowValues: &allowValues},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Claims) != 1 || response.Claims[0].Value != "" {
+		t.Fatalf("allow_values=false leaked values: %#v", response.Claims)
 	}
 }
 
@@ -817,6 +888,16 @@ func TestHandleMCPOnceReadsIntentResource(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), `"id": "tool-1"`) || !strings.Contains(output.String(), `tideglass.intent_response.v2`) || !strings.Contains(output.String(), `codex`) {
 		t.Fatalf("mcp tool output = %s", output.String())
+	}
+	input = strings.NewReader(`{"jsonrpc":"2.0","id":"tool-2","method":"tools/call","params":{"name":"tideglass.resolve_intent","arguments":{"uri":"tideglass://v1/intent/work.project.start/current","disclosure":{"allow_sensitive":true}}}}`)
+	output.Reset()
+	if err := HandleMCPOnce(ctx, tg, input, &output); err == nil {
+		t.Fatal("expected MCP sensitive disclosure without capability to fail")
+	}
+	input = strings.NewReader(`{"jsonrpc":"2.0","id":"tool-3","method":"tools/call","params":{"name":"tideglass.resolve_intent","arguments":{"uri":"tideglass://v1/intent/work.project.start/current","actor":{"capabilities":["read_sensitive"]},"disclosure":{"allow_sensitive":true}}}}`)
+	output.Reset()
+	if err := HandleMCPOnce(ctx, tg, input, &output); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -1587,6 +1668,19 @@ func captureStdout(t *testing.T, fn func()) string {
 func containsString(rows []string, value string) bool {
 	for _, row := range rows {
 		if row == value {
+			return true
+		}
+	}
+	return false
+}
+
+func hasQuestionSlot(rows []IntentQuestion, value string) bool {
+	for _, row := range rows {
+		slot := row.Slot
+		if slot == "" {
+			slot = row.Kind
+		}
+		if slot == value {
 			return true
 		}
 	}

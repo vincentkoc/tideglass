@@ -158,7 +158,7 @@ type IntentFreshness struct {
 
 type IntentDisclosure struct {
 	Mode             string `json:"mode,omitempty"`
-	AllowValues      bool   `json:"allow_values,omitempty"`
+	AllowValues      *bool  `json:"allow_values,omitempty"`
 	AllowEvidence    bool   `json:"allow_evidence,omitempty"`
 	AllowSensitive   bool   `json:"allow_sensitive,omitempty"`
 	AllowCommitments bool   `json:"allow_commitments,omitempty"`
@@ -413,6 +413,10 @@ func Open(ctx context.Context, dbPath string) (*Tideglass, error) {
 	}
 	tg := &Tideglass{store: st, db: st.DB(), path: path}
 	if err := tg.ensureEvidenceSearch(ctx); err != nil {
+		_ = st.Close()
+		return nil, err
+	}
+	if err := tg.ensureIntentRequestSchema(ctx); err != nil {
 		_ = st.Close()
 		return nil, err
 	}
@@ -712,9 +716,14 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 		intent = IntentOut{Kind: kind, Title: titleForKind(kind)}
 		unresolved = unresolvedIntentQuestions(kind, nil)
 	}
+	unresolved = addRequiredSlotQuestions(unresolved, claims, request.Contract.RequiredSlots)
 	filteredClaims, policy := applyIntentPolicy(claims, unresolved, request)
 	filteredClaims = addClaimCommitments(filteredClaims, request)
-	if hasRedactedCriticalClaim(kind, policy.Redacted) {
+	redactedBlocking := redactedBlockingQuestions(kind, policy.Redacted, request.Contract.RequiredSlots, unresolved)
+	if len(redactedBlocking) > 0 {
+		unresolved = append(unresolved, redactedBlocking...)
+	}
+	if hasCriticalUnresolved(redactedBlocking) || hasRedactedCriticalClaim(kind, policy.Redacted) {
 		policy.NeedsUserAnswer = true
 		policy.MayAct = false
 	}
@@ -731,7 +740,7 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 	}
 	decision := IntentDecision{
 		MayAct:          policy.MayAct,
-		Reason:          decisionReason(foundIntent, policy),
+		Reason:          decisionReason(foundIntent, policy, request.Task.Autonomy),
 		Autonomy:        request.Task.Autonomy,
 		NeedsUserAnswer: policy.NeedsUserAnswer,
 	}
@@ -766,7 +775,6 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 		return IntentResponseEnvelope{}, err
 	}
 	response.Commitments.SnapshotID = response.SnapshotID
-	response.Links["self"] = "tideglass://v1/snapshot/" + response.SnapshotID
 	return response, nil
 }
 
@@ -1117,6 +1125,9 @@ func HandleMCPOnce(ctx context.Context, t *Tideglass, in io.Reader, out io.Write
 		if params.Name != "tideglass.resolve_intent" {
 			return fmt.Errorf("unsupported mcp tool %q", params.Name)
 		}
+		if err := authorizeMCPResolveRequest(params.Arguments); err != nil {
+			return err
+		}
 		response, err := t.ResolveIntent(ctx, ResolveOptions{Request: params.Arguments})
 		if err != nil {
 			return err
@@ -1161,6 +1172,29 @@ func authorizeHTTPResolveRequest(request IntentRequestEnvelope) error {
 		return errors.New("http resolve cannot disable reviewed-claim freshness")
 	}
 	return nil
+}
+
+func authorizeMCPResolveRequest(request IntentRequestEnvelope) error {
+	if request.Disclosure.AllowSensitive && !actorHasCapability(request.Actor, "read_sensitive", "sensitive_disclosure") {
+		return errors.New("mcp resolve cannot enable sensitive disclosure without read_sensitive capability")
+	}
+	if request.Freshness.RequireReviewed != nil && !*request.Freshness.RequireReviewed && !actorHasCapability(request.Actor, "read_unreviewed") {
+		return errors.New("mcp resolve cannot disable reviewed-claim freshness without read_unreviewed capability")
+	}
+	return nil
+}
+
+func actorHasCapability(actor IntentActor, accepted ...string) bool {
+	have := map[string]bool{}
+	for _, capability := range actor.Capabilities {
+		have[strings.ToLower(strings.TrimSpace(capability))] = true
+	}
+	for _, capability := range accepted {
+		if have[strings.ToLower(capability)] {
+			return true
+		}
+	}
+	return false
 }
 
 func statusForResolveError(err error) int {
@@ -1253,11 +1287,15 @@ func (t *Tideglass) persistIntentRequest(ctx context.Context, request IntentRequ
 	if err != nil {
 		return "", err
 	}
+	requestJSON, err := json.Marshal(request)
+	if err != nil {
+		return "", err
+	}
 	requestID := id("req")
 	_, err = t.db.ExecContext(ctx, `
-insert into intent_requests(id,uri,actor_json,purpose,audience,freshness_json,disclosure_json,context_json,created_at)
-values(?,?,?,?,?,?,?,?,?)`,
-		requestID, request.URI, string(actorJSON), legacyPurpose(request), request.Audience.Label(), string(freshnessJSON), string(disclosureJSON), string(contextJSON), now())
+insert into intent_requests(id,uri,actor_json,purpose,audience,freshness_json,disclosure_json,context_json,request_json,created_at)
+values(?,?,?,?,?,?,?,?,?,?)`,
+		requestID, request.URI, string(actorJSON), legacyPurpose(request), request.Audience.Label(), string(freshnessJSON), string(disclosureJSON), string(contextJSON), string(requestJSON), now())
 	return requestID, err
 }
 
@@ -1768,6 +1806,14 @@ select e.rowid, e.id, sa.source_id, e.snippet
 from evidence e
 join source_artifacts sa on sa.id = e.source_artifact_id
 where e.rowid not in (select rowid from evidence_fts)`)
+	return err
+}
+
+func (t *Tideglass) ensureIntentRequestSchema(ctx context.Context) error {
+	if sqliteColumnExists(ctx, t.db, "intent_requests", "request_json") {
+		return nil
+	}
+	_, err := t.db.ExecContext(ctx, `alter table intent_requests add column request_json text not null default '{}'`)
 	return err
 }
 
@@ -2421,6 +2467,83 @@ func legacyPurpose(request IntentRequestEnvelope) string {
 	return strings.TrimSpace(request.Task.Goal)
 }
 
+func addRequiredSlotQuestions(unresolved []IntentQuestion, claims []ClaimOut, requiredSlots []string) []IntentQuestion {
+	if len(requiredSlots) == 0 {
+		return unresolved
+	}
+	haveClaims := map[string]bool{}
+	for _, claim := range claims {
+		haveClaims[claim.Kind] = true
+	}
+	haveQuestions := map[string]bool{}
+	for _, question := range unresolved {
+		haveQuestions[questionSlot(question)] = true
+	}
+	out := append([]IntentQuestion{}, unresolved...)
+	for _, slot := range requiredSlots {
+		slot = strings.TrimSpace(slot)
+		if slot == "" || haveClaims[slot] || haveQuestions[slot] {
+			continue
+		}
+		out = append(out, questionForSlot(slot, "critical", true))
+	}
+	return out
+}
+
+func redactedBlockingQuestions(intentKind string, redacted []string, requiredSlots []string, existing []IntentQuestion) []IntentQuestion {
+	if len(redacted) == 0 {
+		return nil
+	}
+	blocking := criticalClaimKinds(intentKind)
+	for _, slot := range requiredSlots {
+		if strings.TrimSpace(slot) != "" {
+			blocking[strings.TrimSpace(slot)] = true
+		}
+	}
+	haveQuestions := map[string]bool{}
+	for _, question := range existing {
+		haveQuestions[questionSlot(question)] = true
+	}
+	var out []IntentQuestion
+	for _, kind := range redacted {
+		if blocking[kind] && !haveQuestions[kind] {
+			out = append(out, questionForSlot(kind, "critical", true))
+		}
+	}
+	return out
+}
+
+func questionForSlot(slot, priority string, blocksAction bool) IntentQuestion {
+	return IntentQuestion{
+		Kind:         slot,
+		Slot:         slot,
+		Question:     defaultSlotQuestion(slot),
+		Priority:     priority,
+		BlocksAction: blocksAction,
+		AnswerType:   "short_text",
+	}
+}
+
+func defaultSlotQuestion(slot string) string {
+	switch slot {
+	case "preference.food.allergy":
+		return "Any allergies or hard dietary restrictions?"
+	case "preference.food.dietary_restriction":
+		return "Any dietary restrictions?"
+	case "preference.budget.restaurant", "preference.food.budget":
+		return "What budget range is comfortable?"
+	default:
+		return "What should Tideglass know for " + slot + "?"
+	}
+}
+
+func questionSlot(question IntentQuestion) string {
+	if question.Slot != "" {
+		return question.Slot
+	}
+	return question.Kind
+}
+
 func normalizeIntentRequest(request IntentRequestEnvelope) IntentRequestEnvelope {
 	request.SchemaVersion = strings.TrimSpace(request.SchemaVersion)
 	if request.SchemaVersion == "" {
@@ -2459,8 +2582,9 @@ func normalizeIntentRequest(request IntentRequestEnvelope) IntentRequestEnvelope
 	if request.Disclosure.Mode == "" {
 		request.Disclosure.Mode = "minimal"
 	}
-	if !request.Disclosure.AllowValues && request.Disclosure.Mode != "existence" {
-		request.Disclosure.AllowValues = true
+	if request.Disclosure.AllowValues == nil {
+		defaultAllowValues := request.Disclosure.Mode != "existence"
+		request.Disclosure.AllowValues = &defaultAllowValues
 	}
 	if !request.Disclosure.AllowCommitments {
 		request.Disclosure.AllowCommitments = true
@@ -2592,12 +2716,14 @@ func applyIntentPolicy(claims []ClaimOut, unresolved []IntentQuestion, request I
 		envelope := IntentClaimEnvelope{
 			ID:          claim.ID,
 			Kind:        claim.Kind,
-			Value:       claim.Value,
 			Confidence:  claim.Confidence,
 			Status:      claim.Status,
 			SourceMode:  claim.SourceMode,
 			Sensitivity: sensitivity,
 			FreshAt:     claim.UpdatedAt,
+		}
+		if allowClaimValues(request.Disclosure) {
+			envelope.Value = claim.Value
 		}
 		if request.Disclosure.AllowEvidence {
 			envelope.Evidence = claim.Evidence
@@ -2632,7 +2758,7 @@ func applyIntentPolicy(claims []ClaimOut, unresolved []IntentQuestion, request I
 		return out[i].ID < out[j].ID
 	})
 	policy.MayAct = !policy.NeedsUserAnswer
-	if request.Task.Autonomy == "context_only" || request.Task.Autonomy == "suggest_only" || request.Task.Autonomy == "deny" {
+	if request.Task.Autonomy == "context_only" || request.Task.Autonomy == "suggest_only" || request.Task.Autonomy == "suggest_then_confirm" || request.Task.Autonomy == "deny" {
 		policy.MayAct = false
 	}
 	return out, policy
@@ -2671,13 +2797,16 @@ func claimRoot(claims []IntentClaimEnvelope) string {
 	return "sha256:" + hashBytes(data)
 }
 
-func decisionReason(foundIntent bool, policy IntentPolicyEnvelope) string {
+func decisionReason(foundIntent bool, policy IntentPolicyEnvelope, autonomy string) string {
 	switch {
 	case !foundIntent:
 		return "intent_missing"
 	case policy.NeedsUserAnswer:
 		return "critical_slots_missing"
 	case !policy.MayAct:
+		if autonomy == "suggest_then_confirm" {
+			return "confirmation_required"
+		}
 		return "autonomy_blocks_action"
 	default:
 		return "ready"
@@ -2694,6 +2823,10 @@ func shouldRedactClaim(disclosure IntentDisclosure, sensitivity string) bool {
 	default:
 		return false
 	}
+}
+
+func allowClaimValues(disclosure IntentDisclosure) bool {
+	return disclosure.AllowValues != nil && *disclosure.AllowValues
 }
 
 func existenceClaimEnvelope(claim ClaimOut) IntentClaimEnvelope {
@@ -3601,6 +3734,7 @@ create table if not exists intent_requests (
   freshness_json text not null default '{}',
   disclosure_json text not null default '{}',
   context_json text not null default '{}',
+  request_json text not null default '{}',
   created_at text not null
 );
 

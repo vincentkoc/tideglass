@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -435,6 +436,9 @@ func runServe(ctx context.Context, args []string) error {
 	if err := fs.Parse(normalizeFlagArgs(args)); err != nil {
 		return err
 	}
+	if err := validateServeAddr(*addr); err != nil {
+		return err
+	}
 	tg, err := app.Open(ctx, *dbPath)
 	if err != nil {
 		return err
@@ -447,6 +451,22 @@ func runServe(ctx context.Context, args []string) error {
 		return nil
 	}
 	return err
+}
+
+func validateServeAddr(addr string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("invalid serve --addr %q: %w", addr, err)
+	}
+	host = strings.Trim(strings.ToLower(host), "[]")
+	if host == "localhost" {
+		return nil
+	}
+	ip := net.ParseIP(host)
+	if ip != nil && ip.IsLoopback() {
+		return nil
+	}
+	return errors.New("serve --addr must bind to localhost or a loopback IP")
 }
 
 func runMCP(ctx context.Context, args []string) error {
