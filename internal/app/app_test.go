@@ -751,6 +751,17 @@ func TestResolveIntentActionGateFailsClosedWithoutConstraints(t *testing.T) {
 	if response.Decision.MayAct || !response.Decision.NeedsUserAnswer || !hasBlockingQuestionSlot(response.Unresolved, "policy.action.constraints") {
 		t.Fatalf("unrelated accepted claim authorized action: %#v", response)
 	}
+	response, err = tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, Request: IntentRequestEnvelope{
+		URI:      "tideglass://v1/intent/work.project.start/current",
+		Task:     IntentTask{Mode: "act_gate", Autonomy: "bounded_act"},
+		Contract: IntentContract{RequiredSlots: []string{"preference.agent.communication"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Decision.MayAct || !response.Decision.NeedsUserAnswer || !hasBlockingQuestionSlot(response.Unresolved, "policy.action.constraints") {
+		t.Fatalf("caller-selected benign required slot authorized action: %#v", response)
+	}
 }
 
 func TestResolveIntentActionGateScansPendingSingletonBoundaries(t *testing.T) {

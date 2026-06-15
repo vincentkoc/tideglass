@@ -3121,11 +3121,6 @@ func actionGatePolicyFailingClaims(intentKind string, claims []ClaimOut, request
 
 func hasActionGateConstraint(intentKind string, claims []ClaimOut, request IntentRequestEnvelope, maxAge time.Duration) bool {
 	blocking := criticalClaimKinds(intentKind)
-	for _, slot := range request.Contract.RequiredSlots {
-		if strings.TrimSpace(slot) != "" {
-			blocking[strings.TrimSpace(slot)] = true
-		}
-	}
 	for _, claim := range claims {
 		if claim.Status != "accepted" || claimStale(claim, maxAge) || belowConfidenceFloor(claim, request) {
 			continue
