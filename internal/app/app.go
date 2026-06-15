@@ -890,24 +890,36 @@ func (t *Tideglass) ReviewClaim(ctx context.Context, opts ReviewOptions) (Review
 	default:
 		return ReviewResult{}, fmt.Errorf("unsupported review action %q", opts.Action)
 	}
-	revision, err := nextRevision(ctx, t.db)
+	tx, err := t.db.BeginTx(ctx, nil)
 	if err != nil {
 		return ReviewResult{}, err
 	}
-	res, err := t.db.ExecContext(ctx, `update claims set status = ?, updated_at = ?, revision = ? where id = ?`, status, now(), revision, claimID)
+	revision, err := nextRevision(ctx, tx)
 	if err != nil {
+		_ = tx.Rollback()
+		return ReviewResult{}, err
+	}
+	res, err := tx.ExecContext(ctx, `update claims set status = ?, updated_at = ?, revision = ? where id = ?`, status, now(), revision, claimID)
+	if err != nil {
+		_ = tx.Rollback()
 		return ReviewResult{}, err
 	}
 	affected, err := res.RowsAffected()
 	if err != nil {
+		_ = tx.Rollback()
 		return ReviewResult{}, err
 	}
 	if affected == 0 {
+		_ = tx.Rollback()
 		return ReviewResult{}, sql.ErrNoRows
 	}
 	patch, _ := json.Marshal(map[string]string{"status": status})
-	if _, err := t.db.ExecContext(ctx, `insert into edits(id,claim_id,operation,patch_json,reason,created_at) values(?,?,?,?,?,?)`,
+	if _, err := tx.ExecContext(ctx, `insert into edits(id,claim_id,operation,patch_json,reason,created_at) values(?,?,?,?,?,?)`,
 		id("edt"), claimID, action, string(patch), opts.Reason, now()); err != nil {
+		_ = tx.Rollback()
+		return ReviewResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
 		return ReviewResult{}, err
 	}
 	return ReviewResult{ClaimID: claimID, Action: action, Status: status}, nil
@@ -1583,16 +1595,28 @@ func (t *Tideglass) insertClaim(ctx context.Context, intentID string, claim cand
 	if sourceMode == "" {
 		sourceMode = "inferred"
 	}
-	revision, err := nextRevision(ctx, t.db)
+	tx, err := t.db.BeginTx(ctx, nil)
 	if err != nil {
 		return "", err
 	}
+	revision, err := nextRevision(ctx, tx)
+	if err != nil {
+		_ = tx.Rollback()
+		return "", err
+	}
 	claimID := id("clm")
-	_, err = t.db.ExecContext(ctx, `
+	_, err = tx.ExecContext(ctx, `
 insert into claims(id,intent_id,subject,kind,value,normalized_value,polarity,scope,status,source_mode,confidence,created_at,updated_at,revision)
 values(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		claimID, intentID, "user", claim.Kind, claim.Value, normalizeText(claim.Value), "neutral", "", "active", sourceMode, claim.Confidence, now(), now(), revision)
-	return claimID, err
+	if err != nil {
+		_ = tx.Rollback()
+		return "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	return claimID, nil
 }
 
 type revisionExecer interface {
@@ -1618,7 +1642,7 @@ from claims c
 left join edits e on e.id = (
   select id from edits
   where claim_id = c.id and json_extract(patch_json, '$.value') is not null
-  order by created_at desc, rowid desc limit 1
+  order by julianday(created_at) desc, rowid desc limit 1
 )
 where c.intent_id = ?
 order by c.created_at desc`, intentID)
@@ -1641,7 +1665,7 @@ order by c.created_at desc`, intentID)
 		if err := rows.Scan(&claim.ID, &claim.Kind, &claim.Value, &claim.Confidence, &claim.Status, &claim.SourceMode, &claim.CreatedAt, &claim.UpdatedAt, &valueEditCreatedAt, &hasValueEdit); err != nil {
 			return nil, err
 		}
-		if valueEditCreatedAt > claim.UpdatedAt {
+		if timestampAfter(valueEditCreatedAt, claim.UpdatedAt) {
 			claim.UpdatedAt = valueEditCreatedAt
 		}
 		claim.HasValueEdit = hasValueEdit == 1
@@ -1667,7 +1691,7 @@ order by c.created_at desc`, intentID)
 			return rank(left.Status) > rank(right.Status)
 		}
 		if left.UpdatedAt != right.UpdatedAt {
-			return left.UpdatedAt > right.UpdatedAt
+			return timestampAfter(left.UpdatedAt, right.UpdatedAt)
 		}
 		if left.HasValueEdit != right.HasValueEdit {
 			return left.HasValueEdit
@@ -1738,7 +1762,7 @@ from claims c
 left join edits e on e.id = (
   select id from edits
   where claim_id = c.id and json_extract(patch_json, '$.value') is not null
-  order by created_at desc, rowid desc limit 1
+  order by julianday(created_at) desc, rowid desc limit 1
 )
 where c.intent_id = ? and c.status != 'rejected'
 order by c.created_at desc`, intentID)
@@ -1759,7 +1783,7 @@ order by c.created_at desc`, intentID)
 		if !blocking[claim.Kind] && !strings.HasPrefix(claim.Kind, "boundary.") {
 			continue
 		}
-		if valueEditCreatedAt > claim.UpdatedAt {
+		if timestampAfter(valueEditCreatedAt, claim.UpdatedAt) {
 			claim.UpdatedAt = valueEditCreatedAt
 		}
 		if singletonClaimKind(claim.Kind) && claim.Status == "accepted" && revision > bestAcceptedSingleton[claim.Kind] {
@@ -3045,8 +3069,23 @@ func claimStale(claim ClaimOut, maxAge time.Duration) bool {
 	if maxAge <= 0 || claim.UpdatedAt == "" {
 		return false
 	}
-	updatedAt, err := time.Parse(time.RFC3339, claim.UpdatedAt)
+	updatedAt, err := time.Parse(time.RFC3339Nano, claim.UpdatedAt)
 	return err != nil || time.Since(updatedAt) > maxAge
+}
+
+func timestampAfter(left, right string) bool {
+	if left == "" || left == right {
+		return false
+	}
+	if right == "" {
+		return true
+	}
+	leftTime, leftErr := time.Parse(time.RFC3339Nano, left)
+	rightTime, rightErr := time.Parse(time.RFC3339Nano, right)
+	if leftErr == nil && rightErr == nil {
+		return leftTime.After(rightTime)
+	}
+	return left > right
 }
 
 func belowConfidenceFloor(claim ClaimOut, request IntentRequestEnvelope) bool {
@@ -3589,7 +3628,7 @@ func titleForKind(kind string) string {
 }
 
 func now() string {
-	return time.Now().UTC().Format(time.RFC3339Nano)
+	return time.Now().UTC().Format("2006-01-02T15:04:05.000000000Z")
 }
 
 func id(prefix string) string {
