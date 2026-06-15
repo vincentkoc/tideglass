@@ -755,7 +755,7 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 		slotClaims := claimsForSlotSatisfaction(kind, loaded, request, maxAge)
 		unresolved = unresolvedIntentQuestions(intent.Kind, slotClaims)
 		unresolved = addRequiredSlotQuestions(unresolved, slotClaims, request.Contract.RequiredSlots)
-		if request.Task.Mode == "act_gate" && !hasActionGateConstraint(kind, claims, request, maxAge) {
+		if request.Task.Mode == "act_gate" && request.Task.Autonomy == "bounded_act" && !hasActionGateConstraint(kind, claims, request, maxAge) {
 			unresolved = append(unresolved, questionForSlot("policy.action.constraints", "critical", true))
 		}
 	} else {
@@ -1811,7 +1811,7 @@ order by c.created_at desc`, intentID)
 		if err := rows.Scan(&claim.ID, &claim.Kind, &claim.Value, &normalized, &claim.Confidence, &claim.Status, &claim.SourceMode, &claim.UpdatedAt, &valueEditCreatedAt, &revision); err != nil {
 			return nil, err
 		}
-		if !blocking[claim.Kind] && !strings.HasPrefix(claim.Kind, "boundary.") {
+		if !blocking[claim.Kind] && !strings.HasPrefix(claim.Kind, "boundary.") && !actionConstraintClaimKind(claim.Kind) {
 			continue
 		}
 		if timestampAfter(valueEditCreatedAt, claim.UpdatedAt) {
@@ -2166,6 +2166,15 @@ func (t *Tideglass) ensureIntentRequestSchema(ctx context.Context) error {
 	if _, err := t.db.ExecContext(ctx, `create table if not exists revisions (id integer primary key autoincrement)`); err != nil {
 		return err
 	}
+	if _, err := t.db.ExecContext(ctx, `create table if not exists maintenance_tasks (name text primary key, applied_at text not null)`); err != nil {
+		return err
+	}
+	if _, err := t.db.ExecContext(ctx, `create index if not exists idx_edits_claim_id on edits(claim_id)`); err != nil {
+		return err
+	}
+	if _, err := t.db.ExecContext(ctx, `create index if not exists idx_edits_claim_operation on edits(claim_id, operation)`); err != nil {
+		return err
+	}
 	if !sqliteColumnExists(ctx, t.db, "claims", "revision") {
 		if _, err := t.db.ExecContext(ctx, `alter table claims add column revision integer not null default 0`); err != nil {
 			if !sqliteDuplicateColumnError(err) {
@@ -2173,7 +2182,36 @@ func (t *Tideglass) ensureIntentRequestSchema(ctx context.Context) error {
 			}
 		}
 	}
-	if _, err := t.db.ExecContext(ctx, `
+	return t.reconcileLegacyReviewedEditsOnce(ctx)
+}
+
+func (t *Tideglass) reconcileLegacyReviewedEditsOnce(ctx context.Context) error {
+	tx, err := t.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	result, err := tx.ExecContext(ctx, `insert or ignore into maintenance_tasks(name, applied_at) values(?, ?)`, "legacy_reviewed_edit_reconciliation_v1", now())
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		committed = true
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `
 update claims
 set status = 'active',
     updated_at = coalesce((
@@ -2211,6 +2249,10 @@ where status in ('accepted', 'rejected')
   )`); err != nil {
 		return err
 	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	committed = true
 	return nil
 }
 
@@ -2910,7 +2952,7 @@ func redactedBlockingQuestions(intentKind string, redacted []string, requiredSlo
 	}
 	var out []IntentQuestion
 	for _, kind := range redacted {
-		if (blocking[kind] || strings.HasPrefix(kind, "boundary.")) && !haveBlockingQuestions[kind] {
+		if (blocking[kind] || strings.HasPrefix(kind, "boundary.") || actionConstraintClaimKind(kind)) && !haveBlockingQuestions[kind] {
 			out = append(out, questionForSlot(kind, "critical", true))
 			haveBlockingQuestions[kind] = true
 		}
@@ -2934,7 +2976,7 @@ func policyFailedBlockingQuestions(intentKind string, claims []ClaimOut, require
 	}
 	var out []IntentQuestion
 	for _, claim := range claims {
-		if (blocking[claim.Kind] || strings.HasPrefix(claim.Kind, "boundary.")) && !haveBlockingQuestions[claim.Kind] {
+		if (blocking[claim.Kind] || strings.HasPrefix(claim.Kind, "boundary.") || actionConstraintClaimKind(claim.Kind)) && !haveBlockingQuestions[claim.Kind] {
 			out = append(out, questionForSlot(claim.Kind, "critical", true))
 			haveBlockingQuestions[claim.Kind] = true
 		}
@@ -3133,7 +3175,7 @@ func actionGatePolicyFailingClaims(intentKind string, claims []ClaimOut, request
 	}
 	var out []ClaimOut
 	for _, claim := range claims {
-		if !blocking[claim.Kind] && !strings.HasPrefix(claim.Kind, "boundary.") {
+		if !blocking[claim.Kind] && !strings.HasPrefix(claim.Kind, "boundary.") && !actionConstraintClaimKind(claim.Kind) {
 			continue
 		}
 		if claim.Status != "accepted" || claimStale(claim, maxAge) || belowConfidenceFloor(claim, request) {
@@ -3144,12 +3186,11 @@ func actionGatePolicyFailingClaims(intentKind string, claims []ClaimOut, request
 }
 
 func hasActionGateConstraint(intentKind string, claims []ClaimOut, request IntentRequestEnvelope, maxAge time.Duration) bool {
-	blocking := criticalClaimKinds(intentKind)
 	for _, claim := range claims {
 		if claim.Status != "accepted" || claimStale(claim, maxAge) || belowConfidenceFloor(claim, request) {
 			continue
 		}
-		if blocking[claim.Kind] || strings.HasPrefix(claim.Kind, "boundary.") {
+		if actionConstraintClaimKind(claim.Kind) {
 			return true
 		}
 	}
@@ -3346,9 +3387,8 @@ func applyIntentPolicy(intentKind string, claims []ClaimOut, unresolved []Intent
 	if !allowAction || request.Task.Mode != "act_gate" || request.Task.Autonomy == "context_only" || request.Task.Autonomy == "suggest_only" || request.Task.Autonomy == "suggest_then_confirm" || request.Task.Autonomy == "deny" {
 		policy.MayAct = false
 	}
-	if request.Task.Mode == "act_gate" && request.Task.Autonomy == "bounded_act" {
-		policy.NeedsUserAnswer = true
-		policy.MayAct = false
+	if request.Task.Mode == "act_gate" && request.Task.Autonomy == "bounded_act" && allowAction && !policy.NeedsUserAnswer && allowClaimValues(request.Disclosure) && request.Disclosure.Mode != "existence" {
+		policy.MayAct = true
 	}
 	return out, policy
 }
@@ -3371,13 +3411,13 @@ func claimRelevantToRequest(kind string, request IntentRequestEnvelope) bool {
 		return false
 	}
 	audience := request.Audience.Label()
-	return audience == "agent" || audience == "local" || audience == request.Actor.ID
+	return audience == "agent" || audience == "local"
 }
 
 func audienceShareTargetsAreLocal(request IntentRequestEnvelope) bool {
 	for _, target := range request.Audience.ShareWith {
 		target = strings.TrimSpace(target)
-		if target == "" || target == "agent" || target == "local" || target == request.Actor.ID {
+		if target == "" || target == "agent" || target == "local" {
 			continue
 		}
 		return false
@@ -3386,7 +3426,11 @@ func audienceShareTargetsAreLocal(request IntentRequestEnvelope) bool {
 }
 
 func claimRequiredForActionGate(intentKind, kind string, request IntentRequestEnvelope) bool {
-	return request.Task.Mode == "act_gate" && (strings.HasPrefix(kind, "boundary.") || criticalClaimKinds(intentKind)[kind])
+	return request.Task.Mode == "act_gate" && (strings.HasPrefix(kind, "boundary.") || criticalClaimKinds(intentKind)[kind] || actionConstraintClaimKind(kind))
+}
+
+func actionConstraintClaimKind(kind string) bool {
+	return kind == "policy.action.constraints"
 }
 
 func addClaimCommitments(claims []IntentClaimEnvelope, request IntentRequestEnvelope, commitments map[string]string) []IntentClaimEnvelope {
@@ -3521,7 +3565,7 @@ func hasRedactedCriticalClaim(intentKind string, redacted []string) bool {
 	}
 	critical := criticalClaimKinds(intentKind)
 	for _, kind := range redacted {
-		if critical[kind] {
+		if critical[kind] || actionConstraintClaimKind(kind) {
 			return true
 		}
 	}
@@ -4396,6 +4440,11 @@ create table if not exists revisions (
   id integer primary key autoincrement
 );
 
+create table if not exists maintenance_tasks (
+  name text primary key,
+  applied_at text not null
+);
+
 create table if not exists intent_requests (
   id text primary key,
   uri text not null,
@@ -4422,6 +4471,8 @@ create table if not exists profile_snapshots (
 
 create index if not exists idx_claims_intent_kind on claims(intent_id, kind);
 create index if not exists idx_claims_scope on claims(scope);
+create index if not exists idx_edits_claim_id on edits(claim_id);
+create index if not exists idx_edits_claim_operation on edits(claim_id, operation);
 create index if not exists idx_evidence_artifact on evidence(source_artifact_id);
 create index if not exists idx_embeddings_owner on embeddings(owner_kind, owner_id);
 create index if not exists idx_intent_requests_uri on intent_requests(uri);

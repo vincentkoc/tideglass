@@ -666,6 +666,42 @@ func TestResolveIntentActionGateUsesLosslessDuplicateKeys(t *testing.T) {
 	}
 }
 
+func TestResolveIntentActionGateAuthorizesWithPolicyConstraint(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	intent, err := tg.ensureIntent(ctx, "work.project.start", "Project start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	constraintID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "policy.action.constraints",
+		Value:      "Bounded action is allowed only for this audited request.",
+		Confidence: 0.99,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: constraintID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	response, err := tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, Request: IntentRequestEnvelope{
+		URI:        "tideglass://v1/intent/work.project.start/current",
+		Task:       IntentTask{Mode: "act_gate", Autonomy: "bounded_act"},
+		Disclosure: IntentDisclosure{AllowSensitive: true},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !response.Decision.MayAct || response.Decision.NeedsUserAnswer || response.Decision.Reason != "ready" || response.Status != "ready" {
+		t.Fatalf("explicit action constraint did not authorize bounded action: %#v", response)
+	}
+}
+
 func TestResolveIntentMigratesLegacyEditedAcceptedClaims(t *testing.T) {
 	ctx := context.Background()
 	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
@@ -675,6 +711,9 @@ func TestResolveIntentMigratesLegacyEditedAcceptedClaims(t *testing.T) {
 	defer tg.Close()
 	intent, err := tg.ensureIntent(ctx, "social.dinner", "Dinner")
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.db.ExecContext(ctx, `delete from maintenance_tasks where name = 'legacy_reviewed_edit_reconciliation_v1'`); err != nil {
 		t.Fatal(err)
 	}
 	claimID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{Kind: "preference.food.allergy", Value: "No allergies.", Confidence: 0.95, SourceMode: "explicit"})
@@ -690,9 +729,6 @@ func TestResolveIntentMigratesLegacyEditedAcceptedClaims(t *testing.T) {
 	}
 	if _, err := tg.db.ExecContext(ctx, `insert into edits(id,claim_id,operation,patch_json,reason,created_at) values(?,?,?,?,?,?)`,
 		id("edt"), claimID, "supersede", `{"value":"Shellfish allergy."}`, "legacy edit", reviewCreatedAt); err != nil {
-		t.Fatal(err)
-	}
-	if err := tg.ensureIntentRequestSchema(ctx); err != nil {
 		t.Fatal(err)
 	}
 	rejectedID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{Kind: "boundary.social.topic", Value: "Old rejected topic.", Confidence: 0.8, SourceMode: "explicit"})
@@ -719,6 +755,25 @@ func TestResolveIntentMigratesLegacyEditedAcceptedClaims(t *testing.T) {
 	}
 	if status != "active" {
 		t.Fatalf("legacy rejected edited claim status = %s, want active", status)
+	}
+	var markerCount int
+	if err := tg.db.QueryRowContext(ctx, `select count(*) from maintenance_tasks where name = 'legacy_reviewed_edit_reconciliation_v1'`).Scan(&markerCount); err != nil {
+		t.Fatal(err)
+	}
+	if markerCount != 1 {
+		t.Fatalf("legacy reconciliation marker count = %d, want 1", markerCount)
+	}
+	if _, err := tg.db.ExecContext(ctx, `update claims set status = 'accepted' where id = ?`, rejectedID); err != nil {
+		t.Fatal(err)
+	}
+	if err := tg.ensureIntentRequestSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := tg.db.QueryRowContext(ctx, `select status from claims where id = ?`, rejectedID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "accepted" {
+		t.Fatalf("legacy reconciliation reran after marker, status = %s", status)
 	}
 	response, err := tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, Request: IntentRequestEnvelope{
 		URI:        "tideglass://v1/intent/social.dinner/current",
@@ -1234,6 +1289,17 @@ func TestResolveIntentV2ActionAndDisclosureContracts(t *testing.T) {
 	}
 	if len(response.Claims) != 0 || len(response.Policy.SafeToShare) != 0 {
 		t.Fatalf("share_with external target leaked unrelated claims: claims=%#v policy=%#v", response.Claims, response.Policy)
+	}
+	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
+		URI:      "tideglass://v1/intent/work.project.start/current",
+		Actor:    IntentActor{Type: "agent", ID: "venue"},
+		Audience: IntentAudience{Type: "agent", ShareWith: []string{"venue"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Claims) != 0 || len(response.Policy.SafeToShare) != 0 {
+		t.Fatalf("actor spoof leaked unrelated claims: claims=%#v policy=%#v", response.Claims, response.Policy)
 	}
 	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
 		URI:      "tideglass://disclosure/work.project.start/agent",
