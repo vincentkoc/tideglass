@@ -567,6 +567,45 @@ func TestResolveIntentSupportsDisclosureAndMissingIntent(t *testing.T) {
 	}
 }
 
+func TestResolveIntentActionGateProcessesScopedCriticalClaims(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	intent, err := tg.ensureIntent(ctx, "social.dinner", "Dinner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "preference.food.allergy",
+		Value:      "Shellfish allergy.",
+		Confidence: 0.95,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: claimID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	response, err := tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, Request: IntentRequestEnvelope{
+		URI:      "tideglass://v1/intent/social.dinner/current",
+		Task:     IntentTask{Mode: "act_gate", Autonomy: "bounded_act"},
+		Audience: IntentAudience{Type: "service", ID: "venue"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Decision.MayAct || !response.Decision.NeedsUserAnswer {
+		t.Fatalf("scoped critical claim authorized action: %#v", response)
+	}
+	if !containsString(response.Policy.Redacted, "preference.food.allergy") || !hasBlockingQuestionSlot(response.Unresolved, "preference.food.allergy") {
+		t.Fatalf("scoped critical claim was not processed as a blocker: %#v", response)
+	}
+}
+
 func TestResolveIntentUnreviewedAndStaleClaimsDoNotSatisfyCriticalSlots(t *testing.T) {
 	ctx := context.Background()
 	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))

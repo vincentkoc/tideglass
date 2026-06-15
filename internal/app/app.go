@@ -742,7 +742,7 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 		unresolved = addRequiredSlotQuestions(unresolved, nil, request.Contract.RequiredSlots)
 	}
 	commitments := claimCommitmentsForClaims(claims)
-	filteredClaims, policy := applyIntentPolicy(claims, unresolved, request, opts.AllowAction)
+	filteredClaims, policy := applyIntentPolicy(kind, claims, unresolved, request, opts.AllowAction)
 	filteredClaims = addClaimCommitments(filteredClaims, request, commitments)
 	redactedBlocking := redactedBlockingQuestions(kind, policy.Redacted, request.Contract.RequiredSlots, unresolved)
 	if len(redactedBlocking) > 0 {
@@ -2929,7 +2929,7 @@ func parseMaxAge(value string) (time.Duration, error) {
 	return duration, nil
 }
 
-func applyIntentPolicy(claims []ClaimOut, unresolved []IntentQuestion, request IntentRequestEnvelope, allowAction bool) ([]IntentClaimEnvelope, IntentPolicyEnvelope) {
+func applyIntentPolicy(intentKind string, claims []ClaimOut, unresolved []IntentQuestion, request IntentRequestEnvelope, allowAction bool) ([]IntentClaimEnvelope, IntentPolicyEnvelope) {
 	freshness := "reviewed"
 	if request.Freshness.RequireReviewed != nil && !*request.Freshness.RequireReviewed {
 		freshness = "unreviewed_allowed"
@@ -2949,7 +2949,7 @@ func applyIntentPolicy(claims []ClaimOut, unresolved []IntentQuestion, request I
 	redacted := map[string]bool{}
 	shareable := map[string]bool{}
 	for _, claim := range claims {
-		if request.Disclosure.Mode == "minimal" && !claimRelevantToRequest(claim.Kind, request) && !claimRequiredForActionGate(claim.Kind, request) {
+		if request.Disclosure.Mode == "minimal" && !claimRelevantToRequest(claim.Kind, request) && !claimRequiredForActionGate(intentKind, claim.Kind, request) {
 			continue
 		}
 		sensitivity := claimSensitivity(claim.Kind)
@@ -3026,8 +3026,8 @@ func claimRelevantToRequest(kind string, request IntentRequestEnvelope) bool {
 	return audience == "agent" || audience == "local" || audience == request.Actor.ID
 }
 
-func claimRequiredForActionGate(kind string, request IntentRequestEnvelope) bool {
-	return request.Task.Mode == "act_gate" && strings.HasPrefix(kind, "boundary.")
+func claimRequiredForActionGate(intentKind, kind string, request IntentRequestEnvelope) bool {
+	return request.Task.Mode == "act_gate" && (strings.HasPrefix(kind, "boundary.") || criticalClaimKinds(intentKind)[kind])
 }
 
 func addClaimCommitments(claims []IntentClaimEnvelope, request IntentRequestEnvelope, commitments map[string]string) []IntentClaimEnvelope {
