@@ -490,7 +490,7 @@ func TestResolveIntentAppliesPolicyAndPersistsSnapshot(t *testing.T) {
 	if len(first.Claims) != 1 || first.Claims[0].ID != normalID {
 		t.Fatalf("policy-filtered claims = %#v", first.Claims)
 	}
-	if first.Policy.MayAct != true || first.Policy.NeedsUserAnswer != false {
+	if first.Policy.MayAct || !first.Policy.NeedsUserAnswer {
 		t.Fatalf("policy = %#v", first.Policy)
 	}
 	if !containsString(first.Policy.Redacted, "boundary.project.no_go") {
@@ -784,6 +784,20 @@ func TestResolveIntentV2ActionAndDisclosureContracts(t *testing.T) {
 	if response.Decision.MayAct || !response.Decision.NeedsUserAnswer {
 		t.Fatalf("value-less action gate authorized action: %#v", response)
 	}
+	allowValues = true
+	response, err = tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, Request: IntentRequestEnvelope{
+		URI:        "tideglass://v1/intent/work.project.start/current",
+		Task:       IntentTask{Mode: "act_gate", Autonomy: "bounded_act"},
+		Contract:   IntentContract{RequiredSlots: []string{"preference.agent.communication"}},
+		Disclosure: IntentDisclosure{Mode: "existence", AllowValues: &allowValues},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Decision.MayAct || !response.Decision.NeedsUserAnswer {
+		t.Fatalf("existence action gate authorized action: %#v", response)
+	}
+	allowValues = false
 	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
 		URI:        "tideglass://v1/intent/work.project.start/current",
 		Task:       IntentTask{Mode: "context", Autonomy: "context_only"},
@@ -830,14 +844,7 @@ func TestResolveIntentCanonicalLinksAndExistenceDisclosure(t *testing.T) {
 	if response.Intent.Kind != "work.project.start" {
 		t.Fatalf("profile uri response = %#v", response)
 	}
-	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{URI: "tideglass://v1/intent/work.project.start/slots"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if response.Intent.Kind != "work.project.start" || response.Resource.Version != "current" {
-		t.Fatalf("v1 intent slots uri response = %#v", response)
-	}
-	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{URI: response.Links["unresolved"]}})
+	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{URI: "tideglass://unresolved/work.project.start"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1046,6 +1053,14 @@ func TestHandleMCPOnceReadsIntentResource(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), `"id": "bad-uri"`) || !strings.Contains(output.String(), `"error"`) {
 		t.Fatalf("expected correlated MCP resource error response: %s", output.String())
+	}
+	input = strings.NewReader(`{"jsonrpc":"2.0","id":9007199254740993,"method":"resources/read","params":{"uri":"tideglass://intent/"}}`)
+	output.Reset()
+	if err := HandleMCPOnce(ctx, tg, input, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), `"id": 9007199254740993`) || !strings.Contains(output.String(), `"error"`) {
+		t.Fatalf("expected exact numeric MCP id in error response: %s", output.String())
 	}
 }
 

@@ -790,8 +790,6 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 		Policy:        policy,
 		Links: map[string]string{
 			"profile":    "tideglass://v1/profile/me/" + kind + "/current",
-			"slots":      "tideglass://v1/intent/" + kind + "/slots",
-			"unresolved": "tideglass://v1/intent/" + kind + "/unresolved",
 			"disclosure": "tideglass://disclosure/" + kind + "/" + request.Audience.Label(),
 		},
 	}
@@ -1161,7 +1159,9 @@ func HandleMCPOnce(ctx context.Context, t *Tideglass, in io.Reader, out io.Write
 		Method  string          `json:"method"`
 		Params  json.RawMessage `json:"params,omitempty"`
 	}
-	if err := json.NewDecoder(io.LimitReader(in, 1<<20)).Decode(&req); err != nil {
+	dec := json.NewDecoder(io.LimitReader(in, 1<<20))
+	dec.UseNumber()
+	if err := dec.Decode(&req); err != nil {
 		return err
 	}
 	var result any
@@ -2610,7 +2610,7 @@ func redactedBlockingQuestions(intentKind string, redacted []string, requiredSlo
 	}
 	var out []IntentQuestion
 	for _, kind := range redacted {
-		if blocking[kind] && !haveQuestions[kind] {
+		if (blocking[kind] || strings.HasPrefix(kind, "boundary.")) && !haveQuestions[kind] {
 			out = append(out, questionForSlot(kind, "critical", true))
 		}
 	}
@@ -2755,7 +2755,7 @@ func parseIntentURI(rawURI string) (string, string, error) {
 	switch {
 	case len(parts) == 2 && parts[0] == "intent" && strings.TrimSpace(parts[1]) != "":
 		return normalizeKind(parts[1], ""), "", nil
-	case len(parts) == 3 && parts[0] == "intent" && strings.TrimSpace(parts[1]) != "" && (parts[2] == "current" || parts[2] == "slots" || parts[2] == "unresolved"):
+	case len(parts) == 3 && parts[0] == "intent" && strings.TrimSpace(parts[1]) != "" && parts[2] == "current":
 		return normalizeKind(parts[1], ""), "", nil
 	case len(parts) == 4 && parts[0] == "profile" && parts[1] == "me" && strings.TrimSpace(parts[2]) != "" && parts[3] == "current":
 		return normalizeKind(parts[2], ""), "", nil
@@ -2910,7 +2910,7 @@ func applyIntentPolicy(claims []ClaimOut, unresolved []IntentQuestion, request I
 		return out[i].ID < out[j].ID
 	})
 	policy.MayAct = !policy.NeedsUserAnswer
-	if request.Task.Mode == "act_gate" && !allowClaimValues(request.Disclosure) {
+	if request.Task.Mode == "act_gate" && (!allowClaimValues(request.Disclosure) || request.Disclosure.Mode == "existence") {
 		policy.NeedsUserAnswer = true
 		policy.MayAct = false
 	}
