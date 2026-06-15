@@ -902,6 +902,13 @@ func (t *Tideglass) ReviewClaim(ctx context.Context, opts ReviewOptions) (Review
 	default:
 		return ReviewResult{}, fmt.Errorf("unsupported review action %q", opts.Action)
 	}
+	var currentStatus string
+	if err := t.db.QueryRowContext(ctx, `select status from claims where id = ?`, claimID).Scan(&currentStatus); err != nil {
+		return ReviewResult{}, err
+	}
+	if currentStatus == status {
+		return ReviewResult{ClaimID: claimID, Action: action, Status: status}, nil
+	}
 	tx, err := t.db.BeginTx(ctx, nil)
 	if err != nil {
 		return ReviewResult{}, err
@@ -2090,6 +2097,10 @@ func sqliteColumnExists(ctx context.Context, db *sql.DB, table, column string) b
 	return false
 }
 
+func sqliteDuplicateColumnError(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "duplicate column")
+}
+
 func (t *Tideglass) retrieveImported(ctx context.Context, source SourceStatus, query string, limit int) ([]retrievedEvidence, error) {
 	queryText := ftsQuery(query)
 	if queryText == "" {
@@ -2140,7 +2151,9 @@ where e.rowid not in (select rowid from evidence_fts)`)
 func (t *Tideglass) ensureIntentRequestSchema(ctx context.Context) error {
 	if !sqliteColumnExists(ctx, t.db, "intent_requests", "request_json") {
 		if _, err := t.db.ExecContext(ctx, `alter table intent_requests add column request_json text not null default '{}'`); err != nil {
-			return err
+			if !sqliteDuplicateColumnError(err) {
+				return err
+			}
 		}
 	}
 	if _, err := t.db.ExecContext(ctx, `create table if not exists revisions (id integer primary key autoincrement)`); err != nil {
@@ -2148,7 +2161,9 @@ func (t *Tideglass) ensureIntentRequestSchema(ctx context.Context) error {
 	}
 	if !sqliteColumnExists(ctx, t.db, "claims", "revision") {
 		if _, err := t.db.ExecContext(ctx, `alter table claims add column revision integer not null default 0`); err != nil {
-			return err
+			if !sqliteDuplicateColumnError(err) {
+				return err
+			}
 		}
 	}
 	if _, err := t.db.ExecContext(ctx, `
@@ -2890,6 +2905,7 @@ func redactedBlockingQuestions(intentKind string, redacted []string, requiredSlo
 	for _, kind := range redacted {
 		if (blocking[kind] || strings.HasPrefix(kind, "boundary.")) && !haveBlockingQuestions[kind] {
 			out = append(out, questionForSlot(kind, "critical", true))
+			haveBlockingQuestions[kind] = true
 		}
 	}
 	return out
@@ -2913,6 +2929,7 @@ func policyFailedBlockingQuestions(intentKind string, claims []ClaimOut, require
 	for _, claim := range claims {
 		if (blocking[claim.Kind] || strings.HasPrefix(claim.Kind, "boundary.")) && !haveBlockingQuestions[claim.Kind] {
 			out = append(out, questionForSlot(claim.Kind, "critical", true))
+			haveBlockingQuestions[claim.Kind] = true
 		}
 	}
 	return out
@@ -3253,6 +3270,7 @@ func applyIntentPolicy(intentKind string, claims []ClaimOut, unresolved []Intent
 	out := make([]IntentClaimEnvelope, 0, len(claims))
 	redacted := map[string]bool{}
 	shareable := map[string]bool{}
+	existenceSeen := map[string]bool{}
 	for _, claim := range claims {
 		if request.Contract.ConfidenceFloor > 0 && claim.Confidence < request.Contract.ConfidenceFloor {
 			continue
@@ -3279,12 +3297,20 @@ func applyIntentPolicy(intentKind string, claims []ClaimOut, unresolved []Intent
 		if shouldRedactClaim(request.Disclosure, sensitivity) {
 			redacted[claim.Kind] = true
 			if request.Disclosure.Mode == "existence" {
-				out = append(out, existenceClaimEnvelope(claim))
+				key := claim.Kind + "\x00" + claim.Status
+				if !existenceSeen[key] {
+					out = append(out, existenceClaimEnvelope(claim))
+					existenceSeen[key] = true
+				}
 			}
 			continue
 		}
 		if request.Disclosure.Mode == "existence" {
-			out = append(out, existenceClaimEnvelope(claim))
+			key := claim.Kind + "\x00" + claim.Status
+			if !existenceSeen[key] {
+				out = append(out, existenceClaimEnvelope(claim))
+				existenceSeen[key] = true
+			}
 			shareable[claim.Kind] = true
 			continue
 		}
