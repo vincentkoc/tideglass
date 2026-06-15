@@ -640,8 +640,8 @@ func TestResolveIntentAppliesPolicyAndPersistsSnapshot(t *testing.T) {
 	if first.Policy.MayAct || !first.Policy.NeedsUserAnswer {
 		t.Fatalf("policy = %#v", first.Policy)
 	}
-	if !containsString(first.Policy.Redacted, "boundary.project.no_go") {
-		t.Fatalf("redactions = %#v", first.Policy.Redacted)
+	if !containsString(first.Policy.CapabilityRequired, "sensitive_disclosure") {
+		t.Fatalf("capabilities = %#v", first.Policy.CapabilityRequired)
 	}
 	second, err := tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, Request: IntentRequestEnvelope{
 		URI:  "tideglass://intent/work.project.start",
@@ -748,8 +748,8 @@ func TestResolveIntentActionGateProcessesScopedCriticalClaims(t *testing.T) {
 	if response.Decision.MayAct || !response.Decision.NeedsUserAnswer {
 		t.Fatalf("scoped critical claim authorized action: %#v", response)
 	}
-	if !containsString(response.Policy.Redacted, "preference.food.allergy") || !hasBlockingQuestionSlot(response.Unresolved, "preference.food.allergy") {
-		t.Fatalf("scoped critical claim was not processed as a blocker: %#v", response)
+	if containsString(response.Policy.Redacted, "preference.food.allergy") || !containsString(response.Policy.CapabilityRequired, "sensitive_disclosure") {
+		t.Fatalf("scoped critical claim leaked or missed sensitive capability: %#v", response)
 	}
 	if _, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
 		Kind:       "preference.food.allergy",
@@ -805,8 +805,8 @@ func TestResolveIntentMinimalDisclosureMarksOmittedCriticalClaims(t *testing.T) 
 	if response.Status == "ready" || !response.Decision.NeedsUserAnswer || response.Policy.MayAct {
 		t.Fatalf("minimal disclosure silently omitted critical claim: %#v", response)
 	}
-	if !containsString(response.Policy.Redacted, "preference.food.allergy") || !hasBlockingQuestionSlot(response.Unresolved, "preference.food.allergy") {
-		t.Fatalf("omitted critical claim was not marked unresolved/redacted: %#v", response)
+	if containsString(response.Policy.Redacted, "preference.food.allergy") || !containsString(response.Policy.CapabilityRequired, "sensitive_disclosure") {
+		t.Fatalf("omitted critical claim leaked or missed sensitive capability: %#v", response)
 	}
 }
 
@@ -893,8 +893,19 @@ func TestResolveIntentRedactsUnknownPreferenceKindsByDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if hasIntentClaimID(response.Claims, claimID) || !containsString(response.Policy.Redacted, "preference.health.medication") {
+	if hasIntentClaimID(response.Claims, claimID) || containsString(response.Policy.Redacted, "preference.health.medication") || !containsString(response.Policy.CapabilityRequired, "sensitive_disclosure") {
 		t.Fatalf("unknown preference kind was not redacted by default: %#v", response)
+	}
+	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
+		URI:        "tideglass://v1/intent/social.dinner/current",
+		Contract:   IntentContract{RequiredSlots: []string{"preference.health.medication"}},
+		Disclosure: IntentDisclosure{Mode: "existence"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Claims) != 0 || containsString(response.Policy.Redacted, "preference.health.medication") || !containsString(response.Policy.CapabilityRequired, "sensitive_disclosure") {
+		t.Fatalf("existence disclosure leaked unknown preference kind: %#v", response)
 	}
 }
 
@@ -2082,11 +2093,11 @@ func TestResolveIntentUnreviewedAndStaleClaimsDoNotSatisfyCriticalSlots(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !response.Policy.NeedsUserAnswer || response.Policy.MayAct || !containsString(response.Policy.Redacted, "preference.food.allergy") {
+	if !response.Policy.NeedsUserAnswer || response.Policy.MayAct || containsString(response.Policy.Redacted, "preference.food.allergy") || !containsString(response.Policy.CapabilityRequired, "sensitive_disclosure") {
 		t.Fatalf("redacted critical claim authorized action: %#v", response.Policy)
 	}
-	if !hasQuestionSlot(response.Unresolved, "preference.food.allergy") {
-		t.Fatalf("redacted critical claim did not produce an unresolved slot: %#v", response.Unresolved)
+	if hasQuestionSlot(response.Unresolved, "preference.food.allergy") {
+		t.Fatalf("redacted critical claim leaked an existence-specific unresolved slot: %#v", response.Unresolved)
 	}
 	old := "2020-01-01T00:00:00Z"
 	if _, err := tg.db.ExecContext(ctx, `update claims set updated_at = ? where id = ?`, old, unreviewedID); err != nil {
@@ -2220,7 +2231,7 @@ func TestResolveIntentV2ActionAndDisclosureContracts(t *testing.T) {
 	if response.Decision.MayAct || !response.Decision.NeedsUserAnswer || !hasQuestionSlot(response.Unresolved, "preference.project.validation") {
 		t.Fatalf("required slot did not gate action: %#v", response)
 	}
-	if !containsString(response.Policy.Redacted, "preference.agent.imported_memory") {
+	if containsString(response.Policy.Redacted, "preference.agent.imported_memory") || !containsString(response.Policy.CapabilityRequired, "sensitive_disclosure") {
 		t.Fatalf("imported memory was not redacted: %#v", response.Policy)
 	}
 	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{

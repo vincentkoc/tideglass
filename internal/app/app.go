@@ -3764,17 +3764,20 @@ func stringSliceContains(rows []string, value string) bool {
 }
 
 func mergeClaimOuts(primary []ClaimOut, extra []ClaimOut) []ClaimOut {
-	seen := map[string]bool{}
+	seen := map[string]int{}
 	out := make([]ClaimOut, 0, len(primary)+len(extra))
 	for _, claim := range primary {
-		seen[claim.ID] = true
+		seen[claim.ID] = len(out)
 		out = append(out, claim)
 	}
 	for _, claim := range extra {
-		if seen[claim.ID] {
+		if index, ok := seen[claim.ID]; ok {
+			if out[index].ReviewReason == "" && claim.ReviewReason != "" {
+				out[index].ReviewReason = claim.ReviewReason
+			}
 			continue
 		}
-		seen[claim.ID] = true
+		seen[claim.ID] = len(out)
 		out = append(out, claim)
 	}
 	return out
@@ -3890,13 +3893,18 @@ func applyIntentPolicy(intentKind string, claims []ClaimOut, unresolved []Intent
 		if request.Contract.ConfidenceFloor > 0 && claim.Confidence < request.Contract.ConfidenceFloor {
 			continue
 		}
+		sensitivity := claimSensitivity(claim.Kind)
 		if scopeByRelevance && !claimRelevantToRequest(claim.Kind, request) && !claimRequiredForActionGate(intentKind, claim.Kind, request) {
 			if omittedClaimBlocksReadiness(intentKind, claim.Kind, request) {
-				redacted[claim.Kind] = true
+				if shouldRedactClaim(request.Disclosure, sensitivity) {
+					policy.NeedsUserAnswer = true
+					policy.CapabilityRequired = append(policy.CapabilityRequired, "sensitive_disclosure")
+				} else {
+					redacted[claim.Kind] = true
+				}
 			}
 			continue
 		}
-		sensitivity := claimSensitivity(claim.Kind)
 		envelope := IntentClaimEnvelope{
 			ID:          claim.ID,
 			Kind:        claim.Kind,
@@ -3913,14 +3921,8 @@ func applyIntentPolicy(intentKind string, claims []ClaimOut, unresolved []Intent
 			envelope.Evidence = claim.Evidence
 		}
 		if shouldRedactClaim(request.Disclosure, sensitivity) {
-			redacted[claim.Kind] = true
-			if request.Disclosure.Mode == "existence" {
-				key := claim.Kind + "\x00" + claim.Status
-				if !existenceSeen[key] {
-					out = append(out, existenceClaimEnvelope(claim))
-					existenceSeen[key] = true
-				}
-			}
+			policy.NeedsUserAnswer = true
+			policy.CapabilityRequired = append(policy.CapabilityRequired, "sensitive_disclosure")
 			continue
 		}
 		if request.Disclosure.Mode == "existence" {
