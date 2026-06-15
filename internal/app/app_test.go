@@ -767,6 +767,21 @@ func TestResolveIntentActionGateIgnoresSupersededSingletonBoundaries(t *testing.
 	if response.Decision.MayAct == false || response.Decision.NeedsUserAnswer || hasBlockingQuestionSlot(response.Unresolved, "boundary.project.no_go") {
 		t.Fatalf("superseded singleton boundary blocked action: %#v", response)
 	}
+	if _, err := tg.EditClaim(ctx, EditOptions{ClaimID: oldBoundaryID, Value: "Fresh pending boundary.", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	response, err = tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, Request: IntentRequestEnvelope{
+		URI:        "tideglass://v1/intent/work.project.start/current",
+		Task:       IntentTask{Mode: "act_gate", Autonomy: "bounded_act"},
+		Contract:   IntentContract{RequiredSlots: []string{"preference.agent.communication"}},
+		Disclosure: IntentDisclosure{AllowSensitive: true},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Decision.MayAct || !response.Decision.NeedsUserAnswer || !hasBlockingQuestionSlot(response.Unresolved, "boundary.project.no_go") {
+		t.Fatalf("fresh edited singleton boundary did not block action: %#v", response)
+	}
 }
 
 func TestResolveIntentInferredClaimsDoNotSatisfyCriticalQuestions(t *testing.T) {

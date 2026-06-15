@@ -34,7 +34,7 @@ import (
 	"github.com/openclaw/crawlkit/vector"
 )
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 type Tideglass struct {
 	store *store.Store
@@ -853,12 +853,17 @@ func (t *Tideglass) EditClaim(ctx context.Context, opts EditOptions) (EditResult
 	if err != nil {
 		return EditResult{}, err
 	}
+	revision, err := nextRevision(ctx, tx)
+	if err != nil {
+		_ = tx.Rollback()
+		return EditResult{}, err
+	}
 	if _, err := tx.ExecContext(ctx, `insert into edits(id,claim_id,operation,patch_json,reason,created_at) values(?,?,?,?,?,?)`,
 		editID, opts.ClaimID, "supersede", string(patch), opts.Reason, now()); err != nil {
 		_ = tx.Rollback()
 		return EditResult{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `update claims set status = 'active', updated_at = ? where id = ?`, now(), opts.ClaimID); err != nil {
+	if _, err := tx.ExecContext(ctx, `update claims set status = 'active', updated_at = ?, revision = ? where id = ?`, now(), revision, opts.ClaimID); err != nil {
 		_ = tx.Rollback()
 		return EditResult{}, err
 	}
@@ -885,7 +890,11 @@ func (t *Tideglass) ReviewClaim(ctx context.Context, opts ReviewOptions) (Review
 	default:
 		return ReviewResult{}, fmt.Errorf("unsupported review action %q", opts.Action)
 	}
-	res, err := t.db.ExecContext(ctx, `update claims set status = ?, updated_at = ? where id = ?`, status, now(), claimID)
+	revision, err := nextRevision(ctx, t.db)
+	if err != nil {
+		return ReviewResult{}, err
+	}
+	res, err := t.db.ExecContext(ctx, `update claims set status = ?, updated_at = ?, revision = ? where id = ?`, status, now(), revision, claimID)
 	if err != nil {
 		return ReviewResult{}, err
 	}
@@ -1574,12 +1583,28 @@ func (t *Tideglass) insertClaim(ctx context.Context, intentID string, claim cand
 	if sourceMode == "" {
 		sourceMode = "inferred"
 	}
+	revision, err := nextRevision(ctx, t.db)
+	if err != nil {
+		return "", err
+	}
 	claimID := id("clm")
-	_, err := t.db.ExecContext(ctx, `
-insert into claims(id,intent_id,subject,kind,value,normalized_value,polarity,scope,status,source_mode,confidence,created_at,updated_at)
-values(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		claimID, intentID, "user", claim.Kind, claim.Value, normalizeText(claim.Value), "neutral", "", "active", sourceMode, claim.Confidence, now(), now())
+	_, err = t.db.ExecContext(ctx, `
+insert into claims(id,intent_id,subject,kind,value,normalized_value,polarity,scope,status,source_mode,confidence,created_at,updated_at,revision)
+values(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		claimID, intentID, "user", claim.Kind, claim.Value, normalizeText(claim.Value), "neutral", "", "active", sourceMode, claim.Confidence, now(), now(), revision)
 	return claimID, err
+}
+
+type revisionExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func nextRevision(ctx context.Context, execer revisionExecer) (int64, error) {
+	result, err := execer.ExecContext(ctx, `insert into revisions default values`)
+	if err != nil {
+		return 0, err
+	}
+	return result.LastInsertId()
 }
 
 func (t *Tideglass) loadClaims(ctx context.Context, intentID string) ([]ClaimOut, error) {
@@ -1708,7 +1733,7 @@ func (t *Tideglass) loadActionGateClaims(ctx context.Context, intentID, intentKi
 select c.id, c.kind,
        coalesce(json_extract(e.patch_json, '$.value'), c.value) as value,
        c.confidence, c.status, c.source_mode,
-       c.updated_at, coalesce(e.created_at, '')
+       c.updated_at, coalesce(e.created_at, ''), c.revision
 from claims c
 left join edits e on e.id = (
   select id from edits
@@ -1722,11 +1747,13 @@ order by c.created_at desc`, intentID)
 	}
 	defer rows.Close()
 	var claims []ClaimOut
-	bestAcceptedSingleton := map[string]string{}
+	bestAcceptedSingleton := map[string]int64{}
+	actionGateClaimRevisions := map[string]int64{}
 	for rows.Next() {
 		var claim ClaimOut
 		var valueEditCreatedAt string
-		if err := rows.Scan(&claim.ID, &claim.Kind, &claim.Value, &claim.Confidence, &claim.Status, &claim.SourceMode, &claim.UpdatedAt, &valueEditCreatedAt); err != nil {
+		var revision int64
+		if err := rows.Scan(&claim.ID, &claim.Kind, &claim.Value, &claim.Confidence, &claim.Status, &claim.SourceMode, &claim.UpdatedAt, &valueEditCreatedAt, &revision); err != nil {
 			return nil, err
 		}
 		if !blocking[claim.Kind] && !strings.HasPrefix(claim.Kind, "boundary.") {
@@ -1735,17 +1762,19 @@ order by c.created_at desc`, intentID)
 		if valueEditCreatedAt > claim.UpdatedAt {
 			claim.UpdatedAt = valueEditCreatedAt
 		}
-		if singletonClaimKind(claim.Kind) && claim.Status == "accepted" && claim.UpdatedAt > bestAcceptedSingleton[claim.Kind] {
-			bestAcceptedSingleton[claim.Kind] = claim.UpdatedAt
+		if singletonClaimKind(claim.Kind) && claim.Status == "accepted" && revision > bestAcceptedSingleton[claim.Kind] {
+			bestAcceptedSingleton[claim.Kind] = revision
 		}
 		claims = append(claims, claim)
+		actionGateClaimRevisions[claim.ID] = revision
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	out := make([]ClaimOut, 0, len(claims))
 	for _, claim := range claims {
-		if singletonClaimKind(claim.Kind) && claim.Status != "accepted" && bestAcceptedSingleton[claim.Kind] != "" && claim.UpdatedAt < bestAcceptedSingleton[claim.Kind] {
+		revision := actionGateClaimRevisions[claim.ID]
+		if singletonClaimKind(claim.Kind) && claim.Status != "accepted" && bestAcceptedSingleton[claim.Kind] > 0 && revision > 0 && revision < bestAcceptedSingleton[claim.Kind] {
 			continue
 		}
 		out = append(out, claim)
@@ -2002,11 +2031,20 @@ where e.rowid not in (select rowid from evidence_fts)`)
 }
 
 func (t *Tideglass) ensureIntentRequestSchema(ctx context.Context) error {
-	if sqliteColumnExists(ctx, t.db, "intent_requests", "request_json") {
-		return nil
+	if !sqliteColumnExists(ctx, t.db, "intent_requests", "request_json") {
+		if _, err := t.db.ExecContext(ctx, `alter table intent_requests add column request_json text not null default '{}'`); err != nil {
+			return err
+		}
 	}
-	_, err := t.db.ExecContext(ctx, `alter table intent_requests add column request_json text not null default '{}'`)
-	return err
+	if _, err := t.db.ExecContext(ctx, `create table if not exists revisions (id integer primary key autoincrement)`); err != nil {
+		return err
+	}
+	if !sqliteColumnExists(ctx, t.db, "claims", "revision") {
+		if _, err := t.db.ExecContext(ctx, `alter table claims add column revision integer not null default 0`); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func discoverStaticSources() []SourceStatus {
@@ -4073,7 +4111,8 @@ create table if not exists claims (
   valid_from text,
   valid_until text,
   created_at text not null,
-  updated_at text not null
+  updated_at text not null,
+  revision integer not null default 0
 );
 
 create table if not exists claim_evidence (
@@ -4130,6 +4169,10 @@ create table if not exists runs (
   status text not null,
   started_at text not null,
   finished_at text
+);
+
+create table if not exists revisions (
+  id integer primary key autoincrement
 );
 
 create table if not exists intent_requests (
