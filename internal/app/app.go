@@ -2011,6 +2011,9 @@ order by c.created_at desc`, intentID)
 			continue
 		}
 		singletonAcceptedRevision := bestAcceptedSingleton[claim.Kind]
+		if singletonClaimKind(claim.Kind) && singletonAcceptedRevision.ok && claim.Status == "accepted" && revision < singletonAcceptedRevision.revision {
+			continue
+		}
 		if singletonClaimKind(claim.Kind) && singletonAcceptedRevision.ok && claim.Status != "accepted" && revision <= singletonAcceptedRevision.revision {
 			continue
 		}

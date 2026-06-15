@@ -1250,6 +1250,53 @@ func TestLoadActionGateClaimsTreatsRevisionZeroAcceptedSingletonAsAuthoritative(
 	}
 }
 
+func TestLoadActionGateClaimsDropsSupersededAcceptedSingletons(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	intent, err := tg.ensureIntent(ctx, "work.project.start", "Project start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "boundary.project.no_go",
+		Value:      "Old accepted boundary.",
+		Confidence: 0.9,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: oldID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	newID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "boundary.project.no_go",
+		Value:      "New accepted boundary.",
+		Confidence: 0.95,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: newID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	claims, err := tg.loadActionGateClaims(ctx, intent.ID, "work.project.start", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasClaimID(claims, oldID) {
+		t.Fatalf("superseded accepted singleton stayed in action gate claims: %#v", claims)
+	}
+	if !hasClaimID(claims, newID) {
+		t.Fatalf("new accepted singleton missing from action gate claims: %#v", claims)
+	}
+}
+
 func TestLoadReviewCandidateClaimsPreservesDuplicateDecisions(t *testing.T) {
 	ctx := context.Background()
 	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
