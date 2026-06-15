@@ -523,7 +523,7 @@ func TestResolveIntentAppliesPolicyAndPersistsSnapshot(t *testing.T) {
 	if err := tg.db.QueryRowContext(ctx, `select request_json from intent_requests where id = ?`, first.RequestID).Scan(&requestJSON); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(requestJSON, "required_slots") || !strings.Contains(requestJSON, "bounded_act") {
+	if !strings.Contains(requestJSON, "required_slots") || !strings.Contains(requestJSON, "bounded_act") || !strings.Contains(requestJSON, `"allow_action":true`) {
 		t.Fatalf("request_json did not preserve v2 envelope: %s", requestJSON)
 	}
 	var snapshotJSON string
@@ -603,6 +603,116 @@ func TestResolveIntentActionGateProcessesScopedCriticalClaims(t *testing.T) {
 	}
 	if !containsString(response.Policy.Redacted, "preference.food.allergy") || !hasBlockingQuestionSlot(response.Unresolved, "preference.food.allergy") {
 		t.Fatalf("scoped critical claim was not processed as a blocker: %#v", response)
+	}
+}
+
+func TestResolveIntentActionGateFailsClosedWithoutConstraints(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	if _, err := tg.ensureIntent(ctx, "work.project.start", "Project start"); err != nil {
+		t.Fatal(err)
+	}
+	response, err := tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, Request: IntentRequestEnvelope{
+		URI:  "tideglass://v1/intent/work.project.start/current",
+		Task: IntentTask{Mode: "act_gate", Autonomy: "bounded_act"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Decision.MayAct || !response.Decision.NeedsUserAnswer || !hasBlockingQuestionSlot(response.Unresolved, "policy.action.constraints") {
+		t.Fatalf("empty action gate authorized action: %#v", response)
+	}
+}
+
+func TestResolveIntentActionGateScansPendingSingletonBoundaries(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	intent, err := tg.ensureIntent(ctx, "work.project.start", "Project start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	communicationID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "preference.agent.communication",
+		Value:      "Use terse updates.",
+		Confidence: 0.9,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: communicationID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	oldBoundaryID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "boundary.project.no_go",
+		Value:      "Old reviewed boundary.",
+		Confidence: 0.9,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: oldBoundaryID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "boundary.project.no_go",
+		Value:      "New pending boundary.",
+		Confidence: 0.95,
+		SourceMode: "explicit",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	response, err := tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, Request: IntentRequestEnvelope{
+		URI:        "tideglass://v1/intent/work.project.start/current",
+		Task:       IntentTask{Mode: "act_gate", Autonomy: "bounded_act"},
+		Contract:   IntentContract{RequiredSlots: []string{"preference.agent.communication"}},
+		Disclosure: IntentDisclosure{AllowSensitive: true},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Decision.MayAct || !response.Decision.NeedsUserAnswer || !hasBlockingQuestionSlot(response.Unresolved, "boundary.project.no_go") {
+		t.Fatalf("pending singleton boundary was hidden by accepted boundary: %#v", response)
+	}
+}
+
+func TestResolveIntentInferredClaimsDoNotSatisfyCriticalQuestions(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	intent, err := tg.ensureIntent(ctx, "social.dinner", "Dinner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "preference.food.allergy",
+		Value:      "Maybe shellfish.",
+		Confidence: 0.6,
+		SourceMode: "inferred",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	response, err := tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
+		URI:       "tideglass://v1/intent/social.dinner/current",
+		Freshness: IntentFreshness{AcceptInferredForQuestions: true},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Status != "partial" || !response.Policy.NeedsUserAnswer || !hasBlockingQuestionSlot(response.Unresolved, "preference.food.allergy") {
+		t.Fatalf("inferred critical claim satisfied critical question: %#v", response)
 	}
 }
 

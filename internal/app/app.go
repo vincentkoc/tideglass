@@ -696,6 +696,9 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 	if strings.TrimSpace(request.RequestID) != "" {
 		request.Context["client_request_id"] = strings.TrimSpace(request.RequestID)
 	}
+	request.Context["server_authority"] = map[string]any{
+		"allow_action": opts.AllowAction,
+	}
 	request.RequestID = requestID
 	if !opts.NoPersist {
 		var err error
@@ -731,11 +734,18 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 		claims = eligibleClaimsForRequest(loaded, requireReviewed, maxAge)
 		policyFailedClaims = policyFailingClaims(loaded, claims)
 		if request.Task.Mode == "act_gate" {
-			policyFailedClaims = mergeClaimOuts(policyFailedClaims, actionGatePolicyFailingClaims(kind, loaded, request, maxAge))
+			actionGateClaims, err := t.loadActionGateClaims(ctx, intent.ID, kind, request.Contract.RequiredSlots)
+			if err != nil {
+				return IntentResponseEnvelope{}, err
+			}
+			policyFailedClaims = mergeClaimOuts(policyFailedClaims, actionGatePolicyFailingClaims(kind, actionGateClaims, request, maxAge))
 		}
-		slotClaims := claimsForSlotSatisfaction(loaded, request, maxAge)
+		slotClaims := claimsForSlotSatisfaction(kind, loaded, request, maxAge)
 		unresolved = unresolvedIntentQuestions(intent.Kind, slotClaims)
 		unresolved = addRequiredSlotQuestions(unresolved, slotClaims, request.Contract.RequiredSlots)
+		if request.Task.Mode == "act_gate" && len(claims) == 0 && len(policyFailedClaims) == 0 {
+			unresolved = append(unresolved, questionForSlot("policy.action.constraints", "critical", true))
+		}
 	} else {
 		intent = IntentOut{Kind: kind, Title: titleForKind(kind)}
 		unresolved = unresolvedIntentQuestions(kind, nil)
@@ -1677,6 +1687,48 @@ order by c.created_at desc`, intentID)
 		claims = append(claims, claim.ClaimOut)
 	}
 	return claims, nil
+}
+
+func (t *Tideglass) loadActionGateClaims(ctx context.Context, intentID, intentKind string, requiredSlots []string) ([]ClaimOut, error) {
+	blocking := criticalClaimKinds(intentKind)
+	for _, slot := range requiredSlots {
+		if strings.TrimSpace(slot) != "" {
+			blocking[strings.TrimSpace(slot)] = true
+		}
+	}
+	rows, err := t.db.QueryContext(ctx, `
+select c.id, c.kind,
+       coalesce(json_extract(e.patch_json, '$.value'), c.value) as value,
+       c.confidence, c.status, c.source_mode,
+       c.updated_at, coalesce(e.created_at, '')
+from claims c
+left join edits e on e.id = (
+  select id from edits
+  where claim_id = c.id and json_extract(patch_json, '$.value') is not null
+  order by created_at desc, rowid desc limit 1
+)
+where c.intent_id = ? and c.status != 'rejected'
+order by c.created_at desc`, intentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var claims []ClaimOut
+	for rows.Next() {
+		var claim ClaimOut
+		var valueEditCreatedAt string
+		if err := rows.Scan(&claim.ID, &claim.Kind, &claim.Value, &claim.Confidence, &claim.Status, &claim.SourceMode, &claim.UpdatedAt, &valueEditCreatedAt); err != nil {
+			return nil, err
+		}
+		if !blocking[claim.Kind] && !strings.HasPrefix(claim.Kind, "boundary.") {
+			continue
+		}
+		if valueEditCreatedAt > claim.UpdatedAt {
+			claim.UpdatedAt = valueEditCreatedAt
+		}
+		claims = append(claims, claim)
+	}
+	return claims, rows.Err()
 }
 
 func (t *Tideglass) attachClaimEvidence(ctx context.Context, claims []ClaimOut) ([]ClaimOut, []EvidenceOut, error) {
@@ -2879,7 +2931,14 @@ func mergeClaimOuts(primary []ClaimOut, extra []ClaimOut) []ClaimOut {
 	return out
 }
 
-func claimsForSlotSatisfaction(claims []ClaimOut, request IntentRequestEnvelope, maxAge time.Duration) []ClaimOut {
+func claimsForSlotSatisfaction(intentKind string, claims []ClaimOut, request IntentRequestEnvelope, maxAge time.Duration) []ClaimOut {
+	critical := criticalClaimKinds(intentKind)
+	required := map[string]bool{}
+	for _, slot := range request.Contract.RequiredSlots {
+		if strings.TrimSpace(slot) != "" {
+			required[strings.TrimSpace(slot)] = true
+		}
+	}
 	out := make([]ClaimOut, 0, len(claims))
 	for _, claim := range claims {
 		if claimStale(claim, maxAge) {
@@ -2888,8 +2947,13 @@ func claimsForSlotSatisfaction(claims []ClaimOut, request IntentRequestEnvelope,
 		if request.Task.Mode == "act_gate" && claim.Status != "accepted" {
 			continue
 		}
-		if claim.Status != "accepted" && !request.Freshness.AcceptInferredForQuestions {
-			continue
+		if claim.Status != "accepted" {
+			if !request.Freshness.AcceptInferredForQuestions {
+				continue
+			}
+			if critical[claim.Kind] || required[claim.Kind] {
+				continue
+			}
 		}
 		if request.Contract.ConfidenceFloor > 0 && claim.Confidence < request.Contract.ConfidenceFloor {
 			continue
