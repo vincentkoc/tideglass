@@ -176,7 +176,7 @@ func runReview(ctx context.Context, args []string) error {
 		return err
 	}
 	defer tg.Close()
-	profile, err := tg.Profile(ctx, app.ProfileOptions{IntentID: *intentID, Kind: *kind})
+	profile, err := tg.Profile(ctx, app.ProfileOptions{IntentID: *intentID, Kind: *kind, ReviewCandidates: true})
 	if err != nil {
 		return err
 	}

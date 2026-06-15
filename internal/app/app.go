@@ -59,10 +59,11 @@ type AskOptions struct {
 }
 
 type ProfileOptions struct {
-	IntentID string
-	Kind     string
-	ForAgent string
-	Budget   int
+	IntentID         string
+	Kind             string
+	ForAgent         string
+	Budget           int
+	ReviewCandidates bool
 }
 
 type EditOptions struct {
@@ -659,11 +660,13 @@ func (t *Tideglass) Profile(ctx context.Context, opts ProfileOptions) (ProfileRe
 	if err != nil {
 		return ProfileResult{}, err
 	}
-	actionGateClaims, err := t.loadActionGateClaims(ctx, intent.ID, intent.Kind, nil)
-	if err != nil {
-		return ProfileResult{}, err
+	if opts.ReviewCandidates {
+		reviewClaims, err := t.loadReviewCandidateClaims(ctx, intent.ID)
+		if err != nil {
+			return ProfileResult{}, err
+		}
+		claims = mergeClaimOuts(claims, reviewClaims)
 	}
-	claims = mergeClaimOuts(claims, actionGateClaims)
 	evidence := []EvidenceOut(nil)
 	claims, evidence, err = t.attachClaimEvidence(ctx, claims)
 	if err != nil {
@@ -1807,6 +1810,62 @@ order by c.created_at desc`, intentID)
 			continue
 		}
 		out = append(out, claim)
+	}
+	return out, nil
+}
+
+func (t *Tideglass) loadReviewCandidateClaims(ctx context.Context, intentID string) ([]ClaimOut, error) {
+	rows, err := t.db.QueryContext(ctx, `
+select c.id, c.kind,
+       coalesce(json_extract(e.patch_json, '$.value'), c.value) as value,
+       c.confidence, c.status, c.source_mode,
+       c.updated_at, coalesce(e.created_at, ''), c.revision
+from claims c
+left join edits e on e.id = (
+  select id from edits
+  where claim_id = c.id and json_extract(patch_json, '$.value') is not null
+  order by julianday(created_at) desc, rowid desc limit 1
+)
+where c.intent_id = ? and c.status != 'rejected'
+order by c.created_at desc`, intentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var claims []ClaimOut
+	revisions := map[string]int64{}
+	bestAcceptedSingleton := map[string]int64{}
+	for rows.Next() {
+		var claim ClaimOut
+		var valueEditCreatedAt string
+		var revision int64
+		if err := rows.Scan(&claim.ID, &claim.Kind, &claim.Value, &claim.Confidence, &claim.Status, &claim.SourceMode, &claim.UpdatedAt, &valueEditCreatedAt, &revision); err != nil {
+			return nil, err
+		}
+		if !singletonClaimKind(claim.Kind) {
+			continue
+		}
+		if timestampAfter(valueEditCreatedAt, claim.UpdatedAt) {
+			claim.UpdatedAt = valueEditCreatedAt
+		}
+		if claim.Status == "accepted" && revision > bestAcceptedSingleton[claim.Kind] {
+			bestAcceptedSingleton[claim.Kind] = revision
+		}
+		claims = append(claims, claim)
+		revisions[claim.ID] = revision
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	out := make([]ClaimOut, 0, len(claims))
+	for _, claim := range claims {
+		revision := revisions[claim.ID]
+		if bestAcceptedSingleton[claim.Kind] > 0 && revision < bestAcceptedSingleton[claim.Kind] {
+			continue
+		}
+		if claim.Status != "accepted" {
+			out = append(out, claim)
+		}
 	}
 	return out, nil
 }

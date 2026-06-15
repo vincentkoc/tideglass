@@ -699,6 +699,13 @@ func TestResolveIntentActionGateScansPendingSingletonBoundaries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if hasClaimID(profile.Claims, pendingBoundaryID) {
+		t.Fatalf("pending action boundary leaked into canonical profile: %#v", profile.Claims)
+	}
+	profile, err = tg.Profile(ctx, ProfileOptions{Kind: "work.project.start", ReviewCandidates: true})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !hasClaimID(profile.Claims, pendingBoundaryID) {
 		t.Fatalf("pending action boundary was hidden from review profile: %#v", profile.Claims)
 	}
