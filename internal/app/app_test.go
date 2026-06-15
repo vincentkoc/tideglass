@@ -1897,6 +1897,22 @@ func TestHandleMCPOnceReadsIntentResource(t *testing.T) {
 	if !strings.Contains(output.String(), `"id": 9007199254740993`) || !strings.Contains(output.String(), `"error"`) {
 		t.Fatalf("expected exact numeric MCP id in error response: %s", output.String())
 	}
+	input = strings.NewReader(`{"jsonrpc":"2.0",`)
+	output.Reset()
+	if err := HandleMCPOnce(ctx, tg, input, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), `"id": null`) || !strings.Contains(output.String(), `"code": -32700`) {
+		t.Fatalf("expected MCP parse error envelope: %s", output.String())
+	}
+	input = strings.NewReader(`{"jsonrpc":"2.0","id":"extra","method":"resources/read","params":{"uri":"tideglass://intent/work.project.start"}}{}`)
+	output.Reset()
+	if err := HandleMCPOnce(ctx, tg, input, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), `"id": null`) || !strings.Contains(output.String(), `"code": -32700`) {
+		t.Fatalf("expected MCP trailing input parse error envelope: %s", output.String())
+	}
 }
 
 func TestProbeSQLiteMarksMissingExpectedTablesPartial(t *testing.T) {

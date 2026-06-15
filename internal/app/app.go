@@ -1293,7 +1293,11 @@ func HandleMCPOnce(ctx context.Context, t *Tideglass, in io.Reader, out io.Write
 	dec := json.NewDecoder(io.LimitReader(in, 1<<20))
 	dec.UseNumber()
 	if err := dec.Decode(&req); err != nil {
-		return err
+		return writeMCPError(out, nil, -32700, err.Error())
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		return writeMCPError(out, nil, -32700, "mcp input must contain exactly one JSON-RPC request")
 	}
 	var result any
 	switch req.Method {
