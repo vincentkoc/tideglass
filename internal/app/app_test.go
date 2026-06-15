@@ -679,7 +679,7 @@ func TestResolveIntentActionGateAuthorizesWithPolicyConstraint(t *testing.T) {
 	}
 	constraintID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
 		Kind:       "policy.action.constraints",
-		Value:      "Bounded action is allowed only for this audited request.",
+		Value:      `{"allow":false,"intent_kind":"work.project.start","task_mode":"act_gate","autonomy":"bounded_act","goal":"start the project","audience":"agent"}`,
 		Confidence: 0.99,
 		SourceMode: "explicit",
 	})
@@ -691,7 +691,30 @@ func TestResolveIntentActionGateAuthorizesWithPolicyConstraint(t *testing.T) {
 	}
 	response, err := tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, Request: IntentRequestEnvelope{
 		URI:        "tideglass://v1/intent/work.project.start/current",
-		Task:       IntentTask{Mode: "act_gate", Autonomy: "bounded_act"},
+		Task:       IntentTask{Mode: "act_gate", Autonomy: "bounded_act", Goal: "start the project"},
+		Disclosure: IntentDisclosure{AllowSensitive: true},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Decision.MayAct || !response.Decision.NeedsUserAnswer || !hasBlockingQuestionSlot(response.Unresolved, "policy.action.constraints") {
+		t.Fatalf("denying action constraint authorized bounded action: %#v", response)
+	}
+	constraintID, err = tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "policy.action.constraints",
+		Value:      `{"allow":true,"intent_kind":"work.project.start","task_mode":"act_gate","autonomy":"bounded_act","goal":"start the project","audience":"agent"}`,
+		Confidence: 0.99,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: constraintID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	response, err = tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, Request: IntentRequestEnvelope{
+		URI:        "tideglass://v1/intent/work.project.start/current",
+		Task:       IntentTask{Mode: "act_gate", Autonomy: "bounded_act", Goal: "start the project"},
 		Disclosure: IntentDisclosure{AllowSensitive: true},
 	}})
 	if err != nil {
@@ -1310,6 +1333,16 @@ func TestResolveIntentV2ActionAndDisclosureContracts(t *testing.T) {
 	}
 	if len(response.Claims) != 0 || len(response.Policy.SafeToShare) != 0 {
 		t.Fatalf("disclosure URI dropped external share target: claims=%#v policy=%#v", response.Claims, response.Policy)
+	}
+	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
+		URI:      "tideglass://disclosure/work.project.start/venue",
+		Audience: IntentAudience{Type: "service", ID: "local"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Claims) != 0 || len(response.Policy.SafeToShare) != 0 || response.Policy.Audience != "venue" {
+		t.Fatalf("disclosure URI was not authoritative: claims=%#v policy=%#v", response.Claims, response.Policy)
 	}
 	requestContext := map[string]any{"trace": "original"}
 	if _, err := tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{

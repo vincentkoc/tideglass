@@ -693,7 +693,7 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 	if err != nil {
 		return IntentResponseEnvelope{}, err
 	}
-	if request.Audience.Label() == "agent" && audienceFromURI != "" {
+	if audienceFromURI != "" {
 		request.Audience.Type = audienceFromURI
 		request.Audience.ID = ""
 	}
@@ -795,6 +795,12 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 	if !foundIntent {
 		policy.NeedsUserAnswer = true
 		policy.MayAct = false
+	}
+	if request.Task.Mode == "act_gate" && request.Task.Autonomy == "suggest_then_confirm" && !policy.NeedsUserAnswer {
+		unresolved = append(unresolved, questionForSlot("policy.action.confirmation", "critical", true))
+		policy.NeedsUserAnswer = true
+		policy.MayAct = false
+		policy.CapabilityRequired = append(policy.CapabilityRequired, "user_confirmation")
 	}
 	status := "ready"
 	if !foundIntent || policy.NeedsUserAnswer {
@@ -3003,6 +3009,8 @@ func defaultSlotQuestion(slot string) string {
 		return "Any dietary restrictions?"
 	case "preference.budget.restaurant", "preference.food.budget":
 		return "What budget range is comfortable?"
+	case "policy.action.confirmation":
+		return "Confirm this suggested action before Tideglass treats it as approved."
 	default:
 		return "What should Tideglass know for " + slot + "?"
 	}
@@ -3190,7 +3198,63 @@ func hasActionGateConstraint(intentKind string, claims []ClaimOut, request Inten
 		if claim.Status != "accepted" || claimStale(claim, maxAge) || belowConfidenceFloor(claim, request) {
 			continue
 		}
-		if actionConstraintClaimKind(claim.Kind) {
+		if actionConstraintAuthorizes(intentKind, claim, request) {
+			return true
+		}
+	}
+	return false
+}
+
+type actionConstraintValue struct {
+	Allow      bool   `json:"allow"`
+	IntentKind string `json:"intent_kind"`
+	TaskMode   string `json:"task_mode"`
+	Autonomy   string `json:"autonomy"`
+	Goal       string `json:"goal"`
+	Audience   string `json:"audience"`
+	Deadline   string `json:"deadline,omitempty"`
+}
+
+func actionConstraintAuthorizes(intentKind string, claim ClaimOut, request IntentRequestEnvelope) bool {
+	if !actionConstraintClaimKind(claim.Kind) {
+		return false
+	}
+	var constraint actionConstraintValue
+	dec := json.NewDecoder(strings.NewReader(claim.Value))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&constraint); err != nil {
+		return false
+	}
+	if !constraint.Allow {
+		return false
+	}
+	if normalizeKind(constraint.IntentKind, "") != intentKind || strings.TrimSpace(constraint.IntentKind) == "" {
+		return false
+	}
+	if !sameRequiredConstraintValue(constraint.TaskMode, request.Task.Mode) {
+		return false
+	}
+	if !sameRequiredConstraintValue(constraint.Autonomy, request.Task.Autonomy) {
+		return false
+	}
+	if !sameRequiredConstraintValue(constraint.Goal, request.Task.Goal) {
+		return false
+	}
+	if !sameRequiredConstraintValue(constraint.Audience, request.Audience.Label()) {
+		return false
+	}
+	return strings.TrimSpace(constraint.Deadline) == strings.TrimSpace(request.Task.Deadline)
+}
+
+func sameRequiredConstraintValue(left, right string) bool {
+	left = strings.TrimSpace(left)
+	right = strings.TrimSpace(right)
+	return left != "" && right != "" && strings.EqualFold(left, right)
+}
+
+func stringSliceContains(rows []string, value string) bool {
+	for _, row := range rows {
+		if row == value {
 			return true
 		}
 	}
@@ -3492,6 +3556,9 @@ func decisionReason(foundIntent bool, policy IntentPolicyEnvelope, mode, autonom
 	case !foundIntent:
 		return "intent_missing"
 	case policy.NeedsUserAnswer:
+		if mode == "act_gate" && autonomy == "suggest_then_confirm" && stringSliceContains(policy.CapabilityRequired, "user_confirmation") {
+			return "confirmation_required"
+		}
 		return "critical_slots_missing"
 	case !policy.MayAct:
 		if mode == "act_gate" && autonomy == "bounded_act" && !allowAction {
