@@ -604,6 +604,25 @@ func TestResolveIntentActionGateProcessesScopedCriticalClaims(t *testing.T) {
 	if !containsString(response.Policy.Redacted, "preference.food.allergy") || !hasBlockingQuestionSlot(response.Unresolved, "preference.food.allergy") {
 		t.Fatalf("scoped critical claim was not processed as a blocker: %#v", response)
 	}
+	if _, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "preference.food.allergy",
+		Value:      "Shellfish allergy.",
+		Confidence: 0.95,
+		SourceMode: "explicit",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	response, err = tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, Request: IntentRequestEnvelope{
+		URI:        "tideglass://v1/intent/social.dinner/current",
+		Task:       IntentTask{Mode: "act_gate", Autonomy: "bounded_act"},
+		Disclosure: IntentDisclosure{AllowSensitive: true},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !response.Decision.MayAct || response.Decision.NeedsUserAnswer {
+		t.Fatalf("duplicate unreviewed critical claim blocked accepted identical constraint: %#v", response)
+	}
 }
 
 func TestResolveIntentActionGateFailsClosedWithoutConstraints(t *testing.T) {
@@ -1089,6 +1108,16 @@ func TestResolveIntentV2ActionAndDisclosureContracts(t *testing.T) {
 	}
 	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
 		URI:      "tideglass://v1/intent/work.project.start/current",
+		Audience: IntentAudience{Type: "agent", ShareWith: []string{"venue"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Claims) != 0 || len(response.Policy.SafeToShare) != 0 {
+		t.Fatalf("share_with external target leaked unrelated claims: claims=%#v policy=%#v", response.Claims, response.Policy)
+	}
+	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
+		URI:      "tideglass://v1/intent/work.project.start/current",
 		Audience: IntentAudience{Type: "service", ID: "venue"},
 		Contract: IntentContract{OptionalSlots: []string{"preference.agent.communication"}},
 	}})
@@ -1346,6 +1375,16 @@ func TestServiceHandlerResolvesIntentResource(t *testing.T) {
 	}
 	if !strings.Contains(requestJSON, "9007199254740993") || strings.Contains(requestJSON, "9007199254740992") {
 		t.Fatalf("large HTTP context number was not preserved: %s", requestJSON)
+	}
+	unknownPolicyField := strings.NewReader(`{"uri":"tideglass://disclosure/social.dinner/venue","disclosure":{"modee":"existence"}}`)
+	unknownPolicyResponse, err := authedHTTP(t, http.MethodPost, server.URL+"/resolve", "application/json", unknownPolicyField, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unknownPolicyResponse.Body.Close()
+	if unknownPolicyResponse.StatusCode != http.StatusBadRequest {
+		data, _ := io.ReadAll(unknownPolicyResponse.Body)
+		t.Fatalf("unknown policy field status = %d body=%s", unknownPolicyResponse.StatusCode, data)
 	}
 	bad, err := authedHTTP(t, http.MethodGet, server.URL+"/resource?uri=tideglass://intent/", "", nil, token)
 	defer bad.Body.Close()

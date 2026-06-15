@@ -412,6 +412,7 @@ func runResolve(ctx context.Context, args []string) error {
 		}
 		dec := json.NewDecoder(bytes.NewReader(data))
 		dec.UseNumber()
+		dec.DisallowUnknownFields()
 		if err := dec.Decode(&request); err != nil {
 			return err
 		}

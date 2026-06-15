@@ -1168,6 +1168,7 @@ func NewServiceHandlerWithToken(t *Tideglass, token string) http.Handler {
 		var request IntentRequestEnvelope
 		dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
 		dec.UseNumber()
+		dec.DisallowUnknownFields()
 		if err := dec.Decode(&request); err != nil {
 			writeHTTPError(w, http.StatusBadRequest, err.Error())
 			return
@@ -1280,6 +1281,7 @@ func writeMCPError(out io.Writer, id any, code int, message string) error {
 func decodeJSONUseNumber(data []byte, value any) error {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
+	dec.DisallowUnknownFields()
 	return dec.Decode(value)
 }
 
@@ -1764,7 +1766,7 @@ func (t *Tideglass) loadActionGateClaims(ctx context.Context, intentID, intentKi
 	rows, err := t.db.QueryContext(ctx, `
 select c.id, c.kind,
        coalesce(json_extract(e.patch_json, '$.value'), c.value) as value,
-       c.confidence, c.status, c.source_mode,
+       c.normalized_value, c.confidence, c.status, c.source_mode,
        c.updated_at, coalesce(e.created_at, ''), c.revision
 from claims c
 left join edits e on e.id = (
@@ -1781,11 +1783,14 @@ order by c.created_at desc`, intentID)
 	var claims []ClaimOut
 	bestAcceptedSingleton := map[string]int64{}
 	actionGateClaimRevisions := map[string]int64{}
+	bestAcceptedDuplicate := map[string]int64{}
+	actionGateClaimKeys := map[string]string{}
 	for rows.Next() {
 		var claim ClaimOut
+		var normalized string
 		var valueEditCreatedAt string
 		var revision int64
-		if err := rows.Scan(&claim.ID, &claim.Kind, &claim.Value, &claim.Confidence, &claim.Status, &claim.SourceMode, &claim.UpdatedAt, &valueEditCreatedAt, &revision); err != nil {
+		if err := rows.Scan(&claim.ID, &claim.Kind, &claim.Value, &normalized, &claim.Confidence, &claim.Status, &claim.SourceMode, &claim.UpdatedAt, &valueEditCreatedAt, &revision); err != nil {
 			return nil, err
 		}
 		if !blocking[claim.Kind] && !strings.HasPrefix(claim.Kind, "boundary.") {
@@ -1794,11 +1799,19 @@ order by c.created_at desc`, intentID)
 		if timestampAfter(valueEditCreatedAt, claim.UpdatedAt) {
 			claim.UpdatedAt = valueEditCreatedAt
 		}
+		if normalized == "" {
+			normalized = normalizeText(claim.Value)
+		}
+		duplicateKey := claim.Kind + "\x00" + normalized
 		if singletonClaimKind(claim.Kind) && claim.Status == "accepted" && revision > bestAcceptedSingleton[claim.Kind] {
 			bestAcceptedSingleton[claim.Kind] = revision
 		}
+		if claim.Status == "accepted" && revision > bestAcceptedDuplicate[duplicateKey] {
+			bestAcceptedDuplicate[duplicateKey] = revision
+		}
 		claims = append(claims, claim)
 		actionGateClaimRevisions[claim.ID] = revision
+		actionGateClaimKeys[claim.ID] = duplicateKey
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -1806,6 +1819,10 @@ order by c.created_at desc`, intentID)
 	out := make([]ClaimOut, 0, len(claims))
 	for _, claim := range claims {
 		revision := actionGateClaimRevisions[claim.ID]
+		duplicateAcceptedRevision := bestAcceptedDuplicate[actionGateClaimKeys[claim.ID]]
+		if duplicateAcceptedRevision > 0 && (claim.Status != "accepted" || revision < duplicateAcceptedRevision) {
+			continue
+		}
 		if singletonClaimKind(claim.Kind) && bestAcceptedSingleton[claim.Kind] > 0 && revision < bestAcceptedSingleton[claim.Kind] {
 			continue
 		}
@@ -3274,8 +3291,22 @@ func claimRelevantToRequest(kind string, request IntentRequestEnvelope) bool {
 	if len(request.Contract.RequiredSlots) > 0 || len(request.Contract.OptionalSlots) > 0 {
 		return false
 	}
+	if !audienceShareTargetsAreLocal(request) {
+		return false
+	}
 	audience := request.Audience.Label()
 	return audience == "agent" || audience == "local" || audience == request.Actor.ID
+}
+
+func audienceShareTargetsAreLocal(request IntentRequestEnvelope) bool {
+	for _, target := range request.Audience.ShareWith {
+		target = strings.TrimSpace(target)
+		if target == "" || target == "agent" || target == "local" || target == request.Actor.ID {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func claimRequiredForActionGate(intentKind, kind string, request IntentRequestEnvelope) bool {
