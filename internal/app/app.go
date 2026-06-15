@@ -906,19 +906,26 @@ func (t *Tideglass) ReviewClaim(ctx context.Context, opts ReviewOptions) (Review
 	if err := t.db.QueryRowContext(ctx, `select status from claims where id = ?`, claimID).Scan(&currentStatus); err != nil {
 		return ReviewResult{}, err
 	}
-	if currentStatus == status {
-		return ReviewResult{ClaimID: claimID, Action: action, Status: status}, nil
-	}
+	sameStatus := currentStatus == status
 	tx, err := t.db.BeginTx(ctx, nil)
 	if err != nil {
 		return ReviewResult{}, err
 	}
-	revision, err := nextRevision(ctx, tx)
-	if err != nil {
-		_ = tx.Rollback()
-		return ReviewResult{}, err
+	revision := int64(0)
+	if !sameStatus {
+		revision, err = nextRevision(ctx, tx)
+		if err != nil {
+			_ = tx.Rollback()
+			return ReviewResult{}, err
+		}
 	}
-	res, err := tx.ExecContext(ctx, `update claims set status = ?, updated_at = ?, revision = ? where id = ?`, status, now(), revision, claimID)
+	updateSQL := `update claims set status = ?, updated_at = ? where id = ?`
+	updateArgs := []any{status, now(), claimID}
+	if !sameStatus {
+		updateSQL = `update claims set status = ?, updated_at = ?, revision = ? where id = ?`
+		updateArgs = []any{status, now(), revision, claimID}
+	}
+	res, err := tx.ExecContext(ctx, updateSQL, updateArgs...)
 	if err != nil {
 		_ = tx.Rollback()
 		return ReviewResult{}, err
@@ -3337,6 +3344,10 @@ func applyIntentPolicy(intentKind string, claims []ClaimOut, unresolved []Intent
 		policy.MayAct = false
 	}
 	if !allowAction || request.Task.Mode != "act_gate" || request.Task.Autonomy == "context_only" || request.Task.Autonomy == "suggest_only" || request.Task.Autonomy == "suggest_then_confirm" || request.Task.Autonomy == "deny" {
+		policy.MayAct = false
+	}
+	if request.Task.Mode == "act_gate" && request.Task.Autonomy == "bounded_act" {
+		policy.NeedsUserAnswer = true
 		policy.MayAct = false
 	}
 	return out, policy

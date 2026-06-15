@@ -620,8 +620,8 @@ func TestResolveIntentActionGateProcessesScopedCriticalClaims(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !response.Decision.MayAct || response.Decision.NeedsUserAnswer {
-		t.Fatalf("duplicate unreviewed critical claim blocked accepted identical constraint: %#v", response)
+	if response.Decision.MayAct || !response.Decision.NeedsUserAnswer || len(response.Claims) != 1 {
+		t.Fatalf("bounded action was not held for confirmation with accepted identical constraint: %#v", response)
 	}
 }
 
@@ -917,7 +917,7 @@ func TestResolveIntentActionGateIgnoresSupersededSingletonBoundaries(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if response.Decision.MayAct == false || response.Decision.NeedsUserAnswer || hasBlockingQuestionSlot(response.Unresolved, "boundary.project.no_go") {
+	if response.Decision.MayAct || !response.Decision.NeedsUserAnswer || hasBlockingQuestionSlot(response.Unresolved, "boundary.project.no_go") {
 		t.Fatalf("superseded singleton boundary blocked action: %#v", response)
 	}
 	if _, err := tg.EditClaim(ctx, EditOptions{ClaimID: oldBoundaryID, Value: "Fresh pending boundary.", Reason: "test"}); err != nil {
@@ -1057,7 +1057,7 @@ func TestResolveIntentUnreviewedAndStaleClaimsDoNotSatisfyCriticalSlots(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if response.Policy.NeedsUserAnswer || !response.Policy.MayAct || len(response.Claims) != 1 || response.Claims[0].Value != "No shellfish or peanuts." {
+	if !response.Policy.NeedsUserAnswer || response.Policy.MayAct || len(response.Claims) != 1 || response.Claims[0].Value != "No shellfish or peanuts." {
 		t.Fatalf("reviewed fresh edit was treated as stale: response=%#v", response)
 	}
 	staleOnlyID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
