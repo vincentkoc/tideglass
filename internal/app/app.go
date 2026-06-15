@@ -787,7 +787,7 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 	if request.Task.Mode == "act_gate" && len(claims) == 0 && len(policyFailedClaims) > 0 {
 		unresolved = append(unresolved, questionForSlot("policy.claim.review_or_freshness", "critical", true))
 	}
-	if hasCriticalUnresolved(redactedBlocking) || hasRedactedCriticalClaim(kind, policy.Redacted) {
+	if hasCriticalUnresolved(redactedBlocking) || hasRedactedCriticalClaim(kind, policy.Redacted, request.Task.Mode) {
 		policy.NeedsUserAnswer = true
 		policy.MayAct = false
 	}
@@ -1455,6 +1455,7 @@ func isRequestError(err error) bool {
 		strings.Contains(message, "unsupported proof.hash") ||
 		strings.Contains(message, "unsupported proof.commitments") ||
 		strings.Contains(message, "proof.zk_predicates are not supported") ||
+		strings.Contains(message, "purpose must match task.goal") ||
 		strings.Contains(message, "invalid freshness.max_age")
 }
 
@@ -3156,6 +3157,7 @@ func normalizeIntentRequest(request IntentRequestEnvelope) IntentRequestEnvelope
 		request.SchemaVersion = "tideglass.intent_request.v2"
 	}
 	request.URI = strings.TrimSpace(request.URI)
+	request.Purpose = strings.TrimSpace(request.Purpose)
 	request.Actor.Type = strings.TrimSpace(request.Actor.Type)
 	if request.Actor.Type == "" {
 		request.Actor.Type = "agent"
@@ -3176,8 +3178,9 @@ func normalizeIntentRequest(request IntentRequestEnvelope) IntentRequestEnvelope
 	if request.Task.Autonomy == "" {
 		request.Task.Autonomy = "suggest_only"
 	}
-	if request.Task.Goal == "" && strings.TrimSpace(request.Purpose) != "" {
-		request.Task.Goal = strings.TrimSpace(request.Purpose)
+	request.Task.Goal = strings.TrimSpace(request.Task.Goal)
+	if request.Task.Goal == "" && request.Purpose != "" {
+		request.Task.Goal = request.Purpose
 	}
 	request.Audience.Type = strings.TrimSpace(request.Audience.Type)
 	request.Audience.ID = strings.TrimSpace(request.Audience.ID)
@@ -3238,6 +3241,9 @@ func validateIntentRequest(request IntentRequestEnvelope) error {
 	}
 	if len(request.Proof.ZKPredicates) > 0 {
 		return errors.New("proof.zk_predicates are not supported")
+	}
+	if request.Purpose != "" && request.Task.Goal != "" && request.Purpose != request.Task.Goal {
+		return errors.New("purpose must match task.goal")
 	}
 	if request.Proof.Hash != "response" {
 		return fmt.Errorf("unsupported proof.hash %q", request.Proof.Hash)
@@ -3522,6 +3528,7 @@ func actionScopeHash(request IntentRequestEnvelope) string {
 			"autonomy": request.Task.Autonomy,
 			"deadline": request.Task.Deadline,
 		},
+		"purpose": request.Purpose,
 		"audience": map[string]any{
 			"type":       request.Audience.Type,
 			"id":         request.Audience.ID,
@@ -3953,12 +3960,15 @@ func hasCriticalUnresolved(rows []IntentQuestion) bool {
 	return false
 }
 
-func hasRedactedCriticalClaim(intentKind string, redacted []string) bool {
+func hasRedactedCriticalClaim(intentKind string, redacted []string, taskMode string) bool {
 	if len(redacted) == 0 {
 		return false
 	}
 	critical := criticalClaimKinds(intentKind)
 	for _, kind := range redacted {
+		if actionConstraintClaimKind(kind) && taskMode != "act_gate" {
+			continue
+		}
 		if critical[kind] || actionConstraintClaimKind(kind) {
 			return true
 		}
