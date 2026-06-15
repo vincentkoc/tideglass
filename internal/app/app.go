@@ -672,6 +672,9 @@ func (t *Tideglass) Profile(ctx context.Context, opts ProfileOptions) (ProfileRe
 }
 
 func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (IntentResponseEnvelope, error) {
+	if opts.NoPersist && opts.AllowAction {
+		return IntentResponseEnvelope{}, errors.New("action authorization requires persisted audit")
+	}
 	request := opts.Request
 	request.URI = strings.TrimSpace(request.URI)
 	kind, audienceFromURI, err := parseIntentURI(request.URI)
@@ -685,13 +688,17 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 	if err := validateIntentRequest(request); err != nil {
 		return IntentResponseEnvelope{}, err
 	}
-	requestID := request.RequestID
-	if requestID == "" {
-		requestID = id("req")
+	requestID := id("req")
+	if request.Context == nil {
+		request.Context = map[string]any{}
 	}
+	if strings.TrimSpace(request.RequestID) != "" {
+		request.Context["client_request_id"] = strings.TrimSpace(request.RequestID)
+	}
+	request.RequestID = requestID
 	if !opts.NoPersist {
 		var err error
-		requestID, err = t.persistIntentRequest(ctx, request)
+		requestID, err = t.persistIntentRequest(ctx, request, requestID)
 		if err != nil {
 			return IntentResponseEnvelope{}, err
 		}
@@ -728,8 +735,9 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 		unresolved = unresolvedIntentQuestions(kind, nil)
 		unresolved = addRequiredSlotQuestions(unresolved, nil, request.Contract.RequiredSlots)
 	}
+	commitments := claimCommitmentsForClaims(claims)
 	filteredClaims, policy := applyIntentPolicy(claims, unresolved, request, opts.AllowAction)
-	filteredClaims = addClaimCommitments(filteredClaims, request)
+	filteredClaims = addClaimCommitments(filteredClaims, request, commitments)
 	redactedBlocking := redactedBlockingQuestions(kind, policy.Redacted, request.Contract.RequiredSlots, unresolved)
 	if len(redactedBlocking) > 0 {
 		unresolved = append(unresolved, redactedBlocking...)
@@ -807,11 +815,20 @@ func (t *Tideglass) EditClaim(ctx context.Context, opts EditOptions) (EditResult
 	}
 	patch, _ := json.Marshal(map[string]string{"value": value})
 	editID := id("edt")
-	if _, err := t.db.ExecContext(ctx, `insert into edits(id,claim_id,operation,patch_json,reason,created_at) values(?,?,?,?,?,?)`,
-		editID, opts.ClaimID, "supersede", string(patch), opts.Reason, now()); err != nil {
+	tx, err := t.db.BeginTx(ctx, nil)
+	if err != nil {
 		return EditResult{}, err
 	}
-	if _, err := t.db.ExecContext(ctx, `update claims set status = 'active', updated_at = ? where id = ?`, now(), opts.ClaimID); err != nil {
+	if _, err := tx.ExecContext(ctx, `insert into edits(id,claim_id,operation,patch_json,reason,created_at) values(?,?,?,?,?,?)`,
+		editID, opts.ClaimID, "supersede", string(patch), opts.Reason, now()); err != nil {
+		_ = tx.Rollback()
+		return EditResult{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `update claims set status = 'active', updated_at = ? where id = ?`, now(), opts.ClaimID); err != nil {
+		_ = tx.Rollback()
+		return EditResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
 		return EditResult{}, err
 	}
 	return EditResult{EditID: editID, ClaimID: opts.ClaimID, Value: value}, nil
@@ -1239,7 +1256,10 @@ func isRequestError(err error) bool {
 	message := err.Error()
 	return strings.Contains(message, "intent request uri is required") ||
 		strings.Contains(message, "unsupported intent uri") ||
+		strings.Contains(message, "unsupported request schema_version") ||
 		strings.Contains(message, "unsupported disclosure mode") ||
+		strings.Contains(message, "unsupported task mode") ||
+		strings.Contains(message, "unsupported autonomy") ||
 		strings.Contains(message, "invalid freshness.max_age")
 }
 
@@ -1298,7 +1318,7 @@ func (t *Tideglass) findIntentForResolve(ctx context.Context, kind string) (Inte
 	return IntentOut{}, false, err
 }
 
-func (t *Tideglass) persistIntentRequest(ctx context.Context, request IntentRequestEnvelope) (string, error) {
+func (t *Tideglass) persistIntentRequest(ctx context.Context, request IntentRequestEnvelope, requestID string) (string, error) {
 	actorJSON, err := json.Marshal(request.Actor)
 	if err != nil {
 		return "", err
@@ -1319,7 +1339,6 @@ func (t *Tideglass) persistIntentRequest(ctx context.Context, request IntentRequ
 	if err != nil {
 		return "", err
 	}
-	requestID := id("req")
 	_, err = t.db.ExecContext(ctx, `
 insert into intent_requests(id,uri,actor_json,purpose,audience,freshness_json,disclosure_json,context_json,request_json,created_at)
 values(?,?,?,?,?,?,?,?,?,?)`,
@@ -2673,9 +2692,13 @@ func parseIntentURI(rawURI string) (string, string, error) {
 	}
 	rest := strings.TrimPrefix(uri, "tideglass://")
 	parts := strings.Split(rest, "/")
+	if len(parts) > 0 && parts[0] == "v1" {
+		if len(parts) > 1 && parts[1] == "v1" {
+			return "", "", fmt.Errorf("unsupported intent uri %q", rawURI)
+		}
+		parts = parts[1:]
+	}
 	switch {
-	case len(parts) >= 2 && parts[0] == "v1":
-		return parseIntentURI("tideglass://" + strings.Join(parts[1:], "/"))
 	case len(parts) == 2 && parts[0] == "intent" && strings.TrimSpace(parts[1]) != "":
 		return normalizeKind(parts[1], ""), "", nil
 	case len(parts) == 3 && parts[0] == "intent" && strings.TrimSpace(parts[1]) != "" && (parts[2] == "current" || parts[2] == "slots" || parts[2] == "unresolved"):
@@ -2813,19 +2836,36 @@ func applyIntentPolicy(claims []ClaimOut, unresolved []IntentQuestion, request I
 	return out, policy
 }
 
-func addClaimCommitments(claims []IntentClaimEnvelope, request IntentRequestEnvelope) []IntentClaimEnvelope {
+func addClaimCommitments(claims []IntentClaimEnvelope, request IntentRequestEnvelope, commitments map[string]string) []IntentClaimEnvelope {
 	if !allowCommitments(request.Disclosure) {
 		return claims
 	}
 	out := make([]IntentClaimEnvelope, len(claims))
 	for index, claim := range claims {
 		out[index] = claim
-		out[index].Commitment = claimCommitment(claim)
+		if claim.ID != "" {
+			out[index].Commitment = commitments[claim.ID]
+		}
+		if out[index].Commitment == "" {
+			out[index].Commitment = commitments[claim.Kind]
+		}
 	}
 	return out
 }
 
-func claimCommitment(claim IntentClaimEnvelope) string {
+func claimCommitmentsForClaims(claims []ClaimOut) map[string]string {
+	out := map[string]string{}
+	for _, claim := range claims {
+		commitment := claimCommitment(claim)
+		out[claim.ID] = commitment
+		if _, exists := out[claim.Kind]; !exists {
+			out[claim.Kind] = commitment
+		}
+	}
+	return out
+}
+
+func claimCommitment(claim ClaimOut) string {
 	data, _ := json.Marshal(map[string]string{
 		"kind":   claim.Kind,
 		"status": claim.Status,

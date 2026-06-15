@@ -537,6 +537,12 @@ func TestResolveIntentAppliesPolicyAndPersistsSnapshot(t *testing.T) {
 	if stored.SnapshotID != first.SnapshotID || stored.Commitments.SnapshotID != first.SnapshotID {
 		t.Fatalf("stored snapshot differs from returned envelope: stored=%#v returned=%#v", stored.Commitments, first.Commitments)
 	}
+	if _, err := tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, NoPersist: true, Request: IntentRequestEnvelope{
+		URI:  "tideglass://v1/intent/work.project.start/current",
+		Task: IntentTask{Mode: "act_gate", Autonomy: "bounded_act"},
+	}}); err == nil {
+		t.Fatal("expected action authorization without persistence to fail")
+	}
 }
 
 func TestResolveIntentSupportsDisclosureAndMissingIntent(t *testing.T) {
@@ -855,7 +861,7 @@ func TestResolveIntentCanonicalLinksAndExistenceDisclosure(t *testing.T) {
 	}}); err == nil {
 		t.Fatal("expected negative freshness to fail closed")
 	}
-	for _, uri := range []string{"tideglass://intent/", "tideglass://unresolved/", "tideglass://profile/me//current"} {
+	for _, uri := range []string{"tideglass://intent/", "tideglass://unresolved/", "tideglass://profile/me//current", "tideglass://v1/v1/intent/work.project.start"} {
 		if _, err := tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{URI: uri}}); err == nil {
 			t.Fatalf("expected empty kind URI to fail: %s", uri)
 		}
@@ -951,6 +957,16 @@ func TestServiceHandlerResolvesIntentResource(t *testing.T) {
 	if forbidden.StatusCode != http.StatusForbidden {
 		data, _ := io.ReadAll(forbidden.Body)
 		t.Fatalf("sensitive resolve status = %d body=%s", forbidden.StatusCode, data)
+	}
+	invalidTask := strings.NewReader(`{"uri":"tideglass://intent/work.project.start","task":{"mode":"ship_it"}}`)
+	invalidResponse, err := http.Post(server.URL+"/resolve", "application/json", invalidTask)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer invalidResponse.Body.Close()
+	if invalidResponse.StatusCode != http.StatusBadRequest {
+		data, _ := io.ReadAll(invalidResponse.Body)
+		t.Fatalf("invalid task status = %d body=%s", invalidResponse.StatusCode, data)
 	}
 	req, err := http.NewRequest(http.MethodGet, server.URL+"/healthz", nil)
 	if err != nil {
