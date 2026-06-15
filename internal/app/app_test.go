@@ -1417,6 +1417,16 @@ func TestResolveIntentV2ActionAndDisclosureContracts(t *testing.T) {
 	}
 	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
 		URI:      "tideglass://v1/intent/work.project.start/current",
+		Audience: IntentAudience{Type: "agent", ID: "external-service"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Claims) != 0 || len(response.Policy.SafeToShare) != 0 {
+		t.Fatalf("external agent audience id leaked unrelated claims: claims=%#v policy=%#v", response.Claims, response.Policy)
+	}
+	response, err = tg.ResolveIntent(ctx, ResolveOptions{Request: IntentRequestEnvelope{
+		URI:      "tideglass://v1/intent/work.project.start/current",
 		Audience: IntentAudience{Type: "agent", ShareWith: []string{"venue"}},
 	}})
 	if err != nil {

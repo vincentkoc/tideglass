@@ -3793,8 +3793,7 @@ func claimRelevantToRequest(kind string, request IntentRequestEnvelope) bool {
 	if !audienceShareTargetsAreLocal(request) {
 		return false
 	}
-	audienceType := strings.TrimSpace(request.Audience.Type)
-	return audienceType == "agent" || audienceType == "local"
+	return audienceIsLocal(request.Audience)
 }
 
 func audienceShareTargetsAreLocal(request IntentRequestEnvelope) bool {
@@ -3806,6 +3805,15 @@ func audienceShareTargetsAreLocal(request IntentRequestEnvelope) bool {
 		return false
 	}
 	return true
+}
+
+func audienceIsLocal(audience IntentAudience) bool {
+	audienceType := strings.TrimSpace(audience.Type)
+	if audienceType != "agent" && audienceType != "local" {
+		return false
+	}
+	audienceID := strings.TrimSpace(audience.ID)
+	return audienceID == "" || audienceID == "agent" || audienceID == "local"
 }
 
 func claimRequiredForActionGate(intentKind, kind string, request IntentRequestEnvelope) bool {
