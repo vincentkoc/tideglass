@@ -909,6 +909,19 @@ func TestResolveIntentRedactsUnknownPreferenceKindsByDefault(t *testing.T) {
 	}
 }
 
+func TestPolicyFailedBlockingQuestionsHideSensitiveKinds(t *testing.T) {
+	questions := policyFailedBlockingQuestions("work.project.start", []ClaimOut{{
+		Kind:   "boundary.health.hiv_status",
+		Status: "accepted",
+	}}, IntentRequestEnvelope{}, nil)
+	if hasBlockingQuestionSlot(questions, "boundary.health.hiv_status") {
+		t.Fatalf("sensitive boundary kind leaked through policy blockers: %#v", questions)
+	}
+	if !hasBlockingQuestionSlot(questions, "policy.sensitive_disclosure") {
+		t.Fatalf("generic sensitive disclosure blocker missing: %#v", questions)
+	}
+}
+
 func TestResolveIntentActionGateUsesLosslessDuplicateKeys(t *testing.T) {
 	ctx := context.Background()
 	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
@@ -2883,6 +2896,14 @@ func TestHandleMCPOnceReadsIntentResource(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), `"id": null`) || !strings.Contains(output.String(), `"code": -32700`) || !strings.Contains(output.String(), `mcp input too large`) {
 		t.Fatalf("expected MCP oversized input parse error envelope: %s", output.String())
+	}
+	input = strings.NewReader(`{"jsonrpc":"1.0","id":"bad-version","method":"resources/read","params":{"uri":"tideglass://intent/work.project.start"}}`)
+	output.Reset()
+	if err := HandleMCPOnce(ctx, tg, input, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), `"id": "bad-version"`) || !strings.Contains(output.String(), `"code": -32600`) {
+		t.Fatalf("expected MCP invalid version error envelope: %s", output.String())
 	}
 }
 

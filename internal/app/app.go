@@ -794,7 +794,7 @@ func (t *Tideglass) ResolveIntent(ctx context.Context, opts ResolveOptions) (Int
 	}
 	var policyFailedBlocking []IntentQuestion
 	if request.Task.Mode == "act_gate" {
-		policyFailedBlocking = policyFailedBlockingQuestions(kind, policyFailedClaims, request.Contract.RequiredSlots, unresolved)
+		policyFailedBlocking = policyFailedBlockingQuestions(kind, policyFailedClaims, request, unresolved)
 		if len(policyFailedBlocking) > 0 {
 			unresolved = append(unresolved, policyFailedBlocking...)
 		}
@@ -1343,6 +1343,9 @@ func HandleMCPOnce(ctx context.Context, t *Tideglass, in io.Reader, out io.Write
 	var trailing any
 	if err := dec.Decode(&trailing); err != io.EOF {
 		return writeMCPError(out, nil, -32700, "mcp input must contain exactly one JSON-RPC request")
+	}
+	if req.JSONRPC != "2.0" {
+		return writeMCPError(out, req.ID, -32600, "invalid JSON-RPC version")
 	}
 	var result any
 	switch req.Method {
@@ -3268,12 +3271,12 @@ func redactedBlockingQuestions(intentKind string, redacted []string, requiredSlo
 	return out
 }
 
-func policyFailedBlockingQuestions(intentKind string, claims []ClaimOut, requiredSlots []string, existing []IntentQuestion) []IntentQuestion {
+func policyFailedBlockingQuestions(intentKind string, claims []ClaimOut, request IntentRequestEnvelope, existing []IntentQuestion) []IntentQuestion {
 	if len(claims) == 0 {
 		return nil
 	}
 	blocking := criticalClaimKinds(intentKind)
-	for _, slot := range requiredSlots {
+	for _, slot := range request.Contract.RequiredSlots {
 		if strings.TrimSpace(slot) != "" {
 			blocking[strings.TrimSpace(slot)] = true
 		}
@@ -3284,9 +3287,13 @@ func policyFailedBlockingQuestions(intentKind string, claims []ClaimOut, require
 	}
 	var out []IntentQuestion
 	for _, claim := range claims {
-		if (blocking[claim.Kind] || strings.HasPrefix(claim.Kind, "boundary.") || actionConstraintClaimKind(claim.Kind)) && !haveBlockingQuestions[claim.Kind] {
-			out = append(out, questionForSlot(claim.Kind, "critical", true))
-			haveBlockingQuestions[claim.Kind] = true
+		slot := claim.Kind
+		if !actionConstraintClaimKind(claim.Kind) && shouldRedactClaim(request.Disclosure, claimSensitivity(claim.Kind)) {
+			slot = "policy.sensitive_disclosure"
+		}
+		if (blocking[claim.Kind] || strings.HasPrefix(claim.Kind, "boundary.") || actionConstraintClaimKind(claim.Kind)) && !haveBlockingQuestions[slot] {
+			out = append(out, questionForSlot(slot, "critical", true))
+			haveBlockingQuestions[slot] = true
 		}
 	}
 	return out
@@ -3901,6 +3908,11 @@ func applyIntentPolicy(intentKind string, claims []ClaimOut, unresolved []Intent
 	shareable := map[string]bool{}
 	existenceSeen := map[string]bool{}
 	scopeByRelevance := request.Disclosure.Mode == "minimal" || !audienceIsLocal(request.Audience) || !audienceShareTargetsAreLocal(request)
+	addCapability := func(capability string) {
+		if !stringSliceContains(policy.CapabilityRequired, capability) {
+			policy.CapabilityRequired = append(policy.CapabilityRequired, capability)
+		}
+	}
 	for _, claim := range claims {
 		if request.Contract.ConfidenceFloor > 0 && claim.Confidence < request.Contract.ConfidenceFloor {
 			continue
@@ -3910,7 +3922,7 @@ func applyIntentPolicy(intentKind string, claims []ClaimOut, unresolved []Intent
 			if omittedClaimBlocksReadiness(intentKind, claim.Kind, request) {
 				if shouldRedactClaim(request.Disclosure, sensitivity) {
 					policy.NeedsUserAnswer = true
-					policy.CapabilityRequired = append(policy.CapabilityRequired, "sensitive_disclosure")
+					addCapability("sensitive_disclosure")
 				} else {
 					redacted[claim.Kind] = true
 				}
@@ -3934,7 +3946,7 @@ func applyIntentPolicy(intentKind string, claims []ClaimOut, unresolved []Intent
 		}
 		if shouldRedactClaim(request.Disclosure, sensitivity) {
 			policy.NeedsUserAnswer = true
-			policy.CapabilityRequired = append(policy.CapabilityRequired, "sensitive_disclosure")
+			addCapability("sensitive_disclosure")
 			continue
 		}
 		if request.Disclosure.Mode == "existence" {
