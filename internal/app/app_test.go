@@ -1191,6 +1191,75 @@ func TestActionConstraintRejectsMalformedOrExpiredValues(t *testing.T) {
 	}
 }
 
+func TestResolveIntentActionGateBlocksTiedDenyConstraint(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	intent, err := tg.ensureIntent(ctx, "work.project.start", "Project start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano)
+	request := normalizeIntentRequest(IntentRequestEnvelope{
+		URI:        "tideglass://v1/intent/work.project.start/current",
+		Task:       IntentTask{Mode: "act_gate", Autonomy: "bounded_act", Goal: "start project", Deadline: deadline},
+		Disclosure: IntentDisclosure{AllowSensitive: true},
+	})
+	constraintValue := func(allow bool) string {
+		t.Helper()
+		data, err := json.Marshal(map[string]any{
+			"allow":         allow,
+			"intent_kind":   "work.project.start",
+			"task_mode":     "act_gate",
+			"autonomy":      "bounded_act",
+			"goal":          "start project",
+			"audience_type": "agent",
+			"deadline":      deadline,
+			"scope_hash":    actionScopeHash(request),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+	firstID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{Kind: "policy.action.constraints", Value: constraintValue(true), Confidence: 0.99, SourceMode: "explicit"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: firstID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	secondID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{Kind: "policy.action.constraints", Value: constraintValue(false), Confidence: 0.99, SourceMode: "explicit"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: secondID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	winningID, losingID := firstID, secondID
+	if secondID > firstID {
+		winningID, losingID = secondID, firstID
+	}
+	allowValue := constraintValue(true)
+	denyValue := constraintValue(false)
+	if _, err := tg.db.ExecContext(ctx, `update claims set value = ?, normalized_value = ?, revision = 0, updated_at = ? where id = ?`, allowValue, normalizeText(allowValue), "2024-01-01T00:00:00Z", winningID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.db.ExecContext(ctx, `update claims set value = ?, normalized_value = ?, revision = 0, updated_at = ? where id = ?`, denyValue, normalizeText(denyValue), "2024-01-01T00:00:00Z", losingID); err != nil {
+		t.Fatal(err)
+	}
+	response, err := tg.ResolveIntent(ctx, ResolveOptions{AllowAction: true, Request: request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Decision.MayAct || !response.Decision.NeedsUserAnswer || !hasBlockingQuestionSlot(response.Unresolved, "policy.action.constraints") {
+		t.Fatalf("tied deny constraint did not block action: %#v", response)
+	}
+}
+
 func TestResolveIntentMigratesLegacyEditedAcceptedClaims(t *testing.T) {
 	ctx := context.Background()
 	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))

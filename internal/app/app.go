@@ -3508,6 +3508,18 @@ func actionGatePolicyFailingClaims(intentKind string, claims []ClaimOut, request
 		if latestClaim.Status != "accepted" || claimStale(latestClaim, maxAge) || belowConfidenceFloor(latestClaim, request) || !latestConstraint.Allow {
 			out = append(out, latestClaim)
 		}
+		for _, claim := range claims {
+			if claim.ID == latestClaim.ID || claim.Revision != latestClaim.Revision || claim.UpdatedAt != latestClaim.UpdatedAt {
+				continue
+			}
+			constraint, ok := matchingActionConstraint(intentKind, claim, request)
+			if !ok {
+				continue
+			}
+			if claim.Status != "accepted" || claimStale(claim, maxAge) || belowConfidenceFloor(claim, request) || !constraint.Allow {
+				out = append(out, claim)
+			}
+		}
 	}
 	for _, claim := range claims {
 		if actionConstraintClaimKind(claim.Kind) {
