@@ -547,7 +547,7 @@ func (t *Tideglass) Ingest(ctx context.Context, opts IngestOptions) (IngestResul
 			if err != nil {
 				return IngestResult{}, err
 			}
-			if err := linkClaimEvidence(ctx, t.db, claimID, evidenceID, "supporting"); err != nil {
+			if err := t.linkClaimEvidence(ctx, claimID, evidenceID, "supporting"); err != nil {
 				return IngestResult{}, err
 			}
 			importedClaims++
@@ -563,7 +563,7 @@ func (t *Tideglass) Ingest(ctx context.Context, opts IngestOptions) (IngestResul
 			return IngestResult{}, err
 		}
 		if claim.EvidenceID != "" {
-			if err := linkClaimEvidence(ctx, t.db, claimID, claim.EvidenceID, "supporting"); err != nil {
+			if err := t.linkClaimEvidence(ctx, claimID, claim.EvidenceID, "supporting"); err != nil {
 				return IngestResult{}, err
 			}
 		}
@@ -622,7 +622,7 @@ func (t *Tideglass) Ask(ctx context.Context, opts AskOptions) (AskResult, error)
 			return AskResult{}, err
 		}
 		if claim.EvidenceID != "" {
-			if err := linkClaimEvidence(ctx, t.db, claimID, claim.EvidenceID, "supporting"); err != nil {
+			if err := t.linkClaimEvidence(ctx, claimID, claim.EvidenceID, "supporting"); err != nil {
 				return AskResult{}, err
 			}
 		}
@@ -1825,20 +1825,29 @@ func nextRevision(ctx context.Context, execer revisionExecer) (int64, error) {
 	return result.LastInsertId()
 }
 
-func linkClaimEvidence(ctx context.Context, execer revisionExecer, claimID, evidenceID, role string) error {
-	result, err := execer.ExecContext(ctx, `insert or ignore into claim_evidence(claim_id,evidence_id,role) values(?,?,?)`, claimID, evidenceID, role)
+func (t *Tideglass) linkClaimEvidence(ctx context.Context, claimID, evidenceID, role string) error {
+	tx, err := t.db.BeginTx(ctx, nil)
 	if err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `insert or ignore into claim_evidence(claim_id,evidence_id,role) values(?,?,?)`, claimID, evidenceID, role)
+	if err != nil {
+		_ = tx.Rollback()
 		return err
 	}
 	affected, err := result.RowsAffected()
 	if err != nil {
+		_ = tx.Rollback()
 		return err
 	}
 	if affected == 0 {
-		return nil
+		return tx.Commit()
 	}
-	_, err = nextRevision(ctx, execer)
-	return err
+	if _, err := nextRevision(ctx, tx); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
 }
 
 func currentRevision(ctx context.Context, queryer interface {
@@ -2168,10 +2177,14 @@ order by c.created_at desc`, intentID)
 	}
 	out := make([]ClaimOut, 0, len(deduped))
 	for _, claim := range deduped {
+		acceptedRevision := bestAcceptedSingleton[claim.Kind]
+		if claim.Status == "accepted" && acceptedRevision.ok && claim.ID != acceptedRevision.id && claim.Revision == acceptedRevision.revision && claim.UpdatedAt == acceptedRevision.updatedAt {
+			out = append(out, claim.ClaimOut)
+			continue
+		}
 		if claim.Status != "active" {
 			continue
 		}
-		acceptedRevision := bestAcceptedSingleton[claim.Kind]
 		if acceptedRevision.ok {
 			if claim.Revision < acceptedRevision.revision || (claim.Revision == acceptedRevision.revision && timestampAfter(acceptedRevision.updatedAt, claim.UpdatedAt)) {
 				continue

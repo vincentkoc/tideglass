@@ -410,7 +410,7 @@ func TestLinkClaimEvidenceAdvancesRevision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := linkClaimEvidence(ctx, tg.db, claimID, evidenceID, "supporting"); err != nil {
+	if err := tg.linkClaimEvidence(ctx, claimID, evidenceID, "supporting"); err != nil {
 		t.Fatal(err)
 	}
 	after, err := currentRevision(ctx, tg.db)
@@ -420,7 +420,7 @@ func TestLinkClaimEvidenceAdvancesRevision(t *testing.T) {
 	if after <= before {
 		t.Fatalf("evidence link did not advance revision: before=%d after=%d", before, after)
 	}
-	if err := linkClaimEvidence(ctx, tg.db, claimID, evidenceID, "supporting"); err != nil {
+	if err := tg.linkClaimEvidence(ctx, claimID, evidenceID, "supporting"); err != nil {
 		t.Fatal(err)
 	}
 	unchanged, err := currentRevision(ctx, tg.db)
@@ -1786,6 +1786,53 @@ func TestResolveIntentActionGateBlocksTiedAcceptedSingletonConflict(t *testing.T
 	}
 	if response.Decision.MayAct || !response.Decision.NeedsUserAnswer || !hasBlockingQuestionSlot(response.Unresolved, "boundary.project.no_go") {
 		t.Fatalf("tied accepted singleton conflict authorized action: %#v", response)
+	}
+}
+
+func TestLoadReviewCandidateClaimsShowsTiedAcceptedSingletonConflict(t *testing.T) {
+	ctx := context.Background()
+	tg, err := Open(ctx, filepath.Join(t.TempDir(), "tideglass.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tg.Close()
+	intent, err := tg.ensureIntent(ctx, "work.project.start", "Project start")
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "boundary.project.no_go",
+		Value:      "Do not touch production.",
+		Confidence: 0.9,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: firstID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	secondID, err := tg.insertClaim(ctx, intent.ID, candidateClaim{
+		Kind:       "boundary.project.no_go",
+		Value:      "Do not touch billing.",
+		Confidence: 0.95,
+		SourceMode: "explicit",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.ReviewClaim(ctx, ReviewOptions{ClaimID: secondID, Action: "accept", Reason: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.db.ExecContext(ctx, `update claims set revision = 0, updated_at = ? where id in (?, ?)`, "2024-01-01T00:00:00Z", firstID, secondID); err != nil {
+		t.Fatal(err)
+	}
+	candidates, err := tg.loadReviewCandidateClaims(ctx, intent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasClaimID(candidates, firstID) && !hasClaimID(candidates, secondID) {
+		t.Fatalf("tied accepted singleton conflict was hidden from review candidates: %#v", candidates)
 	}
 }
 
