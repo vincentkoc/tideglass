@@ -69,6 +69,12 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      - name: Install staticcheck
+        run: go install honnef.co/go/tools/cmd/staticcheck@2026.2.2
+
+      - name: Staticcheck
+        run: '"$(go env GOPATH)/bin/staticcheck" ./...'
+
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 20

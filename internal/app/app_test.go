@@ -2671,6 +2671,9 @@ func TestServiceHandlerResolvesIntentResource(t *testing.T) {
 	}
 	csrf := strings.NewReader(`{"uri":"tideglass://disclosure/social.dinner/venue"}`)
 	csrfResponse, err := authedHTTP(t, http.MethodPost, server.URL+"/resolve", "text/plain", csrf, token)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer csrfResponse.Body.Close()
 	if csrfResponse.StatusCode != http.StatusForbidden {
 		data, _ := io.ReadAll(csrfResponse.Body)
@@ -2678,6 +2681,9 @@ func TestServiceHandlerResolvesIntentResource(t *testing.T) {
 	}
 	body := strings.NewReader(`{"uri":"tideglass://disclosure/social.dinner/venue"}`)
 	resolve, err := authedHTTP(t, http.MethodPost, server.URL+"/resolve", "application/json", body, token)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer resolve.Body.Close()
 	if resolve.StatusCode != http.StatusOK {
 		data, _ := io.ReadAll(resolve.Body)
@@ -2770,6 +2776,9 @@ func TestServiceHandlerResolvesIntentResource(t *testing.T) {
 		t.Fatalf("unsupported proof hash status = %d body=%s", unsupportedProofHashResponse.StatusCode, data)
 	}
 	bad, err := authedHTTP(t, http.MethodGet, server.URL+"/resource?uri=tideglass://intent/", "", nil, token)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer bad.Body.Close()
 	if bad.StatusCode != http.StatusBadRequest {
 		data, _ := io.ReadAll(bad.Body)
@@ -2777,6 +2786,9 @@ func TestServiceHandlerResolvesIntentResource(t *testing.T) {
 	}
 	sensitive := strings.NewReader(`{"uri":"tideglass://intent/work.project.start","disclosure":{"allow_sensitive":true}}`)
 	forbidden, err := authedHTTP(t, http.MethodPost, server.URL+"/resolve", "application/json", sensitive, token)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer forbidden.Body.Close()
 	if forbidden.StatusCode != http.StatusForbidden {
 		data, _ := io.ReadAll(forbidden.Body)
@@ -2784,6 +2796,9 @@ func TestServiceHandlerResolvesIntentResource(t *testing.T) {
 	}
 	invalidTask := strings.NewReader(`{"uri":"tideglass://intent/work.project.start","task":{"mode":"ship_it"}}`)
 	invalidResponse, err := authedHTTP(t, http.MethodPost, server.URL+"/resolve", "application/json", invalidTask, token)
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer invalidResponse.Body.Close()
 	if invalidResponse.StatusCode != http.StatusBadRequest {
 		data, _ := io.ReadAll(invalidResponse.Body)
