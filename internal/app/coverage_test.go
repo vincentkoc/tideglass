@@ -454,3 +454,24 @@ func TestImportAssistantDirWalksJSONFilesWithLimit(t *testing.T) {
 		t.Fatalf("broken json err = %v", err)
 	}
 }
+
+func TestMergePersistedSourceRejectsCorruptJSON(t *testing.T) {
+	tg, ctx := openTestTideglass(t)
+	if err := tg.upsertSource(ctx, SourceStatus{ID: "codex", Kind: "import", Label: "Codex", Locator: "/x", Health: "ok", Metadata: map[string]string{"a": "b"}}); err != nil {
+		t.Fatal(err)
+	}
+	merged, err := tg.mergePersistedSource(ctx, SourceStatus{ID: "codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if merged.Metadata["a"] != "b" || merged.Locator != "/x" || merged.Health != "ok" {
+		t.Fatalf("merged = %#v", merged)
+	}
+	if _, err := tg.db.ExecContext(ctx, `update sources set counts_json = '{broken' where id = 'codex'`); err != nil {
+		t.Fatal(err)
+	}
+	_, err = tg.mergePersistedSource(ctx, SourceStatus{ID: "codex"})
+	if err == nil || !strings.Contains(err.Error(), "decode persisted counts_json for source codex") {
+		t.Fatalf("corrupt row err = %v", err)
+	}
+}
