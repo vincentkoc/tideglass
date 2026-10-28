@@ -523,20 +523,20 @@ func usage() {
 commands:
   init
   sources [--probe] [--json]
-	  ingest chatgpt|claude|codex --path <path> [--limit n]
-	  ask [--kind kind] [--json] <query>
-	  review --kind <kind>|--intent <id>
-	  profile show --kind <kind>|--intent <id>
+  ingest chatgpt|claude|codex --path <path> [--limit n]
+  ask [--kind kind] [--json] <query>
+  review --kind <kind>|--intent <id>
+  profile show --kind <kind>|--intent <id>
   profile edit <claim-id> --set <value>
   profile export --kind <kind>|--intent <id>
   evidence show <claim-id>
-	  context --kind <kind> --for-agent codex
-	  resolve tideglass://intent/<kind> [--json]
-	  serve [--addr 127.0.0.1:8765]
-	  mcp --once
-	  doctor
-	  version
-	`)
+  context --kind <kind> --for-agent codex
+  resolve tideglass://intent/<kind> [--json]
+  serve [--addr 127.0.0.1:8765]
+  mcp --once
+  doctor
+  version
+`)
 }
 
 func normalizeFlagArgs(args []string) []string {
