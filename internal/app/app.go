@@ -1696,9 +1696,19 @@ from sources where id = ?`, source.ID).Scan(
 	if err != nil {
 		return SourceStatus{}, err
 	}
-	_ = json.Unmarshal([]byte(capsJSON), &persisted.Capabilities)
-	_ = json.Unmarshal([]byte(countsJSON), &persisted.Counts)
-	_ = json.Unmarshal([]byte(metadataJSON), &persisted.Metadata)
+	for _, column := range []struct {
+		name string
+		raw  string
+		dst  any
+	}{
+		{"capabilities_json", capsJSON, &persisted.Capabilities},
+		{"counts_json", countsJSON, &persisted.Counts},
+		{"metadata_json", metadataJSON, &persisted.Metadata},
+	} {
+		if err := json.Unmarshal([]byte(column.raw), column.dst); err != nil {
+			return SourceStatus{}, fmt.Errorf("decode persisted %s for source %s: %w", column.name, source.ID, err)
+		}
+	}
 	if strings.TrimSpace(source.Kind) == "" {
 		source.Kind = persisted.Kind
 	}
