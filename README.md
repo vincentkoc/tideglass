@@ -26,7 +26,7 @@ From Homebrew:
 brew install vincentkoc/tap/tideglass
 ```
 
-From source (Go 1.26+):
+From source (Go 1.27+):
 
 ```sh
 go install github.com/vincentkoc/tideglass/cmd/tideglass@latest
