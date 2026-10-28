@@ -3545,14 +3545,6 @@ func actionGatePolicyFailingClaims(intentKind string, claims []ClaimOut, request
 	return out
 }
 
-func hasActionGateConstraint(intentKind string, claims []ClaimOut, request IntentRequestEnvelope, maxAge time.Duration) bool {
-	claim, constraint, ok := latestMatchingActionConstraint(intentKind, claims, request)
-	if !ok {
-		return false
-	}
-	return claim.Status == "accepted" && !claimStale(claim, maxAge) && !belowConfidenceFloor(claim, request) && constraint.Allow
-}
-
 type actionConstraintValue struct {
 	Allow        bool     `json:"allow"`
 	IntentKind   string   `json:"intent_kind"`
@@ -4405,19 +4397,6 @@ func normalizeKind(kind, query string) string {
 	default:
 		return "work.project.start"
 	}
-}
-
-func hasAnyWord(text string, targets ...string) bool {
-	targetSet := map[string]bool{}
-	for _, target := range targets {
-		targetSet[target] = true
-	}
-	for _, word := range words(text) {
-		if targetSet[word] {
-			return true
-		}
-	}
-	return false
 }
 
 func rawTokenSet(text string) map[string]bool {
