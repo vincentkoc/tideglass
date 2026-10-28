@@ -134,18 +134,18 @@ jobs:
           done
           echo "release assets ok"
 
-      - name: Verify Homebrew formula
+      - name: Verify Homebrew cask
         if: ${{ env.RELEASE_SKIP_PUBLISH != '1' }}
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          formula="$(gh api repos/vincentkoc/homebrew-tap/contents/Formula/tideglass.rb --jq '.content' | base64 --decode)"
-          if ! grep -q "version \"${RELEASE_VERSION}\"" <<<"$formula"; then
-            echo "::error::vincentkoc/homebrew-tap Formula/tideglass.rb was not updated to ${RELEASE_VERSION}"
+          cask="$(gh api repos/vincentkoc/homebrew-tap/contents/Casks/tideglass.rb --jq '.content' | base64 --decode)"
+          if ! grep -q "version \"${RELEASE_VERSION}\"" <<<"$cask"; then
+            echo "::error::vincentkoc/homebrew-tap Casks/tideglass.rb was not updated to ${RELEASE_VERSION}"
             exit 1
           fi
-          if ! grep -q "releases/download/v${RELEASE_VERSION}/" <<<"$formula"; then
-            echo "::error::Formula/tideglass.rb does not point at v${RELEASE_VERSION} assets"
+          if ! grep -qF 'releases/download/v#{version}/' <<<"$cask"; then
+            echo "::error::Casks/tideglass.rb does not point at versioned release assets"
             exit 1
           fi
