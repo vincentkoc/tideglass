@@ -7,6 +7,14 @@ updates:
       day: monday
       time: "05:00"
     open-pull-requests-limit: 5
+    # crawlkit ships frequent patch releases; batch them into one weekly PR
+    # instead of one PR per release (see #11-#20).
+    cooldown:
+      default-days: 7
+    groups:
+      go-modules:
+        patterns:
+          - "*"
     labels:
       - dependencies
       - go
@@ -17,6 +25,10 @@ updates:
       day: monday
       time: "05:15"
     open-pull-requests-limit: 5
+    groups:
+      github-actions:
+        patterns:
+          - "*"
     labels:
       - dependencies
       - github-actions
