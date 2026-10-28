@@ -78,7 +78,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${HOMEBREW_TAP_GITHUB_TOKEN:-}" ]; then
-            echo "::error::HOMEBREW_TAP_GITHUB_TOKEN is missing; cannot publish vincentkoc/homebrew-tap formula."
+            echo "::error::HOMEBREW_TAP_GITHUB_TOKEN is missing; cannot publish vincentkoc/homebrew-tap cask."
             exit 1
           fi
           code="$(curl -sS -o /tmp/tap.json -w "%{http_code}" \

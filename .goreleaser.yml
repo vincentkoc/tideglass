@@ -68,22 +68,26 @@ nfpms:
       - src: ./README.md
         dst: /usr/share/doc/tideglass/README.md
 
-brews:
+homebrew_casks:
   - name: tideglass
     ids:
+      - tideglass
+    binaries:
       - tideglass
     repository:
       owner: vincentkoc
       name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
-    directory: Formula
     commit_author:
       name: github-actions[bot]
       email: 41898282+github-actions[bot]@users.noreply.github.com
-    commit_msg_template: "tideglass: update formula for {{ .Tag }}"
+    commit_msg_template: "tideglass: update cask for {{ .Tag }}"
     homepage: https://github.com/vincentkoc/tideglass
     description: Portable intent and preference profiles for local-first agents
-    install: |
-      bin.install "tideglass"
-    test: |
-      system bin/"tideglass", "version"
+    hooks:
+      post:
+        # The binary is not signed or notarized; clear quarantine so macOS runs it.
+        install_steps: |
+          on_macos do
+            run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{ .StagedPath }}/tideglass"]
+          end
