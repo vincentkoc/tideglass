@@ -7,6 +7,10 @@ the [GitHub releases page](https://github.com/vincentkoc/tideglass/releases).
 
 ## [Unreleased]
 
+### Changed
+
+- Dependencies: crawlkit 0.17.3, modernc.org/sqlite 1.61.0.
+
 ## [0.2.0] - 2026-10-28
 
 ### Added
