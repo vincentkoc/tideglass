@@ -7,9 +7,11 @@ the [GitHub releases page](https://github.com/vincentkoc/tideglass/releases).
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-29
+
 ### Changed
 
-- Dependencies: crawlkit 0.17.3, modernc.org/sqlite 1.61.0.
+- Dependencies: crawlkit 0.17.3, modernc.org/sqlite 1.61.0. (#34)
 
 ## [0.2.0] - 2026-10-28
 
@@ -57,6 +59,7 @@ Initial release: local SQLite store, source discovery for crawl archives and
 assistant exports (ChatGPT, Claude, Codex), claim extraction with evidence,
 review, profile export and agent context rendering.
 
-[Unreleased]: https://github.com/vincentkoc/tideglass/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/vincentkoc/tideglass/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/vincentkoc/tideglass/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/vincentkoc/tideglass/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/vincentkoc/tideglass/releases/tag/v0.1.0
